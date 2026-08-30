@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>story_brain_text_editor</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --editor-bg: rgba(7, 16, 24, 0.58);
+        --editor-surface: rgba(10, 21, 32, 0.82);
+        --editor-surface-2: rgba(15, 23, 42, 0.92);
+        --editor-border: rgba(96, 165, 250, 0.16);
+        --editor-border-strong: rgba(96, 165, 250, 0.34);
+        --editor-text: #e5e7eb;
+        --editor-text-muted: rgba(229, 231, 235, 0.58);
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+      }
+
+      .shell {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 220px;
+        border: 1px solid var(--editor-border);
+        border-radius: 8px;
+        background: var(--editor-bg);
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.05),
+          0 10px 24px rgba(0, 0, 0, 0.34);
+        overflow: hidden;
+      }
+
+      .viewer,
+      .editor {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 220px;
+      }
+
+      .viewer {
+        padding: 12px 14px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: var(--editor-text);
+        font-size: 14px;
+        line-height: 1.55;
+        cursor: text;
+      }
+
+      .placeholder {
+        color: var(--editor-text-muted);
+      }
+
+      .editor {
+        display: none;
+      }
+
+      textarea {
+        box-sizing: border-box;
+        display: block;
+        width: 100%;
+        min-height: 260px;
+        padding: 12px 14px;
+        border: 0;
+        outline: 0;
+        resize: vertical;
+        color: var(--editor-text);
+        background: var(--editor-surface);
+        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .toolbar {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 8px;
+        border-top: 1px solid var(--editor-border);
+        background: var(--editor-surface-2);
+      }
+
+      button {
+        min-width: 64px;
+        height: 32px;
+        border: 1px solid var(--editor-border);
+        border-radius: 6px;
+        background: rgba(15, 23, 42, 0.86);
+        color: var(--editor-text);
+        font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        cursor: pointer;
+      }
+
+      button.primary {
+        border-color: var(--editor-border-strong);
+        background: rgba(96, 165, 250, 0.22);
+        color: #ffffff;
+      }
+
+      button:hover {
+        border-color: var(--editor-border-strong);
+        background: rgba(30, 41, 59, 0.96);
+      }
+
+      button.primary:hover {
+        background: rgba(96, 165, 250, 0.32);
+      }
+
+      .is-editing .viewer {
+        display: none;
+      }
+
+      .is-editing .editor {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="shell" class="shell">
+      <div id="viewer" class="viewer"></div>
+      <div id="editor" class="editor">
+        <textarea id="textarea"></textarea>
+        <div class="toolbar">
+          <button id="cancel" type="button">取消</button>
+          <button id="save" class="primary" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const shell = document.getElementById("shell")
+      const viewer = document.getElementById("viewer")
+      const textarea = document.getElementById("textarea")
+      const saveButton = document.getElementById("save")
+      const cancelButton = document.getElementById("cancel")
+      let value = ""
+
+      function post(type, payload) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type,
+            ...payload,
+          },
+          "*"
+        )
+      }
+
+      function setHeight() {
+        const height = Math.max(shell.scrollHeight, 240)
+        post("streamlit:setFrameHeight", { height })
+      }
+
+      function renderViewer() {
+        const text = String(value || "")
+        viewer.textContent = text || "Story Brain"
+        viewer.classList.toggle("placeholder", !text)
+        setHeight()
+      }
+
+      function enterEdit() {
+        textarea.value = value
+        shell.classList.add("is-editing")
+        setTimeout(() => textarea.focus(), 0)
+        setHeight()
+      }
+
+      function exitEdit() {
+        shell.classList.remove("is-editing")
+        setHeight()
+      }
+
+      function save() {
+        value = textarea.value
+        renderViewer()
+        exitEdit()
+        post("streamlit:setComponentValue", {
+          value,
+          dataType: "json",
+        })
+      }
+
+      viewer.addEventListener("dblclick", (event) => {
+        event.preventDefault()
+        enterEdit()
+      })
+
+      saveButton.addEventListener("click", save)
+      cancelButton.addEventListener("click", exitEdit)
+      textarea.addEventListener("input", setHeight)
+      textarea.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          event.preventDefault()
+          save()
+        }
+        if (event.key === "Escape") {
+          event.preventDefault()
+          exitEdit()
+        }
+      })
+
+      window.addEventListener("message", (event) => {
+        if (!event.data || event.data.type !== "streamlit:render") {
+          return
+        }
+        const args = event.data.args || {}
+        value = String(args.value || "")
+        renderViewer()
+      })
+
+      post("streamlit:componentReady", { apiVersion: 1 })
+      renderViewer()
+    </script>
+  </body>
+</html>

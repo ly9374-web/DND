@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>page2_inline_editor</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      let overlayElement = null
+
+      function post(type, payload) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type,
+            ...payload,
+          },
+          "*"
+        )
+      }
+
+      function decodePayload(encoded) {
+        try {
+          const binary = atob(encoded || "")
+          const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
+          return new TextDecoder("utf-8").decode(bytes)
+        } catch (error) {
+          return ""
+        }
+      }
+
+      function ensureStyles() {
+        const parentDoc = window.parent && window.parent.document
+        if (!parentDoc || parentDoc.getElementById("page2-inline-editor-styles")) {
+          return
+        }
+        const style = parentDoc.createElement("style")
+        style.id = "page2-inline-editor-styles"
+        style.textContent = [
+          ".page2-inline-editor-overlay{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:32px;}",
+          ".page2-inline-editor-panel{display:flex;flex-direction:column;width:min(720px,90vw);max-height:80vh;border-radius:12px;border:1px solid rgba(96,165,250,0.3);background:rgba(10,21,32,0.98);box-shadow:0 24px 64px rgba(0,0,0,0.5);overflow:hidden;}",
+          ".page2-inline-editor-title{padding:12px 16px;color:#93c5fd;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;border-bottom:1px solid rgba(96,165,250,0.16);}",
+          ".page2-inline-editor-textarea{flex:1;min-height:240px;padding:14px 16px;border:0;outline:0;resize:none;background:transparent;color:#e5e7eb;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;}",
+          ".page2-inline-editor-toolbar{display:flex;justify-content:flex-end;gap:8px;padding:10px 12px;border-top:1px solid rgba(96,165,250,0.16);}",
+          ".page2-inline-editor-toolbar button{min-width:72px;height:32px;border-radius:6px;border:1px solid rgba(96,165,250,0.3);background:rgba(15,23,42,0.9);color:#e5e7eb;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer;}",
+          ".page2-inline-editor-toolbar button:hover{border-color:rgba(96,165,250,0.6);}",
+          ".page2-inline-editor-toolbar button.primary{background:rgba(96,165,250,0.24);color:#ffffff;}",
+          ".page2-inline-editor-toolbar button.primary:hover{background:rgba(96,165,250,0.36);}",
+        ].join("")
+        parentDoc.head.appendChild(style)
+      }
+
+      function closeEditor() {
+        if (overlayElement) {
+          overlayElement.remove()
+          overlayElement = null
+        }
+      }
+
+      function openEditor(marker) {
+        closeEditor()
+        const parentDoc = window.parent && window.parent.document
+        if (!parentDoc) {
+          return
+        }
+
+        const turnId = String(marker.dataset.turnId || "")
+        const role = String(marker.dataset.role || "")
+        const text = decodePayload(marker.dataset.payload)
+
+        const overlay = parentDoc.createElement("div")
+        overlay.className = "page2-inline-editor-overlay"
+
+        const panel = parentDoc.createElement("div")
+        panel.className = "page2-inline-editor-panel"
+
+        const title = parentDoc.createElement("div")
+        title.className = "page2-inline-editor-title"
+        title.textContent =
+          (role === "user" ? "编辑用户消息" : "编辑 Assistant 消息") +
+          "（Ctrl/⌘+Enter 保存，Esc 取消；清空并保存 = 删除该条消息）"
+
+        const textarea = parentDoc.createElement("textarea")
+        textarea.className = "page2-inline-editor-textarea"
+        textarea.value = text
+
+        const toolbar = parentDoc.createElement("div")
+        toolbar.className = "page2-inline-editor-toolbar"
+
+        const cancelButton = parentDoc.createElement("button")
+        cancelButton.type = "button"
+        cancelButton.textContent = "取消"
+
+        const saveButton = parentDoc.createElement("button")
+        saveButton.type = "button"
+        saveButton.className = "primary"
+        saveButton.textContent = "保存"
+
+        toolbar.append(cancelButton, saveButton)
+        panel.append(title, textarea, toolbar)
+        overlay.appendChild(panel)
+        parentDoc.body.appendChild(overlay)
+        overlayElement = overlay
+
+        function save() {
+          const nextText = textarea.value
+          closeEditor()
+          post("streamlit:setComponentValue", {
+            value: {
+              turn_id: turnId,
+              role: role,
+              text: String(nextText),
+            },
+            dataType: "json",
+          })
+        }
+
+        saveButton.addEventListener("click", save)
+        cancelButton.addEventListener("click", closeEditor)
+        overlay.addEventListener("mousedown", (event) => {
+          if (event.target === overlay) {
+            closeEditor()
+          }
+        })
+        textarea.addEventListener("keydown", (event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            event.preventDefault()
+            save()
+          }
+          if (event.key === "Escape") {
+            event.preventDefault()
+            closeEditor()
+          }
+        })
+
+        setTimeout(() => {
+          textarea.focus()
+          textarea.setSelectionRange(textarea.value.length, textarea.value.length)
+        }, 0)
+      }
+
+      function bindDblClickHandlers() {
+        const parentDoc = window.parent && window.parent.document
+        if (!parentDoc) {
+          return
+        }
+        ensureStyles()
+
+        const markers = parentDoc.querySelectorAll(".page2-turn-marker[data-turn-id][data-role]")
+        markers.forEach((marker) => {
+          if (marker.dataset.bound === "1") {
+            return
+          }
+
+          const bubble =
+            marker.closest('[data-testid="stChatMessageContent"]') ||
+            marker.parentElement ||
+            marker
+
+          bubble.addEventListener("dblclick", (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            openEditor(marker)
+          })
+
+          marker.dataset.bound = "1"
+        })
+      }
+
+      window.addEventListener("message", (event) => {
+        if (!event.data || event.data.type !== "streamlit:render") {
+          return
+        }
+        bindDblClickHandlers()
+        post("streamlit:setFrameHeight", { height: 0 })
+      })
+
+      post("streamlit:componentReady", { apiVersion: 1 })
+      bindDblClickHandlers()
+      post("streamlit:setFrameHeight", { height: 0 })
+    </script>
+  </body>
+</html>
