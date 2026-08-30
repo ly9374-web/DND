@@ -1,0 +1,50 @@
+# Private runtime data: API keys, chat records, user prompts, backups, and media.
+.python_app_data/
+
+# Local secrets and environment overrides.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# One-time local recovery tools (may reference private records/settings).
+/tools/recover_lost_prompt_assets.py
+/tools/reconstruct_naruto_assets.py
+
+# Python environments and caches.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build and package outputs.
+build/
+dist/
+*.egg-info/
+
+# Logs, local databases, and temporary files.
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# OS and editor metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
