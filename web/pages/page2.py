@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import threading
 import uuid
 from pathlib import Path
@@ -34,6 +35,9 @@ _SINGLE_FLIGHT_OPERATION_KINDS = {
     "video",
 }
 
+_EMPTY_SPACE_CONTINUE_MESSAGE = "继续发展"
+_EMPTY_SPACE_SUBMISSION_SENTINEL = "\u2063\u2063\u2063"
+
 
 def _chat_scope() -> str | None:
     mode = str(st.session_state.get("auth_mode", "") or "").strip().lower()
@@ -54,6 +58,87 @@ def _latest_image_media_id(media: list) -> str:
 
 def _show_error(exc: Exception):
     st.error(user_facing_error_message(exc))
+
+
+def _render_empty_space_submit_bridge() -> None:
+    """Turn a Space press on an empty chat box into an invisible submission."""
+    sentinel_json = json.dumps(_EMPTY_SPACE_SUBMISSION_SENTINEL, ensure_ascii=False)
+    components.html(
+        f"""
+        <script>
+          (() => {{
+            const host = window.parent;
+            const doc = host.document;
+            const handlerKey = "__dndEmptySpaceSubmitHandler";
+            const previousHandler = host[handlerKey];
+            if (previousHandler) {{
+              doc.removeEventListener("keydown", previousHandler, true);
+            }}
+
+            const handler = (event) => {{
+              if (
+                event.key !== " " ||
+                event.repeat ||
+                event.isComposing ||
+                event.altKey ||
+                event.ctrlKey ||
+                event.metaKey ||
+                event.shiftKey
+              ) {{
+                return;
+              }}
+
+              const input = doc.querySelector(
+                ".st-key-page2_chat_input textarea"
+              );
+              if (
+                !input ||
+                event.target !== input ||
+                input.disabled ||
+                String(input.value || "").trim() !== ""
+              ) {{
+                return;
+              }}
+
+              event.preventDefault();
+              event.stopPropagation();
+
+              const valueSetter = Object.getOwnPropertyDescriptor(
+                host.HTMLTextAreaElement.prototype,
+                "value"
+              )?.set;
+              if (!valueSetter) {{
+                return;
+              }}
+              valueSetter.call(input, {sentinel_json});
+              input.dispatchEvent(new host.Event("input", {{ bubbles: true }}));
+
+              host.requestAnimationFrame(() => {{
+                const submitButton = doc.querySelector(
+                  ".st-key-page2_chat_input [data-testid='stChatInputSubmitButton']"
+                );
+                if (submitButton) {{
+                  submitButton.click();
+                  return;
+                }}
+                input.dispatchEvent(
+                  new host.KeyboardEvent("keydown", {{
+                    key: "Enter",
+                    code: "Enter",
+                    bubbles: true,
+                    cancelable: true,
+                  }})
+                );
+              }});
+            }};
+
+            host[handlerKey] = handler;
+            doc.addEventListener("keydown", handler, true);
+          }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def _ensure_state():
@@ -949,6 +1034,7 @@ def _prepare_chat_operation(task: _Page2OperationTask):
         user_message=current_text,
         assistant_message=None,
         is_loading=True,
+        is_user_message_hidden=bool(task.payload.get("hide_user_message", False)),
     )
     st.session_state.page2_turns = turns + [new_turn]
     _upsert_record()
@@ -1222,7 +1308,9 @@ def _render_chat_column():
         )
         with history:
             for turn in turns:
-                if turn.user_message:
+                if turn.user_message and not bool(
+                    getattr(turn, "is_user_message_hidden", False)
+                ):
                     _render_editable_chat_message(
                         turn=turn,
                         role="user",
@@ -1270,6 +1358,7 @@ def _render_chat_column():
                 key="page2_chat_input",
                 disabled=chat_edit_active or _operation_kind_busy("chat"),
             )
+            _render_empty_space_submit_bridge()
             dice_clicked = st.button(
                 "",
                 key="page2_chat_dice_btn",
@@ -1326,16 +1415,23 @@ def _render_chat_column():
         _upsert_record()
         st.rerun()
 
-    if not user_text:
+    if user_text is None:
         return
 
-    current_text = str(user_text).strip()
+    submitted_text = str(user_text)
+    hide_user_message = submitted_text == _EMPTY_SPACE_SUBMISSION_SENTINEL
+    current_text = (
+        _EMPTY_SPACE_CONTINUE_MESSAGE if hide_user_message else submitted_text.strip()
+    )
+    if not current_text:
+        return
     _enqueue_operation(
         "chat",
         "发送消息",
         {
             "ctx": ctx,
             "user_text": current_text,
+            "hide_user_message": hide_user_message,
             "story_brain_enabled": story_brain_enabled,
         },
     )

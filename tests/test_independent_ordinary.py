@@ -142,6 +142,37 @@ class IndependentOrdinaryTests(unittest.TestCase):
         self.assertEqual(loaded.story_brain, archive)
         self.assertEqual(loaded.story_brain_short, "短 Story Brain")
 
+    def test_hidden_user_message_round_trips_and_stays_in_model_context(self):
+        turn = Page2ConversationTurn(
+            user_message="继续发展",
+            assistant_message="故事继续",
+            is_user_message_hidden=True,
+        )
+
+        restored = Page2ConversationTurn.from_dict(turn.to_dict())
+        self.assertTrue(restored.is_user_message_hidden)
+        self.assertEqual(
+            page2_service.build_context_messages([restored], 1),
+            [
+                {"role": "user", "content": "继续发展"},
+                {"role": "assistant", "content": "故事继续"},
+            ],
+        )
+
+    def test_hidden_continue_message_is_not_used_as_record_title(self):
+        turns = [
+            Page2ConversationTurn(
+                user_message="继续发展",
+                assistant_message="雨幕中出现了一道门。",
+                is_user_message_hidden=True,
+            )
+        ]
+
+        self.assertEqual(
+            page2_service.make_record_title(turns),
+            "雨幕中出现了一道门。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -543,6 +543,8 @@ def ensure_record_id(existing: Optional[str]) -> str:
 
 def make_record_title(turns: list[Page2ConversationTurn]) -> str:
     for turn in turns:
+        if bool(getattr(turn, "is_user_message_hidden", False)):
+            continue
         text = str(turn.user_message or "").strip()
         if text:
             return text[:24]

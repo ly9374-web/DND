@@ -201,6 +201,7 @@ class Page2ConversationTurn:
     user_message: str = ""
     assistant_message: str = None
     is_loading: bool = False
+    is_user_message_hidden: bool = False
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
 
@@ -211,6 +212,11 @@ class Page2ConversationTurn:
             user_message=data.get("user_message") or data.get("userMessage") or "",
             assistant_message=data.get("assistant_message") or data.get("assistantMessage"),
             is_loading=bool(data.get("is_loading") if "is_loading" in data else data.get("isLoading", False)),
+            is_user_message_hidden=bool(
+                data.get("is_user_message_hidden")
+                if "is_user_message_hidden" in data
+                else data.get("isUserMessageHidden", False)
+            ),
             date=data.get("date") or now_iso(),
         )
 
@@ -220,6 +226,7 @@ class Page2ConversationTurn:
             "user_message": self.user_message,
             "assistant_message": self.assistant_message,
             "is_loading": self.is_loading,
+            "is_user_message_hidden": self.is_user_message_hidden,
             "date": self.date,
         }
 
