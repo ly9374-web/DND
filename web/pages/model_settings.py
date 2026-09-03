@@ -20,48 +20,56 @@ FIELDS = [
         AppStorageKeys.XAI_CHAT_API_KEY,
         "GROK_CHAT_API_KEY",
         "GROK_CHAT_API_KEY",
+        "https://console.x.ai/team/812766c0-9d28-4486-9320-8123ccafd67c/api-keys",
     ),
     (
         "输入 Grok 生图 API Key（会本地持久化保存）",
         AppStorageKeys.XAI_IMAGE_API_KEY,
         "GROK_IMAGE_API_KEY",
         "GROK_IMAGE_API_KEY",
+        "https://console.x.ai/team/812766c0-9d28-4486-9320-8123ccafd67c/api-keys",
     ),
     (
         "输入 Replicate API Token（会本地持久化保存）",
         AppStorageKeys.REPLICATE_API_TOKEN,
         "REPLICATE_API_TOKEN",
         "REPLICATE_API_TOKEN",
+        "https://replicate.com/account/api-tokens",
     ),
     (
         "输入 DeepSeek API Key（会本地持久化保存）",
         AppStorageKeys.DEEPSEEK_API_KEY,
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_API_KEY",
+        "https://platform.deepseek.com/api_keys",
     ),
     (
         "输入 DomoAI API Key（会本地持久化保存）",
         AppStorageKeys.DOMOAI_API_KEY,
         "DOMOAI_API_KEY",
         "DOMOAI_API_KEY",
+        None,
     ),
     (
         "输入 智谱 API Key（会本地持久化保存）",
         AppStorageKeys.ZHIPU_API_KEY,
         "ZHIPU_API_KEY",
         "ZHIPU_API_KEY",
+        "https://bigmodel.cn/apikey/platform",
     ),
     (
         "输入 Cloudinary API Key（会本地持久化保存）",
         AppStorageKeys.CLOUDINARY_API_KEY,
         "CLOUDINARY_API_KEY",
         "CLOUDINARY_API_KEY",
+        "https://console.cloudinary.com/app/c-7ab8374197c616363e35cfe88eae05/settings/api-keys",
     ),
     (
         "输入 Cloudinary API Secret（会本地持久化保存）",
         AppStorageKeys.CLOUDINARY_API_SECRET,
         "CLOUDINARY_API_SECRET",
         "CLOUDINARY_API_SECRET",
+        "https://console.cloudinary.com/app/c-7ab8374197c616363e35cfe88eae05/settings/api-keys",
     ),
 ]
 
@@ -205,8 +213,26 @@ def render():
     st.subheader("API Keys")
     st.caption("在输入框里按回车会立即保存该 Key。")
 
-    for label_text, key, placeholder, secret_name in FIELDS:
-        st.markdown(f"**{label_text}**")
+    for label_text, key, placeholder, secret_name, key_url in FIELDS:
+        label_column, link_column = st.columns([5, 1])
+        with label_column:
+            st.markdown(f"**{label_text}**")
+        with link_column:
+            if key_url:
+                st.link_button(
+                    "获取 Key ↗",
+                    key_url,
+                    use_container_width=True,
+                    key=f"model_settings_key_link_{key}",
+                )
+            else:
+                st.button(
+                    "暂无链接",
+                    disabled=True,
+                    use_container_width=True,
+                    key=f"model_settings_key_link_{key}",
+                )
+
         input_key = _pending_key(key)
         if input_key not in st.session_state:
             st.session_state[input_key] = str(settings.get(key, "") or "")

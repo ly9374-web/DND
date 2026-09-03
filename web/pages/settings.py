@@ -209,14 +209,14 @@ def _render_final_settings(is_guest: bool) -> None:
     try:
         if prompt_assets.bind_legacy_final_setting_by_titles(
             state,
-            final_title="DND(幻)",
+            final_title="佣兵世界",
             template_title="默认模板",
             world_book_title="佣兵世界",
             user_character_title="狼影",
             other_character_titles=["水月", "雏田", "莉娅"],
         ):
             legacy_binding_message = (
-                "已为旧最终设定“DND(幻)”补齐来源关联，现在可以使用一键同步。"
+                "已为旧最终设定“佣兵世界”补齐来源关联，现在可以使用一键同步。"
             )
     except Exception as exc:
         legacy_binding_error = user_facing_error_message(exc)

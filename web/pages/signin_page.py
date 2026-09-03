@@ -30,10 +30,10 @@ html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
   overflow: hidden !important;
 }
 
-/* Kill default paddings/gaps and use flex centering on the main block container */
+/* Kill default paddings/gaps and center the glass panel in the viewport. */
 [data-testid="stMainBlockContainer"],
 section.main > div.block-container {
-  padding: 0 !important;
+  padding: 20px !important;
   height: 100dvh !important;
   max-height: 100dvh !important;
   overflow: hidden !important;
@@ -42,109 +42,198 @@ section.main > div.block-container {
   justify-content: center !important;
 }
 
-/* Ensure the root vertical stack is centered and does not add surprise spacing */
+/* Ensure the root vertical stack is centered and does not add surprise spacing. */
 [data-testid="stMainBlockContainer"] > [data-testid="stVerticalBlock"],
 section.main > div.block-container > [data-testid="stVerticalBlock"] {
-  width: min(980px, 92vw);
+  width: 100%;
   display: flex !important;
   flex-direction: column !important;
   align-items: center !important;
   justify-content: center !important;
-  gap: 26px !important;
+  gap: 0 !important;
   margin: 0 auto !important;
 }
 
-/* ===== Centered sign-in layout ===== */
-.ly-signin-card {
-  width: 100%;
+/* ===== Sign-in panel: pure transparent, only refracts the background ===== */
+.st-key-signin_panel {
+  width: min(460px, calc(100vw - 32px)) !important;
+  margin-inline: auto !important;
+  padding: 32px 34px 34px !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  border-radius: 28px !important;
+  background: transparent !important;
+  -webkit-backdrop-filter: blur(1px) !important;
+  backdrop-filter: blur(1px) !important;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.30) !important;
+}
+.st-key-signin_panel > [data-testid="stVerticalBlock"] {
+  gap: 16px !important;
+}
+
+.dnd-signin-heading {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 26px;
-  padding: 24px 16px;
   text-align: center;
+  margin: 0 0 8px;
 }
-.ly-signin-title {
-  width: 100%;
-  text-align: center;
-  font-size: 64px;
-  font-weight: 800;
-  letter-spacing: 2px;
-  margin: 0;
-  color: #e5e7eb;
+.dnd-signin-mark {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(191, 219, 254, 0.52);
+  border-radius: 50%;
+  background: linear-gradient(145deg, #55b8ff, #8b5cf6);
+  color: #ffffff;
+  font-size: 27px;
+  line-height: 1;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.36),
+    0 10px 30px rgba(85, 184, 255, 0.30),
+    0 0 24px rgba(139, 92, 246, 0.24);
+}
+.dnd-signin-title {
+  color: #f8fafc;
+  font-size: 38px;
+  font-weight: 780;
+  line-height: 1.05;
+  letter-spacing: 0.08em;
+}
+.dnd-signin-subtitle {
+  margin-top: 9px;
+  color: rgba(226, 232, 240, 0.68);
+  font-size: 14px;
+  letter-spacing: 0.04em;
 }
 
-/* ===== Input pill ===== */
-.ly-input {
-  width: min(720px, 92vw);
+/* ===== Passcode input ===== */
+.st-key-signin_passcode {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
 }
-.ly-input [data-testid="stTextInput"] {
-  width: 100%;
+.st-key-signin_passcode label,
+.st-key-signin_passcode label p {
+  color: rgba(241, 245, 249, 0.88) !important;
+  font-size: 13px !important;
+  font-weight: 650 !important;
+  letter-spacing: 0.04em;
 }
-.ly-input input {
-  height: 64px !important;
-  border-radius: 999px !important;
-  border: 1px solid rgba(255,255,255,0.10) !important;
-  background: #f8fafc !important;
-  color: #111827 !important;
-  font-size: 22px !important;
-  padding: 0 24px !important;
+.st-key-signin_passcode [data-baseweb="input"] {
+  min-height: 54px !important;
+  border: 1px solid rgba(148, 163, 184, 0.20) !important;
+  border-radius: 16px !important;
+  background: rgba(5, 10, 19, 0.58) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+  transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
 }
-.ly-input input::placeholder {
-  color: rgba(17, 24, 39, 0.45) !important;
+.st-key-signin_passcode [data-baseweb="input"]:focus-within {
+  border-color: rgba(96, 165, 250, 0.78) !important;
+  background: rgba(6, 12, 24, 0.76) !important;
+  box-shadow:
+    0 0 0 3px rgba(85, 184, 255, 0.12),
+    0 0 22px rgba(85, 184, 255, 0.12) !important;
+}
+.st-key-signin_passcode input {
+  min-height: 52px !important;
+  background: transparent !important;
+  color: #f8fafc !important;
+  font-size: 17px !important;
+  padding-inline: 16px !important;
+}
+.st-key-signin_passcode input::placeholder {
+  color: rgba(203, 213, 225, 0.40) !important;
 }
 
-/* ===== Buttons row (two buttons, centered, near screenshot width) ===== */
-.ly-btn-row {
-  width: min(760px, 92vw);
+/* ===== Primary and secondary actions ===== */
+.st-key-signin_login,
+.st-key-signin_guest {
+  width: 100% !important;
 }
-.ly-btn-row [data-testid="stHorizontalBlock"] {
-  justify-content: center !important;
-  gap: 28px !important;
+.st-key-signin_login button,
+.st-key-signin_guest button {
+  width: 100% !important;
+  min-height: 52px !important;
+  border-radius: 16px !important;
+  color: #f8fafc !important;
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.06em;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease !important;
 }
-.ly-btn-row [data-testid="column"] {
-  max-width: 320px !important;
+.st-key-signin_login button {
+  border: 1px solid rgba(191, 219, 254, 0.52) !important;
+  background: linear-gradient(135deg, #278fda, #7657db) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 12px 28px rgba(49, 117, 208, 0.24),
+    0 0 24px rgba(118, 87, 219, 0.14) !important;
 }
-.ly-btn [data-testid="stButton"] button {
-  height: 52px !important;
-  border-radius: 999px !important;
-  background: #1f2937 !important;
-  color: #e5e7eb !important;
-  border: 1px solid rgba(255,255,255,0.10) !important;
-  font-size: 18px !important;
+.st-key-signin_guest button {
+  border: 1px solid rgba(148, 163, 184, 0.24) !important;
+  background: rgba(15, 23, 42, 0.40) !important;
+  color: rgba(226, 232, 240, 0.82) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+}
+.st-key-signin_login button:hover,
+.st-key-signin_guest button:hover {
+  transform: translateY(-1px) !important;
+}
+.st-key-signin_login button:hover {
+  border-color: rgba(224, 231, 255, 0.82) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 14px 34px rgba(49, 117, 208, 0.30),
+    0 0 30px rgba(139, 92, 246, 0.20) !important;
+}
+.st-key-signin_guest button:hover {
+  border-color: rgba(148, 197, 255, 0.50) !important;
+  background: rgba(30, 41, 59, 0.58) !important;
+}
+
+@media (max-width: 560px) {
+  .st-key-signin_panel {
+    padding: 26px 22px 28px !important;
+    border-radius: 24px !important;
+  }
+  .dnd-signin-title { font-size: 34px; }
 }
 </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="ly-signin-card">', unsafe_allow_html=True)
-    st.markdown('<div class="ly-signin-title">DND</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="ly-input">', unsafe_allow_html=True)
-    code = st.text_input(
-        label="口令",
-        value="",
-        placeholder="",
-        label_visibility="collapsed",
-        key="signin_passcode",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="ly-btn-row">', unsafe_allow_html=True)
-    b1, b2 = st.columns([1, 1], gap="large")
-    with b1:
-        st.markdown('<div class="ly-btn">', unsafe_allow_html=True)
-        login = st.button("登陆", use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    with b2:
-        st.markdown('<div class="ly-btn">', unsafe_allow_html=True)
-        guest = st.button("游客登录", use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    with st.container(key="signin_panel"):
+        st.markdown(
+            """
+            <div class="dnd-signin-heading">
+              <div class="dnd-signin-mark" aria-hidden="true">✦</div>
+              <div class="dnd-signin-title">DND</div>
+              <div class="dnd-signin-subtitle">输入口令，开启你的冒险</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        code = st.text_input(
+            label="访问口令",
+            value="",
+            placeholder="请输入访问口令",
+            type="password",
+            key="signin_passcode",
+        )
+        login = st.button(
+            "登录",
+            use_container_width=True,
+            type="primary",
+            key="signin_login",
+        )
+        guest = st.button(
+            "游客进入",
+            use_container_width=True,
+            key="signin_guest",
+        )
 
     if guest:
         st.session_state.auth_ok = True

@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 APP_FILE="streamlit_app.py"
 REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
-VENV_DIR="$PROJECT_DIR/.venv"
+# 精确版本锁定清单存在时优先使用（换机重装可还原一致的依赖版本）
+if [[ -f "$PROJECT_DIR/requirements.lock.txt" ]]; then
+  REQUIREMENTS_FILE="$PROJECT_DIR/requirements.lock.txt"
+fi
+# 虚拟环境位于 iCloud 之外，避免被 iCloud 同步/物化破坏
+VENV_DIR="/Users/jason/.local/share/project-venvs/DND/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 START_PORT="${STREAMLIT_PORT:-8502}"
 PORT="$START_PORT"
@@ -59,7 +64,14 @@ fi
 if [[ "$NEED_INSTALL" -eq 1 ]]; then
   echo "Installing Python dependencies..."
   "$VENV_PYTHON" -m pip install --upgrade pip
-  "$VENV_PYTHON" -m pip install -r "$REQUIREMENTS_FILE"
+  if ! "$VENV_PYTHON" -m pip install -r "$REQUIREMENTS_FILE"; then
+    if [[ "$REQUIREMENTS_FILE" != "$PROJECT_DIR/requirements.txt" ]]; then
+      echo "锁定清单安装失败，回退到 requirements.txt（版本可能与原环境略有差异）..."
+      "$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements.txt"
+    else
+      exit 1
+    fi
+  fi
   touch "$VENV_DIR/.requirements-installed"
 fi
 
@@ -74,7 +86,7 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 if [[ "$PORT" != "$START_PORT" ]]; then
-  echo "端口 $START_PORT 已被占用，自动改用端口 $PORT。"
+  echo "端口 $START_PORT 已被占用，自动改用端口 ${PORT}。"
 fi
 
 echo

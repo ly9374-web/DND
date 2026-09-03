@@ -26,6 +26,15 @@ _story_brain_text_editor_component = components.declare_component(
     path=str(Path(__file__).resolve().parents[1] / "components" / "story_brain_text_editor"),
 )
 
+_SINGLE_FLIGHT_OPERATION_KINDS = {
+    "chat",
+    "story_brain",
+    "image_prompt",
+    "image",
+    "video",
+}
+
+
 def _chat_scope() -> str | None:
     mode = str(st.session_state.get("auth_mode", "") or "").strip().lower()
     return "guest" if mode == "guest" else None
@@ -132,6 +141,17 @@ def page2_operation_queue_busy() -> bool:
     )
 
 
+def _operation_kind_busy(kind: str) -> bool:
+    """Return whether this kind of request is already running or queued."""
+    active = st.session_state.get("page2_active_operation")
+    if active is not None and active.kind == kind:
+        return True
+    return any(
+        task.kind == kind
+        for task in list(st.session_state.get("page2_operation_queue") or [])
+    )
+
+
 def _story_brain_update_busy() -> bool:
     """保留原有界面锁定判断；现在任何队列操作执行时都禁止破坏性编辑。"""
     return page2_operation_queue_busy()
@@ -152,6 +172,14 @@ def _enqueue_operation(
     *,
     first: bool = False,
 ) -> _Page2OperationTask:
+    if kind in _SINGLE_FLIGHT_OPERATION_KINDS:
+        existing = _latest_earlier_operation(kind)
+        if existing is not None:
+            st.session_state["page2_operation_notice"] = (
+                f"{existing.label}已在执行或队列中，请等待完成。"
+            )
+            return existing
+
     task = _Page2OperationTask(
         kind=kind,
         label=label,
@@ -726,6 +754,7 @@ def render_sidebar_context():
             )
             manual_update_disabled = (
                 _chat_edit_active()
+                or _operation_kind_busy("story_brain")
                 or not bool(st.session_state.get("page2_story_brain_enabled", True))
                 or not bool(manual_turn_id or _has_earlier_operation("chat"))
             )
@@ -1239,7 +1268,7 @@ def _render_chat_column():
             user_text = st.chat_input(
                 input_placeholder,
                 key="page2_chat_input",
-                disabled=chat_edit_active,
+                disabled=chat_edit_active or _operation_kind_busy("chat"),
             )
             dice_clicked = st.button(
                 "",
@@ -1247,7 +1276,7 @@ def _render_chat_column():
                 help="掷一次 0–24 点骰子并直接发送",
                 icon=":material/casino:",
                 type="tertiary",
-                disabled=chat_edit_active,
+                disabled=chat_edit_active or _operation_kind_busy("chat"),
             )
 
     if dice_clicked:
@@ -1470,7 +1499,10 @@ def _render_media_column():
     if st.button(
         "生成图片prompt",
         use_container_width=True,
-        disabled=not image_prompt_conversation and not _has_earlier_operation("chat"),
+        disabled=(
+            _operation_kind_busy("image_prompt")
+            or (not image_prompt_conversation and not _has_earlier_operation("chat"))
+        ),
     ):
         _enqueue_operation(
             "image_prompt",
@@ -1489,7 +1521,12 @@ def _render_media_column():
     image_urls_raw = st.text_area("参考图片 URL（每行一个，可选）", value="", height=90)
     image_urls = [line.strip() for line in image_urls_raw.splitlines() if line.strip()]
 
-    if st.button("生成图片", type="primary", use_container_width=True):
+    if st.button(
+        "生成图片",
+        type="primary",
+        use_container_width=True,
+        disabled=_operation_kind_busy("image"),
+    ):
         prompt_dependency = _latest_earlier_operation("image_prompt")
         _enqueue_operation(
             "image",
@@ -1551,7 +1588,10 @@ def _render_media_column():
     if st.button(
         "生成视频",
         use_container_width=True,
-        disabled=not bool(image_candidates or queued_image_dependency),
+        disabled=(
+            _operation_kind_busy("video")
+            or not bool(image_candidates or queued_image_dependency)
+        ),
     ):
         _enqueue_operation(
             "video",

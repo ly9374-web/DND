@@ -22,6 +22,9 @@ def apply_dark_mode() -> None:
   --nm-text: #e5e7eb;
   --nm-text-2: #9ca3af;
   --nm-text-3: rgba(229, 231, 235, 0.72);
+  --nm-grid: rgba(85, 184, 255, 0.11);
+  --nm-grid-glow: rgba(85, 184, 255, 0.24);
+  --nm-background-glow: rgba(85, 184, 255, 0.18);
 }
 
 html, body {
@@ -31,8 +34,106 @@ html, body {
 
 /* App background */
 .stApp {
-  background: var(--nm-bg) !important;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 42%, var(--nm-background-glow), transparent 34rem),
+    var(--nm-bg) !important;
   color: var(--nm-text) !important;
+}
+
+/*
+ * The grid is based on the Essay Podcast background: a 44px fine grid over a
+ * 220px glow grid. The first layer keeps the lines visible; the second carries
+ * a wide breathing highlight from left to right so the grid itself never moves.
+ */
+.stApp::before,
+.stApp::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--nm-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--nm-grid) 1px, transparent 1px),
+    linear-gradient(var(--nm-grid-glow) 1px, transparent 1px),
+    linear-gradient(90deg, var(--nm-grid-glow) 1px, transparent 1px);
+  background-size: 44px 44px, 44px 44px, 220px 220px, 220px 220px;
+}
+
+.stApp::before {
+  opacity: 0.48;
+  -webkit-mask-image: radial-gradient(
+    ellipse at center,
+    #000 18%,
+    rgba(0, 0, 0, 0.82) 52%,
+    transparent 92%
+  );
+  mask-image: radial-gradient(
+    ellipse at center,
+    #000 18%,
+    rgba(0, 0, 0, 0.82) 52%,
+    transparent 92%
+  );
+  animation: dnd-grid-base-color 20s ease-in-out infinite;
+}
+
+.stApp::after {
+  opacity: 0.36;
+  -webkit-mask-image: radial-gradient(
+    ellipse at center,
+    #000 0%,
+    rgba(0, 0, 0, 0.94) 24%,
+    rgba(0, 0, 0, 0.54) 54%,
+    transparent 78%
+  );
+  mask-image: radial-gradient(
+    ellipse at center,
+    #000 0%,
+    rgba(0, 0, 0, 0.94) 24%,
+    rgba(0, 0, 0, 0.54) 54%,
+    transparent 78%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 48% 118%;
+  mask-size: 48% 118%;
+  -webkit-mask-position: -92% center;
+  mask-position: -92% center;
+  animation:
+    dnd-grid-wave 14s linear infinite,
+    dnd-grid-glow-color 20s ease-in-out infinite;
+  will-change: opacity, filter, mask-position;
+}
+
+@keyframes dnd-grid-wave {
+  0% {
+    opacity: 0.34;
+    -webkit-mask-position: -92% center;
+    mask-position: -92% center;
+  }
+  18% { opacity: 0.64; }
+  50% { opacity: 0.96; }
+  82% { opacity: 0.64; }
+  100% {
+    opacity: 0.34;
+    -webkit-mask-position: 192% center;
+    mask-position: 192% center;
+  }
+}
+
+@keyframes dnd-grid-base-color {
+  0%, 100% { filter: hue-rotate(0deg); }
+  50% { filter: hue-rotate(52deg); }
+}
+
+@keyframes dnd-grid-glow-color {
+  0%, 100% {
+    filter: hue-rotate(0deg) drop-shadow(0 0 2px rgba(85, 184, 255, 0.34));
+  }
+  50% {
+    filter: hue-rotate(52deg) drop-shadow(0 0 8px rgba(168, 85, 247, 0.48));
+  }
 }
 
 /* ===== Full-screen app shell =====
@@ -433,6 +534,20 @@ div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas,
 /* Keep undo button visible even if icon/text structure changes across Streamlit versions */
 .st-key-page2_chat_undo_btn button > div > p {
   margin: 0 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stApp::before {
+    animation: none;
+    filter: hue-rotate(26deg);
+  }
+  .stApp::after {
+    animation: none;
+    opacity: 0.30;
+    filter: hue-rotate(26deg);
+    -webkit-mask-position: center;
+    mask-position: center;
+  }
 }
 
 </style>
