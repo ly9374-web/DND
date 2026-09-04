@@ -65,7 +65,7 @@ def _show_error(exc: Exception):
 
 
 def _render_empty_space_submit_bridge() -> None:
-    """Turn a Space press on an empty chat box into an invisible submission."""
+    """Turn a Space/Enter press on an empty chat box into an invisible submission."""
     sentinel_json = json.dumps(_EMPTY_SPACE_SUBMISSION_SENTINEL, ensure_ascii=False)
     components.html(
         f"""
@@ -80,10 +80,13 @@ def _render_empty_space_submit_bridge() -> None:
             }}
 
             const handler = (event) => {{
+              const isEnter = event.key === "Enter";
+              const isSpace = event.key === " ";
               if (
-                event.key !== " " ||
+                (!isEnter && !isSpace) ||
                 event.repeat ||
                 event.isComposing ||
+                event.keyCode === 229 ||
                 event.altKey ||
                 event.ctrlKey ||
                 event.metaKey ||
