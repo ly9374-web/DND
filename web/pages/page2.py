@@ -37,6 +37,10 @@ _SINGLE_FLIGHT_OPERATION_KINDS = {
 
 _EMPTY_SPACE_CONTINUE_MESSAGE = "继续发展"
 _EMPTY_SPACE_SUBMISSION_SENTINEL = "\u2063\u2063\u2063"
+_HIDDEN_ASSISTANT_MESSAGE_PREFIXES = (
+    "本轮不掷骰子",
+    "本轮掷骰子",
+)
 
 
 def _chat_scope() -> str | None:
@@ -256,8 +260,9 @@ def _enqueue_operation(
     payload: dict | None = None,
     *,
     first: bool = False,
+    allow_same_kind: bool = False,
 ) -> _Page2OperationTask:
-    if kind in _SINGLE_FLIGHT_OPERATION_KINDS:
+    if kind in _SINGLE_FLIGHT_OPERATION_KINDS and not allow_same_kind:
         existing = _latest_earlier_operation(kind)
         if existing is not None:
             st.session_state["page2_operation_notice"] = (
@@ -419,6 +424,15 @@ def _conversation_started(turns: list[Page2ConversationTurn]) -> bool:
     return any(str(turn.user_message or "").strip() for turn in turns)
 
 
+def _assistant_message_for_display(text: str) -> str:
+    """Hide the model's dice-decision marker without changing saved context."""
+    display_text = str(text or "")
+    for prefix in _HIDDEN_ASSISTANT_MESSAGE_PREFIXES:
+        if display_text.startswith(prefix):
+            return display_text[len(prefix) :].lstrip(" \t\r\n，,。:：；;")
+    return display_text
+
+
 def _apply_chat_edit(edit: dict) -> bool:
     """更新对应气泡文本；清空保存 = 删除该条消息。"""
     if _story_brain_update_busy():
@@ -531,7 +545,10 @@ def _render_editable_chat_message(
 
         content_col, edit_col = st.columns([12, 1], vertical_alignment="top")
         with content_col:
-            st.markdown(text or "")
+            display_text = (
+                _assistant_message_for_display(text) if role == "assistant" else text
+            )
+            st.markdown(display_text or "")
         with edit_col:
             edit_clicked = st.button(
                 "",
@@ -1044,6 +1061,9 @@ def _prepare_chat_operation(task: _Page2OperationTask):
             "turn_id": new_turn.id,
             "memory_source_text": memory_source_text,
             "story_brain_enabled": story_brain_enabled,
+            "is_auto_dice_followup": bool(
+                task.payload.get("is_auto_dice_followup", False)
+            ),
         }
     )
     return lambda: page2_service.send_message(
@@ -1192,6 +1212,24 @@ def _apply_chat_operation(task: _Page2OperationTask) -> None:
                 turn_id=turn_id,
                 first=True,
             )
+    if (
+        task.error is None
+        and not bool(task.meta.get("is_auto_dice_followup", False))
+        and page2_service.should_auto_roll_dice(reply)
+    ):
+        _enqueue_operation(
+            "chat",
+            "自动掷骰并发送",
+            {
+                "ctx": ctx,
+                "user_text": _roll_user_dice_message(),
+                "hide_user_message": False,
+                "story_brain_enabled": story_brain_enabled,
+                "is_auto_dice_followup": True,
+            },
+            first=True,
+            allow_same_kind=True,
+        )
     st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
 
 

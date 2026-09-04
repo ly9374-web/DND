@@ -46,6 +46,8 @@ class AppStorageKeys:
     DOMOAI_API_KEY = "domoaiApiKey"
     ZHIPU_API_KEY = "zhipuApiKey"
     DEEPSEEK_API_KEY = "deepseekApiKey"
+    KEYLINK_DEEPSEEK_V4_PRO_API_KEY = "keylinkDeepseekV4ProApiKey"
+    KEYLINK_DEEPSEEK_V4_PRO_ENABLED = "keylinkDeepseekV4ProEnabled"
 
     SYSTEM_PROMPT_RECORDS = "systemPromptRecords"
     SELECTED_SYSTEM_PROMPT_RECORD_ID = "selectedSystemPromptRecordID"
@@ -394,6 +396,25 @@ class DeepSeekConfig:
             "DEEPSEEK_API_KEY",
         )
         return effective_deepseek_api_key
+
+
+# =========================
+# KeyLink DeepSeek V4 Pro 配置
+# =========================
+
+class KeyLinkDeepSeekV4ProConfig:
+    @staticmethod
+    def api_key():
+        api_key = str(
+            settings.get(AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_API_KEY, "") or ""
+        ).strip()
+        if not api_key:
+            return ""
+        return _require_latin1_api_value(api_key, "keylink-deepseek-v4-pro")
+
+    @staticmethod
+    def enabled():
+        return settings.bool(AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_ENABLED, False)
 
 
 # =========================

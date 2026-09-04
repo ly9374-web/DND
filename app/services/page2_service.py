@@ -114,6 +114,11 @@ def roll_point() -> int:
     return secrets.randbelow(25)
 
 
+def should_auto_roll_dice(assistant_message: str) -> bool:
+    """Return whether a freshly generated reply explicitly requests a dice roll."""
+    return str(assistant_message or "").rstrip().endswith("可以开始掷骰子。")
+
+
 def roll_unexpected_event() -> int:
     return secrets.randbelow(101)
 

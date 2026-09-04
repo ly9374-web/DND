@@ -173,6 +173,129 @@ class IndependentOrdinaryTests(unittest.TestCase):
             "雨幕中出现了一道门。",
         )
 
+    def test_auto_dice_roll_requires_exact_reply_ending(self):
+        self.assertTrue(page2_service.should_auto_roll_dice("可以开始掷骰子。"))
+        self.assertTrue(
+            page2_service.should_auto_roll_dice(
+                "##【行动判定】\n0—12：失败\n13—24：成功\n可以开始掷骰子。\n\n"
+            )
+        )
+        self.assertFalse(
+            page2_service.should_auto_roll_dice(
+                "可以开始掷骰子。\n>当前时间：7月20日 17:25"
+            )
+        )
+        self.assertFalse(
+            page2_service.should_auto_roll_dice("正文提到可以开始掷骰子。随后继续。")
+        )
+        self.assertFalse(page2_service.should_auto_roll_dice("请求失败，请稍后重试。"))
+
+    def test_dice_decision_marker_is_hidden_only_at_assistant_message_start(self):
+        from web.pages import page2
+
+        self.assertEqual(
+            page2._assistant_message_for_display("本轮不掷骰子\n\n雨还在下。"),
+            "雨还在下。",
+        )
+        self.assertEqual(
+            page2._assistant_message_for_display("本轮掷骰子：\n##【行动判定】"),
+            "##【行动判定】",
+        )
+        self.assertEqual(
+            page2._assistant_message_for_display("正文提到本轮不掷骰子。"),
+            "正文提到本轮不掷骰子。",
+        )
+
+    def test_completed_chat_queues_visible_auto_dice_followup(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        ctx = page2_service.default_context()
+        turn = Page2ConversationTurn(
+            user_message="尝试潜行",
+            assistant_message=None,
+            is_loading=True,
+        )
+        task = page2._Page2OperationTask(
+            kind="chat",
+            label="发送消息",
+            scope_id="test-scope",
+        )
+        task.result = "##【行动判定】\n0—12：失败\n13—24：成功\n可以开始掷骰子。"
+        task.meta = {
+            "turn_id": turn.id,
+            "ctx": ctx,
+            "story_brain_enabled": False,
+        }
+        session_state = SessionState(
+            page2_turns=[turn],
+            page2_operation_queue=[],
+            page2_active_operation=task,
+            page2_operation_scope_id="test-scope",
+            page2_story_brain_retry_pending=False,
+        )
+
+        with (
+            patch.object(page2.st, "session_state", session_state),
+            patch.object(page2, "_upsert_record"),
+            patch.object(page2.page2_service, "roll_point", return_value=17),
+        ):
+            page2._apply_chat_operation(task)
+
+        self.assertEqual(turn.assistant_message, task.result)
+        self.assertFalse(turn.is_loading)
+        self.assertEqual(len(session_state["page2_operation_queue"]), 1)
+        followup = session_state["page2_operation_queue"][0]
+        self.assertEqual(followup.kind, "chat")
+        self.assertEqual(followup.label, "自动掷骰并发送")
+        self.assertEqual(followup.payload["user_text"], "掷骰结果：“17”")
+        self.assertFalse(followup.payload["hide_user_message"])
+        self.assertTrue(followup.payload["is_auto_dice_followup"])
+
+    def test_auto_dice_followup_does_not_recursively_roll(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        ctx = page2_service.default_context()
+        turn = Page2ConversationTurn(
+            user_message="掷骰结果：“17”",
+            assistant_message=None,
+            is_loading=True,
+        )
+        task = page2._Page2OperationTask(
+            kind="chat",
+            label="自动掷骰并发送",
+            scope_id="test-scope",
+        )
+        task.result = "结算后又出现判定。\n可以开始掷骰子。"
+        task.meta = {
+            "turn_id": turn.id,
+            "ctx": ctx,
+            "story_brain_enabled": False,
+            "is_auto_dice_followup": True,
+        }
+        session_state = SessionState(
+            page2_turns=[turn],
+            page2_operation_queue=[],
+            page2_active_operation=task,
+            page2_operation_scope_id="test-scope",
+            page2_story_brain_retry_pending=False,
+        )
+
+        with (
+            patch.object(page2.st, "session_state", session_state),
+            patch.object(page2, "_upsert_record"),
+        ):
+            page2._apply_chat_operation(task)
+
+        self.assertEqual(session_state["page2_operation_queue"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

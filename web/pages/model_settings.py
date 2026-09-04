@@ -44,6 +44,13 @@ FIELDS = [
         "https://platform.deepseek.com/api_keys",
     ),
     (
+        "keylink-deepseek-v4-pro",
+        AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_API_KEY,
+        "KEYLINK_DEEPSEEK_V4_PRO_API_KEY",
+        None,
+        "https://keylinkclub.com/keys",
+    ),
+    (
         "输入 DomoAI API Key（会本地持久化保存）",
         AppStorageKeys.DOMOAI_API_KEY,
         "DOMOAI_API_KEY",
@@ -82,17 +89,17 @@ def _flash_key(storage_key: str) -> str:
     return f"model_settings_flash_{storage_key}"
 
 
-def _key_status(storage_key: str, secret_name: str) -> str:
+def _key_status(storage_key: str, secret_name: str | None) -> str:
     saved = str(settings.get(storage_key, "") or "").strip()
     if saved:
         if not is_latin1_api_value(saved):
             return "已填入（字符异常）"
         return "已填入"
 
-    if has_invalid_streamlit_secret(secret_name):
+    if secret_name and has_invalid_streamlit_secret(secret_name):
         return "默认 Key 字符异常"
 
-    if has_streamlit_secret(secret_name):
+    if secret_name and has_streamlit_secret(secret_name):
         return "已配置默认 Key"
 
     return "未填写"
@@ -197,6 +204,18 @@ def _save_debug_enabled():
     )
 
 
+def _save_keylink_deepseek_v4_pro_enabled():
+    settings.set(
+        AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_ENABLED,
+        bool(
+            st.session_state.get(
+                "model_settings_keylink_deepseek_v4_pro_enabled",
+                False,
+            )
+        ),
+    )
+
+
 def render():
     st.title("APIkey")
 
@@ -271,6 +290,21 @@ def render():
             st.success("已保存")
         elif flash == "deleted":
             st.success("已删除")
+
+        if key == AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_API_KEY:
+            st.checkbox(
+                "使用 KeyLink 调用 DeepSeek V4 Pro",
+                value=settings.bool(
+                    AppStorageKeys.KEYLINK_DEEPSEEK_V4_PRO_ENABLED,
+                    False,
+                ),
+                help=(
+                    "仅在调用 deepseek-v4-pro 且本项 Key 已填写时生效；"
+                    "关闭开关或 Key 为空时继续使用原 DeepSeek 地址。"
+                ),
+                key="model_settings_keylink_deepseek_v4_pro_enabled",
+                on_change=_save_keylink_deepseek_v4_pro_enabled,
+            )
 
         st.divider()
 

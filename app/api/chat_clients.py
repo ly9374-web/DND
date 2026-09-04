@@ -7,6 +7,7 @@ import requests
 from app.config import (
     XAIConfig,
     DeepSeekConfig,
+    KeyLinkDeepSeekV4ProConfig,
     debug_log,
     mask_authorization_header,
 )
@@ -421,6 +422,7 @@ class DeepSeekAPIClient:
     """
 
     CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
+    KEYLINK_V4_PRO_CHAT_URL = "https://keylinkclub.com/v1/chat/completions"
     DEFAULT_MODEL = "deepseek-v4-flash"
     SUPPORTED_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
 
@@ -465,44 +467,65 @@ class DeepSeekAPIClient:
             }
         )
 
-        effective_deepseek_api_key = DeepSeekConfig.api_key()
-        if not effective_deepseek_api_key:
+        request_url = cls.CHAT_URL
+        provider_label = "DeepSeek"
+        use_keylink = False
+        effective_api_key = ""
+
+        if model == "deepseek-v4-pro" and KeyLinkDeepSeekV4ProConfig.enabled():
+            effective_api_key = KeyLinkDeepSeekV4ProConfig.api_key()
+            if effective_api_key:
+                request_url = cls.KEYLINK_V4_PRO_CHAT_URL
+                provider_label = "KeyLink DeepSeek"
+                use_keylink = True
+
+        if not effective_api_key:
+            effective_api_key = DeepSeekConfig.api_key()
+
+        if not effective_api_key:
             raise RuntimeError(
                 "缺少 DeepSeek API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 DEEPSEEK_API_KEY。"
             )
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": "Bearer " + effective_deepseek_api_key,
+            "Authorization": "Bearer " + effective_api_key,
         }
 
-        body = {
-            "messages": messages,
-            "model": model,
-            "thinking": {
-                "type": "enabled" if thinking_enabled else "disabled",
-            },
-            "response_format": {
-                "type": "text",
-            },
-            "stream": False,
-            "temperature": temperature,
-            "top_p": 1,
-            "tool_choice": "none",
-            "logprobs": False,
-        }
-        if thinking_enabled and reasoning_effort:
-            body["reasoning_effort"] = str(reasoning_effort)
-        if max_tokens is not None:
-            body["max_tokens"] = int(max_tokens)
+        if use_keylink:
+            body = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+        else:
+            body = {
+                "messages": messages,
+                "model": model,
+                "thinking": {
+                    "type": "enabled" if thinking_enabled else "disabled",
+                },
+                "response_format": {
+                    "type": "text",
+                },
+                "stream": False,
+                "temperature": temperature,
+                "top_p": 1,
+                "tool_choice": "none",
+                "logprobs": False,
+            }
+            if thinking_enabled and reasoning_effort:
+                body["reasoning_effort"] = str(reasoning_effort)
+            if max_tokens is not None:
+                body["max_tokens"] = int(max_tokens)
 
         debug_log("====== DeepSeek Chat Request ======")
-        debug_log("URL:", cls.CHAT_URL)
+        debug_log("URL:", request_url)
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", json.dumps(body, ensure_ascii=False))
 
         response = requests.post(
-            cls.CHAT_URL,
+            request_url,
             headers=headers,
             json=body,
             timeout=3600,
@@ -518,16 +541,16 @@ class DeepSeekAPIClient:
             data = response.json()
         except Exception as exc:
             raise RuntimeError(
-                f"DeepSeek 返回了无法解析的响应（HTTP {response.status_code}）。"
+                f"{provider_label} 返回了无法解析的响应（HTTP {response.status_code}）。"
             ) from exc
 
         if data.get("error"):
             debug_log("====== DeepSeek Chat Error ======")
             debug_log(data.get("error"))
-            raise RuntimeError("DeepSeek API error: " + str(data.get("error")))
+            raise RuntimeError(provider_label + " API error: " + str(data.get("error")))
 
         if int(response.status_code) >= 400:
-            raise RuntimeError(f"DeepSeek API HTTP 错误：{response.status_code}")
+            raise RuntimeError(f"{provider_label} API HTTP 错误：{response.status_code}")
 
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -551,7 +574,7 @@ class DeepSeekAPIClient:
 
         finish_reason = str(first.get("finish_reason") or "unknown")
         content = str(content or "").strip()
-        if finish_reason == "length" and thinking_enabled:
+        if finish_reason == "length" and thinking_enabled and not use_keylink:
             debug_log(
                 "DeepSeek thinking output reached max_tokens; "
                 "retrying the same request with thinking disabled."
@@ -570,6 +593,10 @@ class DeepSeekAPIClient:
             return content
 
         if finish_reason == "length":
+            if use_keylink:
+                raise RuntimeError(
+                    "KeyLink DeepSeek 未返回最终内容（finish_reason=length）。"
+                )
             raise RuntimeError(
                 "DeepSeek 未返回最终内容（finish_reason=length），"
                 "关闭思考自动重试后仍用完了本次输出 token。"
