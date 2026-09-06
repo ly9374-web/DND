@@ -9,8 +9,8 @@ REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
 if [[ -f "$PROJECT_DIR/requirements.lock.txt" ]]; then
   REQUIREMENTS_FILE="$PROJECT_DIR/requirements.lock.txt"
 fi
-# 虚拟环境位于 iCloud 之外，避免被 iCloud 同步/物化破坏
-VENV_DIR="/Users/jason/.local/share/project-venvs/DND/.venv"
+# 虚拟环境位于 iCloud/网盘之外，避免被同步/物化破坏；$HOME 自动适配任意用户/任意 Mac
+VENV_DIR="$HOME/.local/share/project-venvs/DND/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 START_PORT="${STREAMLIT_PORT:-8502}"
 PORT="$START_PORT"
@@ -41,17 +41,38 @@ fi
 
 export VS_IMAGE_NOVEL_DATA_DIR="$PROJECT_DIR/.python_app_data"
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+# 虚拟环境不可用（不存在/损坏/Python 版本过旧）时自动重建；venv 内没有用户数据
+VENV_PYTHON="$VENV_DIR/bin/python"
+VENV_OK=0
+if [[ -x "$VENV_PYTHON" ]] && "$VENV_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+  VENV_OK=1
+fi
+if [[ "$VENV_OK" -eq 0 ]]; then
+  if [[ -d "$VENV_DIR" ]]; then
+    echo "虚拟环境不可用或 Python 版本过旧，正在重建..."
+    rm -rf "$VENV_DIR"
+  fi
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "Cannot find python3. Please install Python 3 first."
+    echo "找不到 python3。请先从 https://www.python.org/downloads/ 安装 Python 3.12+，然后重新双击本文件。"
     exit 1
   fi
-
-  echo "Creating virtual environment in .venv..."
+  if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    echo "Python 版本过低（需要 3.10+，推荐 3.12+）：$("$PYTHON_BIN" -V 2>&1)"
+    echo "请从 https://www.python.org/downloads/ 安装新版后重新双击本文件。"
+    exit 1
+  fi
+  echo "首次启动：正在创建虚拟环境..."
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-VENV_PYTHON="$VENV_DIR/bin/python"
+# 锁定清单依赖需要 Python 3.12+；低于 3.12 自动改用 requirements.txt（pip 会自动选择兼容版本）
+if ! "$VENV_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+  if [[ "$REQUIREMENTS_FILE" != "$PROJECT_DIR/requirements.txt" ]]; then
+    echo "当前 Python 低于 3.12，锁定清单依赖需要 3.12+，改用 requirements.txt 安装兼容版本..."
+    REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
+  fi
+fi
+
 NEED_INSTALL=0
 if [[ ! -f "$VENV_DIR/.requirements-installed" ]]; then
   NEED_INSTALL=1
@@ -96,4 +117,4 @@ echo "Data: $VS_IMAGE_NOVEL_DATA_DIR"
 echo "Local URL: http://localhost:$PORT"
 echo
 
-"$VENV_PYTHON" -m streamlit run "$APP_FILE" --server.port "$PORT" --server.headless false
+"$VENV_PYTHON" -m streamlit run "$APP_FILE" --server.port "$PORT" --server.headless false --server.showEmailPrompt false --browser.gatherUsageStats false
