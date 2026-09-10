@@ -51,18 +51,11 @@ FIELDS = [
         "https://keylinkclub.com/keys",
     ),
     (
-        "输入 DomoAI API Key（会本地持久化保存）",
-        AppStorageKeys.DOMOAI_API_KEY,
-        "DOMOAI_API_KEY",
-        "DOMOAI_API_KEY",
-        None,
-    ),
-    (
-        "输入 智谱 API Key（会本地持久化保存）",
-        AppStorageKeys.ZHIPU_API_KEY,
-        "ZHIPU_API_KEY",
-        "ZHIPU_API_KEY",
-        "https://bigmodel.cn/apikey/platform",
+        "输入 OpenRouter API Key（Seedance 视频模型共用，会本地持久化保存）",
+        AppStorageKeys.OPENROUTER_API_KEY,
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_API_KEY",
+        "https://openrouter.ai/settings/keys",
     ),
     (
         "输入 Cloudinary API Key（会本地持久化保存）",

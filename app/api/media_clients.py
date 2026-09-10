@@ -3,21 +3,23 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
 from app.config import (
     CloudinaryConfig,
-    DomoAIConfig,
+    OpenRouterConfig,
     ReplicateConfig,
     XAIConfig,
-    ZhipuConfig,
     debug_log,
     mask_authorization_header,
 )
+from app.video_models import VIDEO_MODELS, WAN_DURATION_FRAMES, WAN_FPS, WAN_MODEL, validate_video_duration
 
 
-IMAGE_ASPECT_RATIO = "3:4"
+IMAGE_ASPECT_RATIO = "1:1"
+IMAGE_ASPECT_RATIOS = ("3:4", "4:3", "1:1")
 
 
 @dataclass
@@ -106,6 +108,7 @@ class GrokImageAPIClient:
         model="grok-imagine-image",
         resolution="2k",
         quality=None,
+        aspect_ratio=IMAGE_ASPECT_RATIO,
     ):
         image_urls = image_urls or []
         image_urls = [url.strip() for url in image_urls if str(url).strip()]
@@ -128,7 +131,7 @@ class GrokImageAPIClient:
                 "model": model,
                 "prompt": prompt,
                 "resolution": resolution,
-                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "aspect_ratio": aspect_ratio,
             }
             if quality:
                 body["quality"] = quality
@@ -140,7 +143,7 @@ class GrokImageAPIClient:
                     "model": model,
                     "prompt": prompt,
                     "resolution": resolution,
-                    "aspect_ratio": IMAGE_ASPECT_RATIO,
+                    "aspect_ratio": aspect_ratio,
                     "image": {
                         "url": image_urls[0],
                         "type": "image_url",
@@ -153,7 +156,7 @@ class GrokImageAPIClient:
                     "model": model,
                     "prompt": prompt,
                     "resolution": resolution,
-                    "aspect_ratio": IMAGE_ASPECT_RATIO,
+                    "aspect_ratio": aspect_ratio,
                     "images": [
                         {
                             "url": item,
@@ -188,6 +191,10 @@ class GrokImageAPIClient:
 
 
 class ReplicateImageAPIClient:
+    POLL_INTERVAL_SECONDS = 3
+    POLL_TIMEOUT_SECONDS = 1200
+    MAX_POLL_ERRORS = 5
+
     MODELS = {
         "flux": "black-forest-labs/flux-2-pro",
         "nanoPro": "google/nano-banana-pro",
@@ -195,7 +202,7 @@ class ReplicateImageAPIClient:
     }
 
     @classmethod
-    def generate_image(cls, provider, prompt, image_urls=None):
+    def generate_image(cls, provider, prompt, image_urls=None, aspect_ratio=IMAGE_ASPECT_RATIO):
         image_urls = image_urls or []
         image_urls = [url.strip() for url in image_urls if str(url).strip()]
 
@@ -221,7 +228,7 @@ class ReplicateImageAPIClient:
             input_body = {
                 "prompt": prompt,
                 "resolution": "1 MP",
-                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "aspect_ratio": aspect_ratio,
                 "input_images": image_urls,
                 "output_format": "jpg",
                 "output_quality": 80,
@@ -232,7 +239,7 @@ class ReplicateImageAPIClient:
                 "prompt": prompt,
                 "resolution": "2K",
                 "image_input": image_urls,
-                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "aspect_ratio": aspect_ratio,
                 "output_format": "png",
                 "safety_filter_level": "block_only_high",
                 "allow_fallback_model": False,
@@ -241,7 +248,7 @@ class ReplicateImageAPIClient:
             input_body = {
                 "prompt": prompt,
                 "image_input": image_urls,
-                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "aspect_ratio": aspect_ratio,
                 "output_format": "jpg",
             }
 
@@ -254,12 +261,18 @@ class ReplicateImageAPIClient:
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", body)
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=3600,
-        )
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=(15, 90),
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                "Replicate 生图请求连接中断，无法确认任务是否已创建。"
+                "请先到 Replicate 查看任务记录，避免重复提交。"
+            ) from exc
 
         debug_log("====== Replicate Image HTTP Status ======")
         debug_log(response.status_code)
@@ -268,171 +281,107 @@ class ReplicateImageAPIClient:
 
         validate_http_response(response)
 
-        return parse_image_response(response.json())
+        return cls._wait_for_image(response.json(), effective_replicate_api_token)
+
+    @classmethod
+    def _wait_for_image(cls, data, api_token):
+        """Resolve both synchronous outputs and accepted asynchronous predictions."""
+        if not isinstance(data, dict):
+            raise RuntimeError("Replicate 生图响应不是 JSON 对象。")
+        prediction_id = str(data.get("id") or "").strip()
+        encoded_id = quote(prediction_id, safe="")
+        task_hint = (
+            f"任务 {prediction_id}：https://replicate.com/p/{encoded_id}"
+            if prediction_id else "响应未提供任务 ID。"
+        )
+        poll_url = "https://api.replicate.com/v1/predictions/" + encoded_id
+        headers = {"Authorization": "Bearer " + api_token}
+        deadline = time.monotonic() + cls.POLL_TIMEOUT_SECONDS
+        consecutive_errors = 0
+        delay = cls.POLL_INTERVAL_SECONDS
+        last_status = "unknown"
+
+        while True:
+            if not isinstance(data, dict):
+                raise RuntimeError("Replicate 查询响应不是 JSON 对象。" + task_hint)
+            status = str(data.get("status") or "").lower()
+            last_status = status or last_status
+            debug_log(
+                "[Replicate Image]", prediction_id, "status:", last_status,
+                "has_output:", bool(data.get("output")),
+            )
+            if status in {"failed", "error", "canceled", "cancelled", "aborted"}:
+                reason = str(data.get("error") or status)
+                raise RuntimeError(f"Replicate 生图任务未成功（{status}）：{reason}。{task_hint}")
+
+            # Sync mode can return ready file outputs while status is processing.
+            if data.get("output"):
+                result = parse_image_response(data)
+                if str(result.image_url or "").strip():
+                    return result
+            if status == "succeeded":
+                raise RuntimeError("Replicate 生图任务已结束，但未返回可用图片。" + task_hint)
+            if status not in {"starting", "processing"}:
+                raise RuntimeError(f"Replicate 生图任务状态无法识别：{status or '空'}。{task_hint}")
+            if not prediction_id:
+                raise RuntimeError("Replicate 生图任务尚未完成，但缺少任务 ID，无法继续查询。")
+
+            # Retry only GETs for this prediction, never the billable POST.
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"等待 Replicate 生图超时，最后状态：{last_status}。"
+                        "远端任务可能仍在执行，可打开任务链接查看结果。" + task_hint
+                    )
+                time.sleep(min(delay, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                try:
+                    response = requests.get(
+                        poll_url,
+                        headers=headers,
+                        timeout=(min(10, remaining), min(60, remaining)),
+                        allow_redirects=False,
+                    )
+                except (requests.ConnectionError, requests.Timeout,
+                        requests.exceptions.ChunkedEncodingError) as exc:
+                    retry_reason = type(exc).__name__
+                    response = None
+                else:
+                    debug_log("====== Replicate Image Poll HTTP Status ======")
+                    debug_log(response.status_code)
+                    if response.status_code == 429 or 500 <= response.status_code < 600:
+                        retry_reason = f"HTTP {response.status_code}"
+                    else:
+                        try:
+                            validate_http_response(response)
+                            data = response.json()
+                        except (RuntimeError, ValueError) as exc:
+                            raise RuntimeError(f"Replicate 生图查询失败：{exc}。{task_hint}") from exc
+                        consecutive_errors = 0
+                        delay = cls.POLL_INTERVAL_SECONDS
+                        break
+
+                consecutive_errors += 1
+                debug_log("[Replicate Image] 查询重试", prediction_id,
+                          consecutive_errors, retry_reason)
+                if consecutive_errors >= cls.MAX_POLL_ERRORS:
+                    raise RuntimeError(
+                        f"Replicate 生图连续查询失败：{retry_reason}。"
+                        "远端任务可能仍在执行，可打开任务链接查看结果。" + task_hint
+                    )
+                delay = min(30, cls.POLL_INTERVAL_SECONDS * 2 ** consecutive_errors)
+                if response is not None:
+                    try:
+                        delay = max(delay, min(60, float(response.headers.get("Retry-After", 0))))
+                    except (TypeError, ValueError):
+                        pass
 
 
 # 兼容旧名字：如果其他文件还 import ReplicateImageClient，也不会报错
 ReplicateImageClient = ReplicateImageAPIClient
-
-
-class DomoAIClient:
-    CREATE_IMAGE_TO_VIDEO_URL = "https://api.domoai.com/v1/video/image2video"
-
-    @staticmethod
-    def _extract_video_url(data):
-        if not isinstance(data, dict):
-            return None
-
-        direct = (
-            data.get("video_url")
-            or data.get("output_url")
-            or data.get("url")
-            or data.get("result")
-        )
-
-        if isinstance(direct, list) and direct:
-            direct = direct[0]
-
-        if isinstance(direct, str) and direct.startswith("http"):
-            return direct
-
-        output_videos = data.get("output_videos") or data.get("outputVideos")
-        if isinstance(output_videos, list) and output_videos:
-            first = output_videos[0]
-            if isinstance(first, dict):
-                nested_url = first.get("url") or first.get("video_url")
-                if isinstance(nested_url, str) and nested_url.startswith("http"):
-                    return nested_url
-            if isinstance(first, str) and first.startswith("http"):
-                return first
-
-        return None
-
-    @classmethod
-    def create_image_to_video_task_with_base64(cls, image_base64, prompt, seconds):
-        image_base64 = str(image_base64 or "").strip()
-        prompt = str(prompt or "").strip()
-
-        if not image_base64:
-            raise ValueError("imageBase64 不能为空")
-
-        try:
-            seconds = int(seconds)
-        except Exception:
-            raise ValueError("seconds 必须是整数")
-
-        if seconds < 1 or seconds > 10:
-            raise ValueError("视频时长必须在 1 到 10 秒之间")
-
-        effective_domoai_api_key = DomoAIConfig.api_key()
-        if not effective_domoai_api_key:
-            raise RuntimeError(
-                "缺少 DomoAI API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 DOMOAI_API_KEY。"
-            )
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + effective_domoai_api_key,
-        }
-
-        body = {
-            "prompt": prompt,
-            "model": "animate-2.4-faster",
-            "image": {
-                "bytes_base64_encoded": image_base64,
-            },
-            "seconds": seconds,
-        }
-
-        debug_log("====== DomoAI Image2Video Request ======")
-        debug_log("URL:", cls.CREATE_IMAGE_TO_VIDEO_URL)
-        debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
-
-        response = requests.post(
-            cls.CREATE_IMAGE_TO_VIDEO_URL,
-            headers=headers,
-            json=body,
-            timeout=3600,
-        )
-
-        debug_log("====== DomoAI Image2Video HTTP Status ======")
-        debug_log(response.status_code)
-        debug_log("====== DomoAI Image2Video Raw Response ======")
-        debug_log(response.text)
-
-        validate_http_response(response)
-
-        data = response.json()
-
-        code = data.get("code")
-        if code not in (None, 0):
-            raise RuntimeError("DomoAI error: " + str(data))
-
-        data_object = data.get("data")
-
-        if isinstance(data_object, dict):
-            task_id = data_object.get("task_id") or data_object.get("id")
-        else:
-            task_id = data.get("task_id") or data.get("id")
-
-        if not task_id:
-            raise RuntimeError("Missing task_id: " + str(data))
-
-        return str(task_id)
-
-    @classmethod
-    def poll_task_until_video_url(cls, task_id):
-        task_id = str(task_id or "").strip()
-
-        if not task_id:
-            raise ValueError("taskID 不能为空")
-
-        url = "https://api.domoai.com/v1/tasks/" + task_id
-
-        effective_domoai_api_key = DomoAIConfig.api_key()
-        if not effective_domoai_api_key:
-            raise RuntimeError(
-                "缺少 DomoAI API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 DOMOAI_API_KEY。"
-            )
-
-        headers = {
-            "Authorization": "Bearer " + effective_domoai_api_key,
-        }
-
-        for _ in range(80):
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=3600,
-            )
-
-            debug_log("====== DomoAI Poll HTTP Status ======")
-            debug_log(response.status_code)
-            debug_log("====== DomoAI Poll Raw Response ======")
-            debug_log(response.text)
-
-            validate_http_response(response)
-
-            data = response.json()
-
-            data_object = data.get("data")
-
-            if isinstance(data_object, dict):
-                status = str(data_object.get("status") or "").lower()
-                video_url = cls._extract_video_url(data_object)
-            else:
-                status = str(data.get("status") or "").lower()
-                video_url = cls._extract_video_url(data)
-
-            if isinstance(video_url, str) and video_url.startswith("http"):
-                return video_url
-
-            if status in ["failed", "error", "canceled", "cancelled"]:
-                raise RuntimeError("DomoAI task failed: " + str(data))
-
-            time.sleep(3)
-
-        raise TimeoutError("DomoAI 视频任务超时。")
 
 
 class ReplicateVideoAPIClient:
@@ -454,7 +403,8 @@ class ReplicateVideoAPIClient:
         return None
 
     @classmethod
-    def generate_wan_2_2_i2v_fast(cls, image_url, prompt):
+    def generate_wan_2_2_i2v_fast(cls, image_url, prompt, seconds=5):
+        validate_video_duration(WAN_MODEL, seconds)
         image_url = str(image_url or "").strip()
         prompt = str(prompt or "").strip()
 
@@ -477,10 +427,10 @@ class ReplicateVideoAPIClient:
                 "image": image_url,
                 "prompt": prompt,
                 "go_fast": True,
-                "num_frames": 81,
+                "num_frames": WAN_DURATION_FRAMES[seconds],
                 "resolution": "720p",
                 "sample_shift": 12,
-                "frames_per_second": 16,
+                "frames_per_second": WAN_FPS,
                 "interpolate_output": False,
                 "lora_scale_transformer": 1,
                 "lora_scale_transformer_2": 1,
@@ -564,153 +514,131 @@ class ReplicateVideoAPIClient:
         raise TimeoutError("Replicate Wan 2.2 I2V Fast 视频任务超时。")
 
 
-class ZhipuVideoClient:
-    CREATE_VIDEO_URL = "https://open.bigmodel.cn/api/paas/v4/videos/generations"
-    POLL_URL_PREFIX = "https://open.bigmodel.cn/api/paas/v4/async-result/"
-
-    @staticmethod
-    def _extract_video_url(data):
-        if not isinstance(data, dict):
-            return None
-
-        direct = (
-            data.get("video_url")
-            or data.get("output")
-            or data.get("result")
-        )
-
-        if isinstance(direct, list) and direct:
-            direct = direct[0]
-
-        if isinstance(direct, str) and direct.startswith("http"):
-            return direct
-
-        video_result = data.get("video_result") or data.get("videoResult")
-        if isinstance(video_result, list) and video_result:
-            first = video_result[0]
-            if isinstance(first, dict):
-                nested_url = first.get("url") or first.get("video_url")
-                if isinstance(nested_url, str) and nested_url.startswith("http"):
-                    return nested_url
-            if isinstance(first, str) and first.startswith("http"):
-                return first
-
-        return None
+class OpenRouterVideoAPIClient:
+    CREATE_URL = "https://openrouter.ai/api/v1/videos"
+    POLL_INTERVAL_SECONDS = 10
+    POLL_TIMEOUT_SECONDS = 1800
+    MAX_POLL_ERRORS = 5
 
     @classmethod
-    def create_image_to_video_task(cls, image_url, prompt, seconds):
-        image_url = str(image_url or "").strip()
-        prompt = str(prompt or "").strip()
-
-        if not image_url:
-            raise ValueError("智谱图生视频需要图片 URL")
-
-        try:
-            seconds = int(seconds)
-        except Exception:
-            raise ValueError("seconds 必须是整数")
-
-        if seconds not in (5, 10):
-            raise ValueError("智谱视频时长只支持 5 秒或 10 秒。")
-
-        effective_zhipu_api_key = ZhipuConfig.api_key()
-        if not effective_zhipu_api_key:
-            raise RuntimeError(
-                "缺少智谱 API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 ZHIPU_API_KEY。"
-            )
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + effective_zhipu_api_key,
-        }
-
+    def generate_video(cls, *, model, image_url, prompt, seconds, aspect_ratio, generate_audio=True):
+        validate_video_duration(model, seconds)
+        if model == WAN_MODEL:
+            raise ValueError("Wan 视频请使用 Replicate API。")
+        if aspect_ratio not in VIDEO_MODELS[model].aspect_ratios:
+            raise ValueError("当前视频模型不支持此画面比例。")
+        if urlsplit(str(image_url)).scheme not in ("http", "https"):
+            raise ValueError("Seedance 图生视频需要可访问的图片 URL。")
+        api_key = OpenRouterConfig.api_key()
+        if not api_key:
+            raise RuntimeError("缺少 OpenRouter API Key，请在 APIkey 页面填写或配置 OPENROUTER_API_KEY。")
+        headers = {"Authorization": "Bearer " + api_key}
         body = {
-            "model": "cogvideox-2",
-            "image_url": image_url,
+            "model": model,
             "prompt": prompt,
-            "duration": seconds,
-            "quality": "speed",
-            "with_audio": False,
-            "fps": 30,
+            "duration": int(seconds),
+            "resolution": "720p",
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": bool(generate_audio),
+            "frame_images": [{
+                "type": "image_url",
+                "image_url": {"url": image_url},
+                "frame_type": "first_frame",
+            }],
         }
-
-        debug_log("====== Zhipu Image2Video Request ======")
-        debug_log("URL:", cls.CREATE_VIDEO_URL)
-        debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
-        debug_log("Body:", body)
-
-        response = requests.post(
-            cls.CREATE_VIDEO_URL,
-            headers=headers,
-            json=body,
-            timeout=3600,
-        )
-
-        debug_log("====== Zhipu Image2Video HTTP Status ======")
-        debug_log(response.status_code)
-        debug_log("====== Zhipu Image2Video Raw Response ======")
-        debug_log(response.text)
-
+        try:
+            response = requests.post(cls.CREATE_URL, headers=headers, json=body, timeout=(15, 60))
+        except requests.RequestException as exc:
+            # A timed-out POST may already have created a paid job. Never resubmit it here.
+            raise RuntimeError("OpenRouter 连接中断，无法确认任务是否已创建，请先查看 OpenRouter 任务记录。") from exc
         validate_http_response(response)
-
         data = response.json()
-        task_id = data.get("id") or data.get("task_id")
-
+        task_id = str(data.get("id") or "").strip()
         if not task_id:
-            raise RuntimeError("Missing Zhipu task id: " + str(data))
-
-        return str(task_id)
-
-    @classmethod
-    def poll_video_url(cls, task_id):
-        task_id = str(task_id or "").strip()
-
-        if not task_id:
-            raise ValueError("taskID 不能为空")
-
-        url = cls.POLL_URL_PREFIX + task_id
-
-        effective_zhipu_api_key = ZhipuConfig.api_key()
-        if not effective_zhipu_api_key:
-            raise RuntimeError(
-                "缺少智谱 API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 ZHIPU_API_KEY。"
-            )
-
-        headers = {
-            "Authorization": "Bearer " + effective_zhipu_api_key,
-        }
-
-        for _ in range(120):
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=3600,
-            )
-
-            debug_log("====== Zhipu Poll HTTP Status ======")
-            debug_log(response.status_code)
-            debug_log("====== Zhipu Poll Raw Response ======")
-            debug_log(response.text)
-
+            raise RuntimeError("OpenRouter 未返回视频任务 ID。")
+        # Construct authenticated URLs ourselves instead of trusting arbitrary response URLs.
+        poll_url = cls.CREATE_URL + "/" + quote(task_id, safe="")
+        deadline = time.monotonic() + cls.POLL_TIMEOUT_SECONDS
+        errors = 0
+        while True:
+            status = str(data.get("status") or "").lower()
+            if status == "completed":
+                return poll_url + "/content?index=0"
+            if status in ("failed", "cancelled", "canceled", "expired"):
+                raise RuntimeError(f"OpenRouter 视频任务 {status}：{data.get('error') or '生成失败'}；任务：{task_id}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"OpenRouter 视频等待超时，请保留任务地址查询结果：{poll_url}")
+            time.sleep(min(cls.POLL_INTERVAL_SECONDS, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue
+            try:
+                response = requests.get(poll_url, headers=headers, timeout=(15, min(60, remaining)))
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise requests.ConnectionError(f"HTTP {response.status_code}")
+            except requests.RequestException as exc:
+                errors += 1
+                if errors >= cls.MAX_POLL_ERRORS:
+                    raise RuntimeError(f"OpenRouter 连续查询失败，任务可能仍在运行：{poll_url}") from exc
+                continue
             validate_http_response(response)
-
             data = response.json()
+            errors = 0
 
-            video_url = cls._extract_video_url(data)
 
-            if isinstance(video_url, str) and video_url.startswith("http"):
-                return video_url
+def is_openrouter_video_url(url):
+    parsed = urlsplit(str(url or ""))
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "openrouter.ai"
+        and parsed.path.startswith("/api/v1/videos/")
+        and parsed.path.endswith("/content")
+    )
 
-            task_status = str(
-                data.get("task_status") or data.get("status") or ""
-            ).lower()
 
-            if task_status in ["failed", "error", "canceled", "cancelled"]:
-                raise RuntimeError("智谱视频任务失败：" + str(data))
-
-            time.sleep(3)
-
-        raise TimeoutError("智谱视频任务超时。")
+def download_video_bytes(url, *, api_key=""):
+    """Fetch only for an explicit preview/download, in memory; never persist a video."""
+    headers = {}
+    if is_openrouter_video_url(url):
+        if not api_key:
+            raise RuntimeError("播放或下载此视频需要 OpenRouter API Key，请在 APIkey 页面填写。")
+        headers["Authorization"] = "Bearer " + api_key
+    elif urlsplit(str(url)).hostname == "openrouter.ai":
+        raise ValueError("不是有效的 OpenRouter 视频下载地址。")
+    current_url = url
+    for _ in range(6):
+        if urlsplit(str(current_url)).scheme not in ("http", "https"):
+            raise ValueError("视频下载地址必须是 HTTP 或 HTTPS URL。")
+        response = requests.get(
+            current_url, headers=headers, timeout=(15, 120), stream=True, allow_redirects=False,
+        )
+        try:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    raise RuntimeError("视频下载重定向缺少目标地址。")
+                current_url = urljoin(current_url, location)
+                # Redirects target signed delivery URLs; do not forward the API key.
+                headers = {}
+                continue
+            if response.status_code in (404, 410):
+                raise RuntimeError("视频链接已失效或视频已被服务商清理。")
+            validate_http_response(response)
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/" in content_type or "json" in content_type:
+                raise RuntimeError("服务商返回的不是视频文件。")
+            chunks = bytearray()
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                chunks.extend(chunk)
+                if len(chunks) > 256 * 1024 * 1024:
+                    raise RuntimeError("视频超过 256 MB，无法在当前播放器中加载。")
+            if not chunks:
+                raise RuntimeError("服务商返回的视频文件为空。")
+            return bytes(chunks)
+        finally:
+            response.close()
+    raise RuntimeError("视频下载重定向次数过多。")
 
 
 class CloudinaryUploader:

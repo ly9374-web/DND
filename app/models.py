@@ -12,6 +12,14 @@ def new_id():
     return str(uuid4())
 
 
+def optional_positive_int(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 class Page2ChatModel(str, Enum):
     GROK1 = "grok1"
     GROK2 = "grok2"
@@ -53,23 +61,51 @@ def grok_api_model_for_chat_model(value) -> str | None:
     return GROK_CHAT_MODEL_IDS.get(normalize_chat_model(value))
 
 
-class Page2VideoGenerationProvider(str, Enum):
-    DOMOAI = "domoai"
-    ZHIPU = "zhipu"
-
-
 class GeneratedMediaKind(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
 
 
 @dataclass
+class FirstInputRecord:
+    title: str
+    content: str
+    id: str = field(default_factory=new_id)
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+
+    @staticmethod
+    def from_dict(data):
+        return FirstInputRecord(
+            id=data.get("id") or new_id(),
+            title=data.get("title") or data.get("name") or "",
+            content=data.get("content") or data.get("text") or "",
+            created_at=data.get("created_at") or data.get("createdAt") or now_iso(),
+            updated_at=data.get("updated_at") or data.get("updatedAt") or now_iso(),
+        )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content": self.content,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
 class SystemPromptRecord:
     title: str
     prompt: str
+    # Legacy compatibility mirror of the currently selected first-input content.
     first_input: str = ""
+    first_inputs: list[FirstInputRecord] = field(default_factory=list)
+    selected_first_input_id: str = ""
+    long_term_memory: str = ""
     final_template_id: str = ""
     final_world_book_id: str = ""
+    final_long_term_memory_id: str = ""
     final_user_character_id: str = ""
     final_other_character_ids: list[str] = field(default_factory=list)
     final_user_character_name: str = ""
@@ -77,22 +113,66 @@ class SystemPromptRecord:
     id: str = field(default_factory=new_id)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+    first_inputs_need_migration: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        normalized_inputs: list[FirstInputRecord] = []
+        for item in list(self.first_inputs or []):
+            if isinstance(item, FirstInputRecord):
+                normalized_inputs.append(item)
+            elif isinstance(item, dict):
+                normalized_inputs.append(FirstInputRecord.from_dict(item))
+        if not normalized_inputs:
+            normalized_inputs = [
+                FirstInputRecord(
+                    title="默认首轮输入",
+                    content=str(self.first_input or ""),
+                )
+            ]
+        self.first_inputs = normalized_inputs
+        if not any(item.id == self.selected_first_input_id for item in self.first_inputs):
+            self.selected_first_input_id = self.first_inputs[0].id
+        selected = next(
+            item for item in self.first_inputs if item.id == self.selected_first_input_id
+        )
+        self.first_input = str(selected.content or "")
 
     @staticmethod
     def from_dict(data):
-        return SystemPromptRecord(
+        legacy_first_input = (
+            data.get("first_input")
+            or data.get("firstInput")
+            or data.get("first_reply")
+            or data.get("firstReply")
+            or ""
+        )
+        record = SystemPromptRecord(
             id=data.get("id") or new_id(),
             title=data.get("title", "未命名记录"),
             prompt=data.get("prompt", ""),
-            first_input=(
-                data.get("first_input")
-                or data.get("firstInput")
-                or data.get("first_reply")
-                or data.get("firstReply")
+            first_input=legacy_first_input,
+            first_inputs=[
+                FirstInputRecord.from_dict(item)
+                for item in (data.get("first_inputs") or data.get("firstInputs") or [])
+                if isinstance(item, dict)
+            ],
+            selected_first_input_id=(
+                data.get("selected_first_input_id")
+                or data.get("selectedFirstInputID")
+                or ""
+            ),
+            long_term_memory=(
+                data.get("long_term_memory")
+                or data.get("longTermMemory")
                 or ""
             ),
             final_template_id=data.get("final_template_id") or data.get("finalTemplateID") or "",
             final_world_book_id=data.get("final_world_book_id") or data.get("finalWorldBookID") or "",
+            final_long_term_memory_id=(
+                data.get("final_long_term_memory_id")
+                or data.get("finalLongTermMemoryID")
+                or ""
+            ),
             final_user_character_id=(
                 data.get("final_user_character_id")
                 or data.get("finalUserCharacterID")
@@ -115,16 +195,26 @@ class SystemPromptRecord:
             ),
             created_at=data.get("created_at") or data.get("createdAt") or now_iso(),
             updated_at=data.get("updated_at") or data.get("updatedAt") or now_iso(),
+            first_inputs_need_migration=not bool(
+                data.get("first_inputs") or data.get("firstInputs")
+            ),
         )
+        return record
 
     def to_dict(self):
+        self.__post_init__()
+        self.first_inputs_need_migration = False
         return {
             "id": self.id,
             "title": self.title,
             "prompt": self.prompt,
             "first_input": self.first_input,
+            "first_inputs": [item.to_dict() for item in self.first_inputs],
+            "selected_first_input_id": self.selected_first_input_id,
+            "long_term_memory": self.long_term_memory,
             "final_template_id": self.final_template_id,
             "final_world_book_id": self.final_world_book_id,
+            "final_long_term_memory_id": self.final_long_term_memory_id,
             "final_user_character_id": self.final_user_character_id,
             "final_other_character_ids": list(self.final_other_character_ids),
             "final_user_character_name": self.final_user_character_name,
@@ -202,6 +292,7 @@ class Page2ConversationTurn:
     assistant_message: str = None
     is_loading: bool = False
     is_user_message_hidden: bool = False
+    is_context_excluded: bool = False
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
 
@@ -217,6 +308,11 @@ class Page2ConversationTurn:
                 if "is_user_message_hidden" in data
                 else data.get("isUserMessageHidden", False)
             ),
+            is_context_excluded=bool(
+                data.get("is_context_excluded")
+                if "is_context_excluded" in data
+                else data.get("isContextExcluded", False)
+            ),
             date=data.get("date") or now_iso(),
         )
 
@@ -227,6 +323,7 @@ class Page2ConversationTurn:
             "assistant_message": self.assistant_message,
             "is_loading": self.is_loading,
             "is_user_message_hidden": self.is_user_message_hidden,
+            "is_context_excluded": self.is_context_excluded,
             "date": self.date,
         }
 
@@ -242,10 +339,14 @@ class GeneratedImageRecord:
     video_url_string: str = None
     source_image_url_string: str = None
     source_image_data_base64: str = None
-    duration_seconds: int = None
+    duration_seconds: float = None
     video_generation_provider: str = None
     id: str = field(default_factory=new_id)
     created_at: str = field(default_factory=now_iso)
+    source_turn_id: str = ""
+    previous_source_turn_id: str = ""
+    video_prompt: str = ""
+    video_story_text: str = ""
 
     @staticmethod
     def from_dict(data):
@@ -269,6 +370,10 @@ class GeneratedImageRecord:
             source_image_data_base64=data.get("source_image_data_base64") or data.get("sourceImageDataBase64"),
             duration_seconds=data.get("duration_seconds") or data.get("durationSeconds"),
             video_generation_provider=data.get("video_generation_provider") or data.get("videoGenerationProvider"),
+            source_turn_id=str(data.get("source_turn_id") or ""),
+            previous_source_turn_id=str(data.get("previous_source_turn_id") or ""),
+            video_prompt=str(data.get("video_prompt") or ""),
+            video_story_text=str(data.get("video_story_text") or ""),
         )
 
     def to_dict(self):
@@ -287,6 +392,10 @@ class GeneratedImageRecord:
             "source_image_data_base64": self.source_image_data_base64,
             "duration_seconds": self.duration_seconds,
             "video_generation_provider": self.video_generation_provider,
+            "source_turn_id": self.source_turn_id,
+            "previous_source_turn_id": self.previous_source_turn_id,
+            "video_prompt": self.video_prompt,
+            "video_story_text": self.video_story_text,
         }
 
 
@@ -329,6 +438,13 @@ class ChatRecord:
     # original JSON so opening and saving an old record cannot erase its data.
     story_brain: object = field(default_factory=dict)
     story_brain_short: str = ""
+    story_brain_next_update_turn: int | None = None
+    story_brain_last_update_turn_id: str = ""
+    # At most two versions: current and previous, never a per-turn memory archive.
+    story_brain_checkpoints: list = field(default_factory=list)
+    final_setting_id: str = ""
+    # 记录是否属于隐藏账号（在隐藏账号中创建的聊天记录对普通账号不可见）。
+    hidden: bool = False
     id: str = field(default_factory=new_id)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
@@ -359,6 +475,26 @@ class ChatRecord:
                 else data.get("storyBrain", {})
             ),
             story_brain_short=data.get("story_brain_short") or data.get("storyBrainShort") or "",
+            story_brain_next_update_turn=optional_positive_int(
+                data.get("story_brain_next_update_turn")
+                if "story_brain_next_update_turn" in data
+                else data.get("storyBrainNextUpdateTurn")
+            ),
+            story_brain_last_update_turn_id=str(
+                data.get("story_brain_last_update_turn_id")
+                or data.get("storyBrainLastUpdateTurnID")
+                or ""
+            ),
+            final_setting_id=(
+                data.get("final_setting_id")
+                or data.get("finalSettingID")
+                or ""
+            ),
+            story_brain_checkpoints=deepcopy([
+                item for item in (data.get("story_brain_checkpoints") or [])
+                if isinstance(item, dict) and isinstance(item.get("state"), dict)
+            ][-2:]),
+            hidden=bool(data.get("hidden", False)),
             created_at=data.get("created_at") or data.get("createdAt") or now_iso(),
             updated_at=data.get("updated_at") or data.get("updatedAt") or now_iso(),
         )
@@ -378,6 +514,15 @@ class ChatRecord:
             ],
             "story_brain": deepcopy(self.story_brain),
             "story_brain_short": str(self.story_brain_short or "").strip(),
+            "story_brain_next_update_turn": optional_positive_int(
+                self.story_brain_next_update_turn
+            ),
+            "story_brain_last_update_turn_id": str(
+                self.story_brain_last_update_turn_id or ""
+            ),
+            "final_setting_id": str(self.final_setting_id or ""),
+            "story_brain_checkpoints": deepcopy(self.story_brain_checkpoints[-2:]),
+            "hidden": bool(self.hidden),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -390,6 +535,7 @@ class ChatRecordIndexItem:
     created_at: str
     updated_at: str
     file_name: str
+    hidden: bool = False
 
     @staticmethod
     def from_dict(data):
@@ -399,6 +545,7 @@ class ChatRecordIndexItem:
             created_at=data.get("created_at") or data.get("createdAt") or now_iso(),
             updated_at=data.get("updated_at") or data.get("updatedAt") or now_iso(),
             file_name=data.get("file_name") or data.get("fileName") or "",
+            hidden=bool(data.get("hidden", False)),
         )
 
     def to_dict(self):
@@ -408,4 +555,5 @@ class ChatRecordIndexItem:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "file_name": self.file_name,
+            "hidden": bool(self.hidden),
         }

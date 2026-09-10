@@ -1,6 +1,8 @@
 import json
+import time
 from dataclasses import dataclass
 from typing import Optional, List
+from urllib.parse import urlparse
 
 import requests
 
@@ -11,6 +13,52 @@ from app.config import (
     debug_log,
     mask_authorization_header,
 )
+
+
+# =========================
+# 网络瞬断自动重试（代理重启/切换节点时秒级不可用）
+# =========================
+
+TRANSIENT_NETWORK_ERRORS = (
+    requests.exceptions.ProxyError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+NETWORK_RETRY_DELAYS = (2, 5)
+
+
+def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_env_proxy=False, stream=False):
+    """POST 请求；遇到代理断连/连接被重置等瞬时网络错误时自动重试。
+
+    仅重试连接层异常（请求未送达服务器），HTTP 错误码不重试。
+    bypass_env_proxy=True 时对该 URL 的主机忽略环境变量代理直连
+    （用于国内可直连的服务，如 api.deepseek.com）。
+    stream=True 时返回未消费的流式响应，调用方自行迭代。
+    """
+    extra_kwargs = {}
+    if bypass_env_proxy:
+        # requests 官方支持的用法：proxies 中的 no_proxy 键使该主机绕过
+        # 环境变量代理，其余请求不受影响。
+        extra_kwargs["proxies"] = {"no_proxy": urlparse(url).hostname or ""}
+    last_exc = None
+    for attempt, delay in enumerate([0] + list(NETWORK_RETRY_DELAYS)):
+        if delay:
+            debug_log(f"{label} 网络瞬断，{delay}s 后第 {attempt + 1} 次重试：{last_exc}")
+            time.sleep(delay)
+        try:
+            return requests.post(
+                url,
+                headers=headers,
+                json=json_body,
+                timeout=timeout,
+                stream=stream,
+                **extra_kwargs,
+            )
+        except TRANSIENT_NETWORK_ERRORS as exc:
+            last_exc = exc
+    raise last_exc
 
 
 # =========================
@@ -49,10 +97,7 @@ class GrokAPIClient:
 
     功能：
     1. 普通聊天 send_message()
-    2. 生成图片prompt generate_image_prompt()
-    3. 第一人称图片prompt generate_first_person_image_prompt()
-    4. 人物特写图片prompt generate_character_closeup_image_prompt()
-    5. 解析 Grok Responses API 返回
+    2. 解析 Grok Responses API 返回
     """
 
     RESPONSES_URL = "https://api.x.ai/v1/responses"
@@ -97,6 +142,7 @@ class GrokAPIClient:
             "model": model,
             "input": input_messages,
             "temperature": temperature,
+            "max_output_tokens": 20000,
         }
         if thinking_enabled is not None:
             effective_reasoning_effort = (
@@ -107,140 +153,53 @@ class GrokAPIClient:
         data = cls._post_responses(body, label="Grok Request")
         return cls.parse_response(data).text
 
-    @classmethod
-    def generate_image_prompt(cls, user_message):
+    @staticmethod
+    def _consume_responses_stream(response, label):
+        """消费 /v1/responses 的 SSE 流，返回与同步接口同构的 data dict。
+
+        优先使用 response.completed 事件携带的完整 response；
+        若流直接以连接关闭结束（无 completed/[DONE]，实测 xAI 行为），
+        则从 output_text.delta 拼接文本并构造 {"id": ..., "output_text": ...}。
+        无任何文本 delta 时返回 None，由调用方回退非流式。
         """
-        对应 Swift:
-        generateImagePrompt(from userMessage:)
-        """
+        text_parts = []
+        response_id = None
+        # SSE 流为 UTF-8；响应头未声明 charset 时 requests 默认用
+        # ISO-8859-1 解码会导致中文乱码，这里显式指定。
+        if (response.encoding or "").lower().replace("-", "") != "utf8":
+            response.encoding = "utf-8"
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or "")
+            if event_type == "response.completed":
+                inner = event.get("response")
+                if isinstance(inner, dict):
+                    return inner
+            elif event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    text_parts.append(delta)
+            elif event_type == "response.created" and response_id is None:
+                created = event.get("response")
+                if isinstance(created, dict):
+                    response_id = created.get("id")
 
-        system_prompt = """
-# 任务
-根据 `userMessage` 提取最适合视觉化的一个瞬间，生成可直接用于 AI 绘图的图片描述。不要复述剧情，只描述摄像机能够直接看到的内容。
-# 输出格式
-场景：
-描述人物所在环境，按前景、中景、背景说明可见内容，包括建筑、家具、道路、植物、车辆、天气、时间、背景人物等。不要使用剧情中的专有地点名称，不描述情绪或氛围。
-主要人物：
-先说明主要人物数量，再逐一描述。每个人物尽量包含：性别、年龄段、外貌特征、发型发色、身材、穿着特征、身体姿势、手部动作、头部朝向、视线和面部表情。不要使用剧情中的人物姓名。
-人物互动：
-明确人物之间的位置和距离，以及谁在看谁、谁碰到谁、谁拿着什么。只描述能直接看见的动作。
-构图：
-说明人物位于画面左、中、右，以及前景、中景、背景的空间关系。确保主体清晰，避免重要人物互相遮挡。除非剧情要求，否则尽量让主要人物脸部和动作完整可见。
-摄像头角度：
-按照“景别 + 机位高度 + 拍摄方向 + 俯仰角度”描述。例如：中远景，摄像机位于人物胸部高度，从人物左前方45度拍摄，轻微俯视，可以同时看到两名人物和后方环境。
-画风：动漫画风
-# 规则
-* 只选择一个明确瞬间，不混合多个时间点。
-* 忠于给你的userMessage，不省略任何东西。
-* 不能输出人名或者地名。
-严格按照以上格式输出，不附加解释。
-# 案例：
-userMessage：
-放学后，小雨回到教室拿遗忘的作业本，发现班主任还站在讲台旁。她刚准备离开，老师突然叫住她，把一张满是红色批注的试卷递了过来。小雨低着头接过试卷，教室门口还有三个正在等她的同学，窗外已经完全黑了。
-输出：
-场景：
-一间普通学校教室，室内亮着白色顶灯。前景有几排整齐排列的木质课桌和椅子，中景是讲台和黑板，桌面放着几本书和教学用品。背景右侧是打开的教室门，门口站着三名穿校服的学生。左侧窗户外为黑夜，玻璃上映出部分室内灯光。
-主要人物：
-画面中有两名主要人物。一名十几岁的亚洲女学生站在讲台前，皮肤白皙，黑色中长发，身材纤细，穿白色校服衬衫、深色百褶裙和运动鞋。她微微低头，右手伸向前方接试卷，视线落在试卷上，眉毛轻微下垂，嘴唇闭合。另一名三十岁左右的亚洲女教师站在讲台旁，黑色长发扎在脑后，穿浅色衬衫和深色长裤，右手拿着一张布满红色批注的白色试卷并向学生递出，脸朝向学生。
-人物互动：
-女教师站在女学生正前方约半米处，右手将试卷递向女学生。女学生伸出右手接住试卷下方，两人的视线都集中在试卷附近。门口三名学生站在较远的背景位置，看向教室内部。
-构图：
-女学生位于画面中央偏左，女教师位于中央偏右，两人构成画面主体。讲台位于两人后方，课桌占据前景下方区域，门口三名学生位于右侧背景，左侧窗户可以清楚看到黑色夜景。两名主要人物身体和脸部均无遮挡。
-摄像头角度：
-中远景，摄像机位于教室后方、接近人物胸部高度，从两名主要人物左前方约45度拍摄，轻微俯视，可以同时看到讲台前的两名人物、前景课桌、左侧窗户和右侧门口的三名学生。
-画风：动漫
-""".strip()
-
-        body = {
-            "model": "grok-4.3",
-            "input": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_message,
-                },
-            ],
-        }
-
-        data = cls._post_responses(body, label="Grok Prompt Request")
-        return cls.parse_response(data).text
-
-    @classmethod
-    def generate_first_person_image_prompt(cls, user_message, subject):
-        """
-        对应 Swift:
-        generateFirstPersonImagePrompt(from userMessage:subject:)
-        """
-
-        subject = str(subject or "").strip()
-        if not subject:
-            raise ValueError("Subject is empty")
-
-        system_prompt = (
-            f"分析我给你的故事，以“{subject}”为第一人称，并用“我”代指自己的名字，"
-            f"使用客观具体的描述，最终输出不超过100字“{subject}”所看到的画面，"
-            f"用第一人称“我”来描述所看到的画面。禁止使用抽象的词汇，"
-            f"禁止生成“{subject}”看不到的内容，比如“{subject}”的形象，"
-            f"“{subject}”背后的环境，禁止使用成语抽象描述场景。"
-            f"并且在prompt中描述“{subject}”的一个肢体在画面何处出现输出少于150字。"
-            "输出结尾加上“摄像头视角：我的第一人称视角”和“画风：写实”\n"
-            "案例：我看到前方有一位黄头发蓝眼睛的可爱亚洲成年女性蹲在教室的地面上，"
-            "她的表情悲伤，穿着校服。背景是教室，周围有其他学生，后面的光线昏暗发黄。"
-            "画面左侧伸出我拿着铅笔的手指着那位女生 摄像头视角：我的第一人称视角 画风：写实"
-        )
-
-        body = {
-            "model": "grok-4.3",
-            "input": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_message,
-                },
-            ],
-        }
-
-        data = cls._post_responses(body, label="Grok First Person Prompt Request")
-        return cls.parse_response(data).text
-
-    @classmethod
-    def generate_character_closeup_image_prompt(cls, user_message, subject):
-        """
-        对应 Swift:
-        generateCharacterCloseupImagePrompt(from userMessage:subject:)
-        """
-
-        subject = str(subject or "").strip()
-        if not subject:
-            raise ValueError("Character closeup subject is empty")
-
-        system_prompt = f"""
-根据 userMessage 生成一个图片描述，以以下模板提取画面主要角并生成{subject}的人物特写，不要出现{subject}的人物的名字，给我详细描述{subject}的外貌,穿着，姿势，状态，表情，特征,还有场景背景。描述中不要出现别的角色。最终输出字数不超过80字
-范例：一个漂亮皮肤白皙的蓝头发女生。女生带着红色帽子，穿着蓝色格子校服，脸上有泪痕，头上有杂草。女生左手举起右手放松的放在大腿上，两腿分开。女生眉毛皱起，眼睛眯成一条缝露出一个勉强的微笑。背景是学校的老师办公室
-""".strip()
-
-        body = {
-            "model": "grok-4.3",
-            "input": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_message,
-                },
-            ],
-        }
-
-        data = cls._post_responses(body, label="Grok Character Closeup Prompt Request")
-        return cls.parse_response(data).text
+        if not text_parts:
+            return None
+        debug_log("====== " + label + " Stream Output ======")
+        text = "".join(text_parts)
+        debug_log(text)
+        return {"id": response_id, "output_text": text}
 
     @classmethod
     def _post_responses(cls, body, label="Grok Request"):
@@ -260,11 +219,44 @@ userMessage：
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", json.dumps(body, ensure_ascii=False))
 
-        response = requests.post(
+        # 流式优先：代理通常对空闲连接有约 60s 超时，长思考请求（如 grok-4.6
+        # high reasoning）在非流式下会因等待期间无数据流动被代理掐断；
+        # 流式的 delta 事件持续到达可保持连接活跃。
+        try:
+            response = post_with_network_retry(
+                cls.RESPONSES_URL,
+                headers=headers,
+                json_body={**body, "stream": True},
+                timeout=(15, 600),
+                label=label,
+                stream=True,
+            )
+            if response.status_code == 200:
+                data = cls._consume_responses_stream(response, label)
+                if data is not None:
+                    return data
+                debug_log(f"{label} 流式未返回内容，回退非流式。")
+            else:
+                # 错误响应是普通 JSON，直接解析返回，与原非流式错误路径一致。
+                debug_log("====== " + label + " HTTP Status ======")
+                debug_log(response.status_code)
+                try:
+                    return response.json()
+                except Exception:
+                    return {
+                        "error": {
+                            "message": "Grok 返回内容不是 JSON：" + response.text
+                        }
+                    }
+        except TRANSIENT_NETWORK_ERRORS as exc:
+            debug_log(f"{label} 流式请求网络失败，回退非流式：{exc}")
+
+        response = post_with_network_retry(
             cls.RESPONSES_URL,
             headers=headers,
-            json=body,
+            json_body=body,
             timeout=3600,
+            label=label,
         )
 
         debug_log("====== " + label + " HTTP Status ======")
@@ -524,11 +516,15 @@ class DeepSeekAPIClient:
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", json.dumps(body, ensure_ascii=False))
 
-        response = requests.post(
+        response = post_with_network_retry(
             request_url,
             headers=headers,
-            json=body,
+            json_body=body,
             timeout=3600,
+            label="DeepSeek Chat",
+            # api.deepseek.com 国内可直连，且部分代理节点会阻断该域名；
+            # KeyLink 中转域名仍按环境变量代理设置访问。
+            bypass_env_proxy=not use_keylink,
         )
 
         debug_log("====== DeepSeek Chat HTTP Status ======")

@@ -6,6 +6,7 @@ import re
 from app.api.chat_clients import DeepSeekAPIClient, GrokAPIClient
 from app.config import AppStorageKeys, FINAL_SETTING_SYNC_BACKUP_PATH, settings
 from app.models import (
+    FirstInputRecord,
     FixedTemplateRecord,
     PromptTextRecord,
     deepseek_api_model_for_chat_model,
@@ -14,9 +15,14 @@ from app.models import (
     now_iso,
 )
 from app.services.public_prompt_seed import seed_public_prompt_assets_if_needed
+from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
 
 
 DEFAULT_FINAL_FIRST_INPUT = """*根据背景介绍，世界书和用户角色给用户一个初始场景，告诉用户现在他是谁（原样输出“system prompt中的用户角色信息”），他在干嘛，周围有什么，现在剧情是从什么时候什么地方开始的，并且在最近几轮让用户自然的遇到给他主线任务的角色并且给他布置详细的主线任务。主线任务必须包含1.任务完成标准 2.任务失败标准 3.任务奖励（任务奖励需要是物质奖励加上可以开启的精彩剧情，比如有意思的后续任务）。"""
+
+DEFAULT_LONG_TERM_MEMORY_TITLE = "默认记忆"
+DEFAULT_LONG_TERM_MEMORY = DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
+DEFAULT_LONG_TERM_MEMORY_TITLES = {"默认", DEFAULT_LONG_TERM_MEMORY_TITLE}
 
 WORLD_BOOK_SYSTEM_PROMPT = """我会给你一个对于这个世界背景的大致介绍和关于这个世界背景知识的基本问答。根据大致介绍和基本问答，你将会细化这个世界背景至最多800字，包括但不限于：这个世界的背景、常识、特殊之处。输出使用markdown格式"""
 
@@ -188,61 +194,298 @@ def _persist_text_records(key: str, records: list[PromptTextRecord]) -> None:
     settings.set(key, json.dumps([record.to_dict() for record in records], ensure_ascii=False))
 
 
-def load_world_books() -> list[PromptTextRecord]:
+def _load_text_record_spaces(
+    key: str,
+    hidden_key: str,
+) -> tuple[list[PromptTextRecord], list[PromptTextRecord]]:
+    return (
+        _decode_text_records(settings.get(key, "")),
+        _decode_text_records(settings.get(hidden_key, "")),
+    )
+
+
+def load_world_books(hidden_space: bool = False) -> list[PromptTextRecord]:
     seed_public_prompt_assets_if_needed()
-    return _decode_text_records(settings.get(AppStorageKeys.WORLD_BOOK_RECORDS, ""))
+    records, hidden_records = _load_text_record_spaces(
+        AppStorageKeys.WORLD_BOOK_RECORDS,
+        AppStorageKeys.HIDDEN_WORLD_BOOK_RECORDS,
+    )
+    return records + hidden_records if hidden_space else records
 
 
-def load_character_cards() -> list[PromptTextRecord]:
+def load_character_cards(hidden_space: bool = False) -> list[PromptTextRecord]:
     seed_public_prompt_assets_if_needed()
-    return _decode_text_records(settings.get(AppStorageKeys.CHARACTER_CARD_RECORDS, ""))
+    records, hidden_records = _load_text_record_spaces(
+        AppStorageKeys.CHARACTER_CARD_RECORDS,
+        AppStorageKeys.HIDDEN_CHARACTER_CARD_RECORDS,
+    )
+    return records + hidden_records if hidden_space else records
 
 
-def _save_text_record(key: str, record_id: str, title: str, content: str) -> PromptTextRecord:
-    records = _decode_text_records(settings.get(key, ""))
-    existing = next((record for record in records if record.id == str(record_id or "")), None)
+def _load_long_term_memory_spaces() -> tuple[list[PromptTextRecord], list[PromptTextRecord]]:
+    records, hidden_records = _load_text_record_spaces(
+        AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+        AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+    )
+    if not settings.bool(AppStorageKeys.LONG_TERM_MEMORY_DEFAULT_SEEDED, False):
+        default_record = next(
+            (
+                record
+                for record in records
+                if str(record.title or "").strip() == DEFAULT_LONG_TERM_MEMORY_TITLE
+            ),
+            None,
+        )
+        if default_record is None:
+            default_record = PromptTextRecord(
+                title=DEFAULT_LONG_TERM_MEMORY_TITLE,
+                content=DEFAULT_LONG_TERM_MEMORY,
+            )
+            records.append(default_record)
+            _persist_text_records(AppStorageKeys.LONG_TERM_MEMORY_RECORDS, records)
+        settings.set(AppStorageKeys.LONG_TERM_MEMORY_DEFAULT_SEEDED, True)
+        settings.set(
+            AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID,
+            default_record.id,
+        )
+    default_record = default_long_term_memory_record(records)
+    if default_record is not None and str(
+        settings.get(AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID, "") or ""
+    ) != default_record.id:
+        settings.set(AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID, default_record.id)
+    return records, hidden_records
+
+
+def load_long_term_memories(hidden_space: bool = False) -> list[PromptTextRecord]:
+    records, hidden_records = _load_long_term_memory_spaces()
+    return records + hidden_records if hidden_space else records
+
+
+def default_long_term_memory_record(
+    records: list[PromptTextRecord] | None = None,
+    *,
+    hidden_space: bool = False,
+) -> PromptTextRecord | None:
+    if records is None:
+        normal_records, hidden_records = _load_text_record_spaces(
+            AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+            AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+        )
+        records = hidden_records if hidden_space else normal_records
+    key = (
+        AppStorageKeys.HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID
+        if hidden_space
+        else AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID
+    )
+    default_id = str(
+        settings.get(key, "") or ""
+    )
+    found = next((item for item in records if item.id == default_id), None)
+    if found is not None:
+        return found
+    found = next(
+        (
+            item
+            for item in records
+            if str(item.title or "").strip() in DEFAULT_LONG_TERM_MEMORY_TITLES
+        ),
+        None,
+    )
+    return found or (records[0] if records else None)
+
+
+def current_default_long_term_memory(*, hidden_space: bool = False) -> str:
+    record = default_long_term_memory_record(hidden_space=hidden_space)
+    if record is None and hidden_space:
+        record = default_long_term_memory_record()
+    if record is None:
+        return DEFAULT_LONG_TERM_MEMORY
+    return str(record.content or "").strip() or DEFAULT_LONG_TERM_MEMORY
+
+
+def _save_text_record(
+    key: str,
+    hidden_key: str,
+    record_id: str,
+    title: str,
+    content: str,
+    hidden_space: bool,
+) -> PromptTextRecord:
+    records, hidden_records = _load_text_record_spaces(key, hidden_key)
+    record_id = str(record_id or "")
+    existing = next((record for record in records if record.id == record_id), None)
+    if existing is None:
+        existing = next((record for record in hidden_records if record.id == record_id), None)
     if existing is None:
         existing = PromptTextRecord(title=str(title or "").strip(), content=str(content or "").strip())
-        records.append(existing)
+        (hidden_records if hidden_space else records).append(existing)
     else:
         existing.title = str(title or "").strip()
         existing.content = str(content or "").strip()
         existing.updated_at = now_iso()
     _persist_text_records(key, records)
+    _persist_text_records(hidden_key, hidden_records)
     return existing
 
 
-def save_world_book(record_id: str, title: str, content: str) -> PromptTextRecord:
-    return _save_text_record(AppStorageKeys.WORLD_BOOK_RECORDS, record_id, title, content)
+def save_world_book(
+    record_id: str,
+    title: str,
+    content: str,
+    hidden_space: bool = False,
+) -> PromptTextRecord:
+    return _save_text_record(
+        AppStorageKeys.WORLD_BOOK_RECORDS,
+        AppStorageKeys.HIDDEN_WORLD_BOOK_RECORDS,
+        record_id,
+        title,
+        content,
+        hidden_space,
+    )
 
 
-def save_character_card(record_id: str, title: str, content: str) -> PromptTextRecord:
-    return _save_text_record(AppStorageKeys.CHARACTER_CARD_RECORDS, record_id, title, content)
+def save_character_card(
+    record_id: str,
+    title: str,
+    content: str,
+    hidden_space: bool = False,
+) -> PromptTextRecord:
+    return _save_text_record(
+        AppStorageKeys.CHARACTER_CARD_RECORDS,
+        AppStorageKeys.HIDDEN_CHARACTER_CARD_RECORDS,
+        record_id,
+        title,
+        content,
+        hidden_space,
+    )
 
 
-def _delete_text_record(key: str, record_id: str) -> None:
-    records = [record for record in _decode_text_records(settings.get(key, "")) if record.id != record_id]
+def save_long_term_memory(
+    record_id: str,
+    title: str,
+    content: str,
+    hidden_space: bool = False,
+) -> PromptTextRecord:
+    record = _save_text_record(
+        AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+        AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+        record_id,
+        title,
+        content,
+        hidden_space,
+    )
+    normal_records, hidden_records = _load_text_record_spaces(
+        AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+        AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+    )
+    saved_in_hidden_space = any(item.id == record.id for item in hidden_records)
+    default_key = (
+        AppStorageKeys.HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID
+        if saved_in_hidden_space
+        else AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID
+    )
+    current_default_id = str(
+        settings.get(default_key, "") or ""
+    )
+    if (
+        record.id == current_default_id
+        or str(record.title or "").strip() in DEFAULT_LONG_TERM_MEMORY_TITLES
+        or not current_default_id
+    ):
+        settings.set(default_key, record.id)
+    return record
+
+
+def create_prefilled_long_term_memory(hidden_space: bool = False) -> PromptTextRecord:
+    return save_long_term_memory(
+        "",
+        "",
+        current_default_long_term_memory(hidden_space=hidden_space),
+        hidden_space=hidden_space,
+    )
+
+
+def _delete_text_record(key: str, hidden_key: str, record_id: str) -> None:
+    records, hidden_records = _load_text_record_spaces(key, hidden_key)
+    records = [record for record in records if record.id != record_id]
+    hidden_records = [record for record in hidden_records if record.id != record_id]
     _persist_text_records(key, records)
+    _persist_text_records(hidden_key, hidden_records)
 
 
 def delete_world_book(record_id: str) -> None:
-    _delete_text_record(AppStorageKeys.WORLD_BOOK_RECORDS, record_id)
+    _delete_text_record(
+        AppStorageKeys.WORLD_BOOK_RECORDS,
+        AppStorageKeys.HIDDEN_WORLD_BOOK_RECORDS,
+        record_id,
+    )
 
 
 def delete_character_card(record_id: str) -> None:
-    _delete_text_record(AppStorageKeys.CHARACTER_CARD_RECORDS, record_id)
+    _delete_text_record(
+        AppStorageKeys.CHARACTER_CARD_RECORDS,
+        AppStorageKeys.HIDDEN_CHARACTER_CARD_RECORDS,
+        record_id,
+    )
 
 
-def _persist_templates(records: list[FixedTemplateRecord]) -> None:
+def delete_long_term_memory(record_id: str) -> None:
+    record_id = str(record_id or "")
+    deleting_normal_default = str(
+        settings.get(AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID, "") or ""
+    ) == record_id
+    deleting_hidden_default = str(
+        settings.get(AppStorageKeys.HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID, "")
+        or ""
+    ) == record_id
+    _delete_text_record(
+        AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+        AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+        record_id,
+    )
+    if deleting_normal_default or deleting_hidden_default:
+        remaining, hidden_remaining = _load_text_record_spaces(
+            AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
+            AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
+        )
+        if deleting_normal_default:
+            replacement = default_long_term_memory_record(remaining)
+            settings.set(
+                AppStorageKeys.DEFAULT_LONG_TERM_MEMORY_RECORD_ID,
+                replacement.id if replacement is not None else "",
+            )
+        if deleting_hidden_default:
+            replacement = default_long_term_memory_record(
+                hidden_remaining,
+                hidden_space=True,
+            )
+            settings.set(
+                AppStorageKeys.HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID,
+                replacement.id if replacement is not None else "",
+            )
+
+
+def _persist_templates(
+    records: list[FixedTemplateRecord],
+    hidden_records: list[FixedTemplateRecord] | None = None,
+) -> None:
     settings.set(
         AppStorageKeys.FIXED_TEMPLATE_RECORDS,
         json.dumps([record.to_dict() for record in records], ensure_ascii=False),
     )
+    if hidden_records is not None:
+        settings.set(
+            AppStorageKeys.HIDDEN_FIXED_TEMPLATE_RECORDS,
+            json.dumps([record.to_dict() for record in hidden_records], ensure_ascii=False),
+        )
 
 
-def load_fixed_templates() -> list[FixedTemplateRecord]:
+def _load_template_spaces() -> tuple[list[FixedTemplateRecord], list[FixedTemplateRecord]]:
     seed_public_prompt_assets_if_needed()
     records = _decode_template_records(settings.get(AppStorageKeys.FIXED_TEMPLATE_RECORDS, ""))
+    hidden_records = _decode_template_records(
+        settings.get(AppStorageKeys.HIDDEN_FIXED_TEMPLATE_RECORDS, "")
+    )
     if not settings.bool(AppStorageKeys.FIXED_TEMPLATE_DEFAULT_SEEDED, False):
         record = FixedTemplateRecord(
             title="默认模板",
@@ -254,13 +497,22 @@ def load_fixed_templates() -> list[FixedTemplateRecord]:
         _persist_templates(records)
         settings.set(AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID, record.id)
         settings.set(AppStorageKeys.FIXED_TEMPLATE_DEFAULT_SEEDED, True)
-    return records
+    return records, hidden_records
+
+
+def load_fixed_templates(hidden_space: bool = False) -> list[FixedTemplateRecord]:
+    records, hidden_records = _load_template_spaces()
+    return records + hidden_records if hidden_space else records
 
 
 def selected_fixed_template(records: list[FixedTemplateRecord] | None = None) -> FixedTemplateRecord | None:
     records = records if records is not None else load_fixed_templates()
     selected_id = str(settings.get(AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID, "") or "")
-    return next((record for record in records if record.id == selected_id), None)
+    found = next((record for record in records if record.id == selected_id), None)
+    if found is None and records:
+        # 选中的模板属于隐藏空间、当前账号不可见时，回退到第一条可见模板。
+        return records[0]
+    return found
 
 
 def save_fixed_template(
@@ -271,9 +523,13 @@ def save_fixed_template(
     response_format: str,
     *,
     make_active: bool,
+    hidden_space: bool = False,
 ) -> FixedTemplateRecord:
-    records = load_fixed_templates()
-    existing = next((record for record in records if record.id == str(record_id or "")), None)
+    records, hidden_records = _load_template_spaces()
+    record_id = str(record_id or "")
+    existing = next((record for record in records if record.id == record_id), None)
+    if existing is None:
+        existing = next((record for record in hidden_records if record.id == record_id), None)
     if existing is None:
         existing = FixedTemplateRecord(
             title=str(title or "").strip(),
@@ -281,36 +537,49 @@ def save_fixed_template(
             dm_core_tasks=str(dm_core_tasks or "").strip(),
             response_format=str(response_format or "").strip(),
         )
-        records.append(existing)
+        (hidden_records if hidden_space else records).append(existing)
     else:
         existing.title = str(title or "").strip()
         existing.background_intro = str(background_intro or "").strip()
         existing.dm_core_tasks = str(dm_core_tasks or "").strip()
         existing.response_format = str(response_format or "").strip()
         existing.updated_at = now_iso()
-    _persist_templates(records)
+    _persist_templates(records, hidden_records)
     if make_active:
         settings.set(AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID, existing.id)
     return existing
 
 
-def create_prefilled_fixed_template() -> FixedTemplateRecord:
+def create_prefilled_fixed_template(hidden_space: bool = False) -> FixedTemplateRecord:
+    source = next(
+        (
+            record
+            for record in load_fixed_templates(hidden_space=True)
+            if str(record.title or "").strip() == "默认模板"
+        ),
+        None,
+    )
     return save_fixed_template(
         "",
         "",
-        DEFAULT_TEMPLATE_BACKGROUND,
-        DEFAULT_TEMPLATE_DM_CORE,
-        DEFAULT_TEMPLATE_RESPONSE_FORMAT,
+        source.background_intro if source else DEFAULT_TEMPLATE_BACKGROUND,
+        source.dm_core_tasks if source else DEFAULT_TEMPLATE_DM_CORE,
+        source.response_format if source else DEFAULT_TEMPLATE_RESPONSE_FORMAT,
         make_active=False,
+        hidden_space=hidden_space,
     )
 
 
 def delete_fixed_template(record_id: str) -> None:
-    records = [record for record in load_fixed_templates() if record.id != record_id]
-    _persist_templates(records)
+    records, hidden_records = _load_template_spaces()
+    records = [record for record in records if record.id != record_id]
+    hidden_records = [record for record in hidden_records if record.id != record_id]
+    _persist_templates(records, hidden_records)
     selected_id = str(settings.get(AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID, "") or "")
     if selected_id == record_id:
-        fallback = max(records, key=lambda record: record.updated_at, default=None)
+        fallback = max(records, key=lambda record: record.updated_at, default=None) or max(
+            hidden_records, key=lambda record: record.updated_at, default=None
+        )
         settings.set(
             AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID,
             fallback.id if fallback is not None else "",
@@ -727,9 +996,9 @@ def bind_legacy_final_setting_by_titles(
             )
         return found[0]
 
-    templates = load_fixed_templates()
-    world_books = load_world_books()
-    character_cards = load_character_cards()
+    templates = load_fixed_templates(hidden_space=True)
+    world_books = load_world_books(hidden_space=True)
+    character_cards = load_character_cards(hidden_space=True)
     template = unique_record(templates, template_title, "固定模板")
     world_book = unique_record(world_books, world_book_title, "世界书")
     user_character = unique_record(character_cards, user_character_title, "角色卡")
@@ -766,7 +1035,9 @@ def sync_final_setting(
     *,
     title: str,
     prompt: str,
-    first_input: str,
+    long_term_memory: str,
+    first_inputs: list[FirstInputRecord],
+    selected_first_input_id: str,
 ) -> list[str]:
     """Validate and atomically sync one final setting back to its linked source assets."""
     if record is None:
@@ -775,6 +1046,7 @@ def sync_final_setting(
     required_links = {
         "固定模板": str(record.final_template_id or "").strip(),
         "世界书": str(record.final_world_book_id or "").strip(),
+        "长期记忆": str(record.final_long_term_memory_id or "").strip(),
         "用户角色": str(record.final_user_character_id or "").strip(),
     }
     missing_links = [label for label, record_id in required_links.items() if not record_id]
@@ -799,20 +1071,57 @@ def sync_final_setting(
             "请重新新建最终设定；本次未写入任何内容。"
         )
 
-    templates = load_fixed_templates()
-    world_books = load_world_books()
-    character_cards = load_character_cards()
+    templates, hidden_templates = _load_template_spaces()
+    world_books, hidden_world_books = _load_text_record_spaces(
+        AppStorageKeys.WORLD_BOOK_RECORDS,
+        AppStorageKeys.HIDDEN_WORLD_BOOK_RECORDS,
+    )
+    character_cards, hidden_character_cards = _load_text_record_spaces(
+        AppStorageKeys.CHARACTER_CARD_RECORDS,
+        AppStorageKeys.HIDDEN_CHARACTER_CARD_RECORDS,
+    )
+    long_term_memories, hidden_long_term_memories = _load_long_term_memory_spaces()
     template = next(
-        (item for item in templates if item.id == required_links["固定模板"]), None
+        (
+            item
+            for item in templates + hidden_templates
+            if item.id == required_links["固定模板"]
+        ),
+        None,
     )
     world_book = next(
-        (item for item in world_books if item.id == required_links["世界书"]), None
+        (
+            item
+            for item in world_books + hidden_world_books
+            if item.id == required_links["世界书"]
+        ),
+        None,
+    )
+    long_term_memory_record = next(
+        (
+            item
+            for item in long_term_memories + hidden_long_term_memories
+            if item.id == required_links["长期记忆"]
+        ),
+        None,
     )
     user_character = next(
-        (item for item in character_cards if item.id == required_links["用户角色"]), None
+        (
+            item
+            for item in character_cards + hidden_character_cards
+            if item.id == required_links["用户角色"]
+        ),
+        None,
     )
     other_characters = [
-        next((item for item in character_cards if item.id == record_id), None)
+        next(
+            (
+                item
+                for item in character_cards + hidden_character_cards
+                if item.id == record_id
+            ),
+            None,
+        )
         for record_id in other_ids
     ]
     deleted_sources = []
@@ -820,6 +1129,8 @@ def sync_final_setting(
         deleted_sources.append("固定模板")
     if world_book is None:
         deleted_sources.append("世界书")
+    if long_term_memory_record is None:
+        deleted_sources.append("长期记忆")
     if user_character is None:
         deleted_sources.append("用户角色卡")
     deleted_sources.extend(
@@ -858,6 +1169,11 @@ def sync_final_setting(
             updated_labels.append(label)
 
     update_text_record(world_book, sections["2. 世界书"][0], f'世界书“{world_book.title or "未命名"}”')
+    update_text_record(
+        long_term_memory_record,
+        long_term_memory,
+        f'长期记忆“{long_term_memory_record.title or "未命名"}”',
+    )
     for name, character, content in zip(other_names, other_characters, other_contents):
         restored_content = content.replace(user_name, "{用户角色名}")
         update_text_record(character, restored_content, f'角色卡“{name}”')
@@ -878,7 +1194,10 @@ def sync_final_setting(
 
     record.title = str(title or "").strip()
     record.prompt = str(prompt or "").strip()
-    record.first_input = str(first_input or "").strip()
+    record.long_term_memory = str(long_term_memory or "").strip()
+    record.first_inputs = list(first_inputs or [])
+    record.selected_first_input_id = str(selected_first_input_id or "")
+    record.__post_init__()
     record.updated_at = changed_at
     state.selected_record_id = record.id
 
@@ -886,11 +1205,26 @@ def sync_final_setting(
         AppStorageKeys.WORLD_BOOK_RECORDS: json.dumps(
             [item.to_dict() for item in world_books], ensure_ascii=False
         ),
+        AppStorageKeys.HIDDEN_WORLD_BOOK_RECORDS: json.dumps(
+            [item.to_dict() for item in hidden_world_books], ensure_ascii=False
+        ),
         AppStorageKeys.CHARACTER_CARD_RECORDS: json.dumps(
             [item.to_dict() for item in character_cards], ensure_ascii=False
         ),
+        AppStorageKeys.HIDDEN_CHARACTER_CARD_RECORDS: json.dumps(
+            [item.to_dict() for item in hidden_character_cards], ensure_ascii=False
+        ),
+        AppStorageKeys.LONG_TERM_MEMORY_RECORDS: json.dumps(
+            [item.to_dict() for item in long_term_memories], ensure_ascii=False
+        ),
+        AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS: json.dumps(
+            [item.to_dict() for item in hidden_long_term_memories], ensure_ascii=False
+        ),
         AppStorageKeys.FIXED_TEMPLATE_RECORDS: json.dumps(
             [item.to_dict() for item in templates], ensure_ascii=False
+        ),
+        AppStorageKeys.HIDDEN_FIXED_TEMPLATE_RECORDS: json.dumps(
+            [item.to_dict() for item in hidden_templates], ensure_ascii=False
         ),
         AppStorageKeys.SYSTEM_PROMPT_RECORDS: json.dumps(
             [item.to_dict() for item in state.records], ensure_ascii=False

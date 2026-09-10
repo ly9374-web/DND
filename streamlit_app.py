@@ -14,6 +14,9 @@ from web.pages.page2 import (
 )
 from web.pages.records import render as render_records
 from web.pages.settings import render as render_settings
+from web.pages.signin_page import (
+    _reset_chat_session_state as reset_chat_session_state,
+)
 from web.pages.signin_page import render as render_signin
 
 
@@ -61,6 +64,7 @@ def _render_guest_countdown():
         st.session_state.user_id = ""
         st.session_state.hidden_unlocked = False
         st.session_state.pop("guest_expires_at", None)
+        reset_chat_session_state()
         st.warning("游客试用已结束，请重新登录。")
         goto("signin", push_history=False)
         st.rerun()
@@ -92,6 +96,7 @@ def _render_sidebar():
             st.session_state.hidden_unlocked = False
             st.session_state.pop("guest_expires_at", None)
             st.session_state.nav_history = []
+            reset_chat_session_state()
             goto("signin", push_history=False)
         else:
             back()

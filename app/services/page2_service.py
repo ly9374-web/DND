@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
+import math
 import secrets
 import uuid
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
+from PIL import Image, ImageOps
+
 from app.api.chat_clients import GrokAPIClient, DeepSeekAPIClient
 from app.api.media_clients import (
+    IMAGE_ASPECT_RATIO,
+    IMAGE_ASPECT_RATIOS,
     CloudinaryUploader,
-    DomoAIClient,
+    OpenRouterVideoAPIClient,
     GrokImageAPIClient,
     ReplicateImageAPIClient,
     ReplicateVideoAPIClient,
-    ZhipuVideoClient,
     download_url_as_base64,
     try_download_url_as_base64,
 )
@@ -30,7 +35,13 @@ from app.models import (
     now_iso,
 )
 from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
+from app.services.image_prompts import build_image_prompt_system_prompt
+from app.services.video_prompts import VIDEO_PROMPT_SYSTEM_PROMPT
 from app.storage import ChatRecordStore
+from app.video_models import (
+    VIDEO_MODELS, WAN_MODEL, WAN_FPS, WAN_DURATION_FRAMES,
+    normalize_video_model, validate_video_duration,
+)
 DEFAULT_SYSTEM_PROMPT = ""
 STORY_BRAIN_SHORT = "story_brain_short"
 STORY_BRAIN_UPDATE_MODELS = ["deepseekPro", "deepseekFlash", "grok"]
@@ -50,7 +61,7 @@ def normalize_story_brain_update_model(value) -> str:
     return "deepseekFlash"
 
 UNEXPECTED_EVENT_PROMPT = """
-本轮根据上下文，根据剧情走向和人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况需要推动剧情的发展，需要用户对其进行反应。意外情况可以是场景中的角色说的话，做的行为，也可以是新角色的入场或者场景中什么事情的发生
+本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况可以是场景中的角色主动了什么话，或做了什么行为。
 """.strip()
 
 
@@ -172,9 +183,8 @@ def load_context_from_settings() -> Page2Context:
             max(0, settings.int(AppStorageKeys.PAGE2_UNEXPECTED_EVENT_THRESHOLD, 98)),
         ),
         temperature=float(settings.float(AppStorageKeys.PAGE2_TEMPERATURE, 0.8)),
-        selected_video_generation_provider=str(
-            settings.get(AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER, "domoai")
-            or "domoai"
+        selected_video_generation_provider=normalize_video_model(
+            settings.get(AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER, WAN_MODEL)
         ),
     )
 
@@ -191,7 +201,7 @@ def default_context() -> Page2Context:
         unexpected_event_enabled=False,
         unexpected_event_threshold=98,
         temperature=0.8,
-        selected_video_generation_provider="domoai",
+        selected_video_generation_provider=WAN_MODEL,
     )
 
 
@@ -231,7 +241,7 @@ def save_context_to_settings(ctx: Page2Context):
     settings.set(AppStorageKeys.PAGE2_TEMPERATURE, float(ctx.temperature))
     settings.set(
         AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER,
-        str(ctx.selected_video_generation_provider or "domoai"),
+        normalize_video_model(ctx.selected_video_generation_provider),
     )
 
 
@@ -239,7 +249,11 @@ def build_context_messages(
     turns: Iterable[Page2ConversationTurn],
     context_turn_count: int,
 ) -> list[dict]:
-    turns_list = list(turns)
+    turns_list = [
+        turn
+        for turn in turns
+        if not bool(getattr(turn, "is_context_excluded", False))
+    ]
     turn_count = max(0, int(context_turn_count))
     if turn_count == 0:
         return []
@@ -256,6 +270,43 @@ def build_context_messages(
     return messages
 
 
+def _send_with_current_chat_model(
+    *,
+    ctx: Page2Context,
+    context_messages: list[dict],
+    user_message: str,
+    system_prompt: str | None = None,
+) -> str:
+    effective_system_prompt = ctx.system_prompt if system_prompt is None else system_prompt
+    deepseek_model = deepseek_api_model_for_chat_model(ctx.selected_chat_model)
+    if deepseek_model is not None:
+        return DeepSeekAPIClient.send_message(
+            system_prompt=effective_system_prompt,
+            context_messages=context_messages,
+            user_message=user_message,
+            temperature=ctx.temperature,
+            model=deepseek_model,
+            thinking_enabled=ctx.chat_reasoning_enabled,
+            reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
+        )
+
+    grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
+    grok_requires_reasoning = grok_model == "grok-4.6"
+    return GrokAPIClient.send_message(
+        system_prompt=effective_system_prompt,
+        context_messages=context_messages,
+        user_message=user_message,
+        model=grok_model,
+        temperature=ctx.temperature,
+        thinking_enabled=True if grok_requires_reasoning else ctx.chat_reasoning_enabled,
+        reasoning_effort=(
+            "high"
+            if ctx.chat_reasoning_enabled
+            else "low" if grok_requires_reasoning else None
+        ),
+    )
+
+
 def send_message(
     *,
     ctx: Page2Context,
@@ -265,7 +316,6 @@ def send_message(
     story_brain_enabled: bool = True,
 ) -> str:
     context_messages = build_context_messages(turns, ctx.context_turn_count)
-    system_prompt = ctx.system_prompt
     user_message_for_model = user_message
 
     if story_brain_enabled:
@@ -279,32 +329,10 @@ def send_message(
         if roll_unexpected_event() >= threshold:
             user_message_for_model = _append_unexpected_event_prompt(user_message_for_model)
 
-    deepseek_model = deepseek_api_model_for_chat_model(ctx.selected_chat_model)
-    if deepseek_model is not None:
-        return DeepSeekAPIClient.send_message(
-            system_prompt=system_prompt,
-            context_messages=context_messages,
-            user_message=user_message_for_model,
-            temperature=ctx.temperature,
-            model=deepseek_model,
-            thinking_enabled=ctx.chat_reasoning_enabled,
-            reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
-        )
-
-    grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
-    grok_requires_reasoning = grok_model == "grok-4.6"
-    return GrokAPIClient.send_message(
-        system_prompt=system_prompt,
+    return _send_with_current_chat_model(
+        ctx=ctx,
         context_messages=context_messages,
         user_message=user_message_for_model,
-        model=grok_model,
-        temperature=ctx.temperature,
-        thinking_enabled=True if grok_requires_reasoning else ctx.chat_reasoning_enabled,
-        reasoning_effort=(
-            "high"
-            if ctx.chat_reasoning_enabled
-            else "low" if grok_requires_reasoning else None
-        ),
     )
 
 
@@ -313,8 +341,17 @@ def generate_short_story_brain(
     ctx: Page2Context,
     turns: list[Page2ConversationTurn],
     story_brain_short: str,
+    long_term_memory_prompt: str = "",
+    history_turn_count: int | None = None,
 ) -> str:
-    history_turns = max(1, int(ctx.story_brain_turns))
+    history_turns = max(
+        1,
+        int(
+            ctx.story_brain_turns
+            if history_turn_count is None
+            else history_turn_count
+        ),
+    )
     existing_story_brain = str(story_brain_short or "").strip()
     if existing_story_brain in INVALID_STORY_BRAIN_TEXTS:
         existing_story_brain = ""
@@ -327,10 +364,14 @@ def generate_short_story_brain(
 """.strip()
 
     update_model = normalize_story_brain_update_model(ctx.story_brain_update_model)
+    story_brain_system_prompt = (
+        str(long_term_memory_prompt or "").strip()
+        or DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
+    )
     deepseek_model = deepseek_api_model_for_chat_model(update_model)
     if deepseek_model is not None:
         raw_text = DeepSeekAPIClient.send_message(
-            system_prompt=DEFAULT_STORY_BRAIN_GENERATOR_PROMPT,
+            system_prompt=story_brain_system_prompt,
             context_messages=[],
             user_message=generator_user_message,
             temperature=ctx.temperature,
@@ -341,7 +382,7 @@ def generate_short_story_brain(
         )
     else:
         raw_text = GrokAPIClient.send_message(
-            system_prompt=DEFAULT_STORY_BRAIN_GENERATOR_PROMPT,
+            system_prompt=story_brain_system_prompt,
             context_messages=[],
             user_message=generator_user_message,
             model="grok-4.3",
@@ -356,29 +397,52 @@ def generate_short_story_brain(
     return updated_story_brain or existing_story_brain
 
 
-def generate_image_prompt(conversation_text: str, mode: str = "normal", subject: str = "") -> str:
+def generate_image_prompt(
+    conversation_text: str,
+    mode: str = "normal",
+    subject: str = "",
+    *,
+    ctx: Page2Context,
+) -> str:
     conversation_text = str(conversation_text or "").strip()
     if not conversation_text:
         raise ValueError("暂无助手回复内容。")
 
-    mode = str(mode or "normal").strip()
-    subject = str(subject or "").strip()
-
-    if mode == "first_person":
-        if not subject:
-            raise ValueError("主体不能为空。")
-        return GrokAPIClient.generate_first_person_image_prompt(conversation_text, subject)
-
-    if mode == "closeup":
-        if not subject:
-            raise ValueError("主体不能为空。")
-        return GrokAPIClient.generate_character_closeup_image_prompt(conversation_text, subject)
-
-    return GrokAPIClient.generate_image_prompt(conversation_text)
+    return _send_with_current_chat_model(
+        ctx=ctx,
+        system_prompt=build_image_prompt_system_prompt(mode, subject),
+        context_messages=[],
+        user_message=conversation_text,
+    )
 
 
-def generate_image(provider: str, prompt: str, image_urls: Optional[list[str]] = None) -> GeneratedImageRecord:
+def generate_video_prompt(*, ctx: Page2Context, image_prompt: str, story_text: str) -> str:
+    image_prompt = str(image_prompt or "").strip()
+    story_text = str(story_text or "").strip()
+    if not image_prompt:
+        raise ValueError("这张图片缺少生成时的图片 prompt，无法自动生成视频 prompt。")
+    if not story_text:
+        raise ValueError("缺少本轮故事内容，无法生成视频 prompt。")
+    reply = _strip_plain_text_output(_send_with_current_chat_model(
+        ctx=ctx,
+        system_prompt=VIDEO_PROMPT_SYSTEM_PROMPT,
+        context_messages=[],
+        user_message=f"图片prompt：\n{image_prompt}\n\n本轮故事内容：\n{story_text}",
+    ))
+    if not reply or reply in INVALID_STORY_BRAIN_TEXTS:
+        raise ValueError("模型没有返回可用的视频 prompt，请重试。")
+    return reply
+
+
+def generate_image(
+    provider: str,
+    prompt: str,
+    image_urls: Optional[list[str]] = None,
+    aspect_ratio: str = IMAGE_ASPECT_RATIO,
+) -> GeneratedImageRecord:
     provider = str(provider or "").strip()
+    if provider == "grokQuality":
+        provider = "grokpro2k"
     prompt = str(prompt or "").strip()
     image_urls = image_urls or []
     image_urls = [str(url).strip() for url in image_urls if str(url).strip()]
@@ -386,10 +450,13 @@ def generate_image(provider: str, prompt: str, image_urls: Optional[list[str]] =
     if not prompt:
         raise ValueError("你得先点“生成图片prompt”生成prompt才能点这个生图")
 
-    if provider in ["grok", "grokQuality", "grokPro"]:
+    if aspect_ratio not in IMAGE_ASPECT_RATIOS:
+        raise ValueError("图片尺寸请选择 3:4、4:3 或 1:1。")
+
+    if provider in ["grok", "grokpro2k", "grokPro"]:
         model = {
             "grok": "grok-imagine-image",
-            "grokQuality": "grok-imagine-image-quality",
+            "grokpro2k": "grok-imagine-image-2.0",
             "grokPro": "grok-imagine-image-2.0",
         }.get(provider, "grok-imagine-image")
 
@@ -398,13 +465,15 @@ def generate_image(provider: str, prompt: str, image_urls: Optional[list[str]] =
             image_urls=image_urls,
             model=model,
             resolution="1k" if provider == "grokPro" else "2k",
-            quality="low" if provider == "grokPro" else None,
+            quality={"grokPro": "low", "grokpro2k": "medium"}.get(provider),
+            aspect_ratio=aspect_ratio,
         )
     else:
         result = ReplicateImageAPIClient.generate_image(
             provider=provider,
             prompt=prompt,
             image_urls=image_urls,
+            aspect_ratio=aspect_ratio,
         )
 
     image_url = getattr(result, "image_url", None)
@@ -445,7 +514,7 @@ def _decode_image_base64(image_base64: str) -> bytes:
     return image_bytes
 
 
-def _prepare_video_cloudinary_image_url(source_record: GeneratedImageRecord) -> str:
+def _video_input_image_bytes(source_record: GeneratedImageRecord) -> bytes:
     if source_record.image_data_base64:
         try:
             image_bytes = _decode_image_base64(source_record.image_data_base64)
@@ -463,6 +532,25 @@ def _prepare_video_cloudinary_image_url(source_record: GeneratedImageRecord) -> 
             )
     else:
         raise RuntimeError("图生视频需要可用的图片 URL 或 base64 图片数据。")
+    return image_bytes
+
+
+def _video_aspect_ratio(image_bytes: bytes, supported_ratios: tuple[str, ...]) -> str:
+    with Image.open(io.BytesIO(image_bytes)) as original:
+        image = ImageOps.exif_transpose(original)
+        width, height = image.size
+    ratio = width / height
+    return min(
+        supported_ratios,
+        key=lambda item: abs(math.log(ratio / (int(item.split(":")[0]) / int(item.split(":")[1])))),
+    )
+
+
+def _prepare_video_cloudinary_image_url(
+    source_record: GeneratedImageRecord, *, image_bytes: bytes | None = None,
+) -> str:
+    if image_bytes is None:
+        image_bytes = _video_input_image_bytes(source_record)
 
     try:
         return CloudinaryUploader.upload_image_bytes(image_bytes)
@@ -480,51 +568,34 @@ def generate_video_from_image(
     ctx: Page2Context,
     source_record: GeneratedImageRecord,
     prompt: str,
-    seconds: int,
+    seconds: int | float,
+    generate_audio: bool = True,
 ) -> GeneratedImageRecord:
     prompt = str(prompt or "").strip()
     if not prompt:
-        prompt = "动起来"
+        raise ValueError("视频 prompt 不能为空，请先生成或填写视频 prompt。")
 
-    provider = str(ctx.selected_video_generation_provider or "domoai").strip()
-    effective_seconds = int(seconds)
+    provider = str(ctx.selected_video_generation_provider or WAN_MODEL).strip()
+    validate_video_duration(provider, seconds)
+    image_bytes = _video_input_image_bytes(source_record)
+    image_reference = _prepare_video_cloudinary_image_url(source_record, image_bytes=image_bytes)
 
-    if provider == "wan22Fast":
-        image_reference = _prepare_video_cloudinary_image_url(source_record)
+    if provider == WAN_MODEL:
         video_url = ReplicateVideoAPIClient.generate_wan_2_2_i2v_fast(
-            image_reference,
-            prompt,
+            image_reference, prompt, seconds=seconds,
         )
-        effective_seconds = 5
-    elif provider == "zhipu":
-        image_reference = _prepare_video_cloudinary_image_url(source_record)
-        task_id = ZhipuVideoClient.create_image_to_video_task(
-            image_reference,
-            prompt,
-            seconds,
-        )
-        video_url = ZhipuVideoClient.poll_video_url(task_id)
+        effective_seconds = WAN_DURATION_FRAMES[seconds] / WAN_FPS
     else:
-        if source_record.image_data_base64:
-            image_base64 = source_record.image_data_base64
-        elif source_record.image_url_string:
-            try:
-                image_base64 = download_url_as_base64(source_record.image_url_string)
-            except Exception as exc:
-                raise RuntimeError(
-                    "输入图片 URL 已无法访问，图生视频需要原图数据。"
-                    "请重新生成图片，或使用仍可访问的图片作为输入。原始错误："
-                    + str(exc)
-                )
-        else:
-            raise RuntimeError("当前记录没有可用图片。")
-
-        task_id = DomoAIClient.create_image_to_video_task_with_base64(
-            image_base64,
-            prompt,
-            seconds,
+        aspect_ratio = _video_aspect_ratio(image_bytes, VIDEO_MODELS[provider].aspect_ratios)
+        video_url = OpenRouterVideoAPIClient.generate_video(
+            model=provider,
+            image_url=image_reference,
+            prompt=prompt,
+            seconds=seconds,
+            aspect_ratio=aspect_ratio,
+            generate_audio=generate_audio,
         )
-        video_url = DomoAIClient.poll_task_until_video_url(task_id)
+        effective_seconds = int(seconds)
 
     return GeneratedImageRecord(
         provider=source_record.provider,
@@ -569,10 +640,15 @@ def upsert_chat_record(
     system_prompt: str,
     story_brain: object,
     story_brain_short: str = "",
+    story_brain_next_update_turn: int | None = None,
+    story_brain_last_update_turn_id: str = "",
+    story_brain_checkpoints: list | None = None,
+    final_setting_id: str = "",
     scope: str | None = None,
+    hidden: bool = False,
 ) -> str:
     has_short_story_brain = bool(str(story_brain_short or "").strip())
-    if not turns and not generated_media and not has_short_story_brain:
+    if not record_id and not turns and not generated_media and not has_short_story_brain:
         return str(record_id or "").strip()
 
     now = now_iso()
@@ -580,10 +656,12 @@ def upsert_chat_record(
 
     existing_title = None
     existing_created_at = None
+    existing_hidden = None
     for item in ChatRecordStore.load_index(scope=scope):
         if item.id == record_id:
             existing_title = item.title
             existing_created_at = item.created_at
+            existing_hidden = bool(getattr(item, "hidden", False))
             break
 
     record = ChatRecord(
@@ -594,6 +672,18 @@ def upsert_chat_record(
         generated_images=generated_media,
         story_brain=story_brain,
         story_brain_short=str(story_brain_short or "").strip(),
+        story_brain_next_update_turn=(
+            max(1, int(story_brain_next_update_turn))
+            if story_brain_next_update_turn is not None
+            else None
+        ),
+        story_brain_last_update_turn_id=str(
+            story_brain_last_update_turn_id or ""
+        ),
+        final_setting_id=str(final_setting_id or ""),
+        story_brain_checkpoints=list(story_brain_checkpoints or [])[-2:],
+        # 已有记录沿用创建时的账号归属；新记录按当前账号标记。
+        hidden=existing_hidden if existing_hidden is not None else bool(hidden),
         created_at=existing_created_at or now,
         updated_at=now,
     )

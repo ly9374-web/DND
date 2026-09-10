@@ -31,13 +31,19 @@ def render(
 
     with st.sidebar:
         st.subheader(sidebar_title)
-        st.caption("提示：把聊天标题改成以「隐藏：」开头，可在未解锁时隐藏。")
+        st.caption("提示：隐藏账号中产生的聊天记录会自动对普通账号隐藏。")
 
     mode = str(st.session_state.get("auth_mode", "") or "").strip().lower()
     scope = "guest" if mode == "guest" else None
     items = store.load_index_sorted(scope=scope)
     if not bool(st.session_state.get("hidden_unlocked", False)):
-        items = [i for i in items if not str(i.title or "").strip().startswith("隐藏：")]
+        # 普通账号：隐藏隐藏账号创建的记录（hidden 标记），并兼容旧的「隐藏：」标题前缀。
+        items = [
+            i
+            for i in items
+            if not bool(getattr(i, "hidden", False))
+            and not str(i.title or "").strip().startswith("隐藏：")
+        ]
 
     if not items:
         st.info(empty_message)

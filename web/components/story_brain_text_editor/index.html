@@ -66,7 +66,7 @@
         box-sizing: border-box;
         display: block;
         width: 100%;
-        min-height: 260px;
+        min-height: 780px;
         padding: 12px 14px;
         border: 0;
         outline: 0;
@@ -139,6 +139,7 @@
       const saveButton = document.getElementById("save")
       const cancelButton = document.getElementById("cancel")
       let value = ""
+      let disabled = false
 
       function post(type, payload) {
         window.parent.postMessage(
@@ -164,6 +165,7 @@
       }
 
       function enterEdit() {
+        if (disabled) return
         textarea.value = value
         shell.classList.add("is-editing")
         setTimeout(() => textarea.focus(), 0)
@@ -176,6 +178,7 @@
       }
 
       function save() {
+        if (disabled) return
         value = textarea.value
         renderViewer()
         exitEdit()
@@ -210,6 +213,11 @@
         }
         const args = event.data.args || {}
         value = String(args.value || "")
+        disabled = Boolean(args.disabled)
+        textarea.disabled = disabled
+        saveButton.disabled = disabled
+        viewer.setAttribute("aria-readonly", String(disabled))
+        if (disabled) exitEdit()
         renderViewer()
       })
 

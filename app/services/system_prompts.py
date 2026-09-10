@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import AppStorageKeys, settings
-from app.models import SystemPromptRecord, now_iso
+from app.models import FirstInputRecord, SystemPromptRecord, now_iso
 from app.services.public_prompt_seed import seed_public_prompt_assets_if_needed
 
 
@@ -127,7 +127,72 @@ def load_state(hidden_space: bool = False) -> PromptState:
         else:
             state = _seed_default_records(state)
 
+    _ensure_record_defaults(state)
+    _ensure_selected_prompt_visible(state)
     return state
+
+
+def _ensure_record_defaults(state: PromptState) -> None:
+    """Migrate old final settings to named first inputs and the default memory."""
+    from app.services import prompt_assets
+
+    prompt_assets.load_long_term_memories(hidden_space=True)
+    normal_default_memory = prompt_assets.default_long_term_memory_record()
+    hidden_default_memory = prompt_assets.default_long_term_memory_record(
+        hidden_space=True
+    )
+    changed = False
+    for record in state.records + state.hidden_records:
+        default_memory = (
+            (hidden_default_memory or normal_default_memory)
+            if record in state.hidden_records
+            else normal_default_memory
+        )
+        if bool(getattr(record, "first_inputs_need_migration", False)):
+            changed = True
+        before_first_input = str(record.first_input or "")
+        before_selected_id = str(record.selected_first_input_id or "")
+        record.__post_init__()
+        if (
+            before_first_input != record.first_input
+            or before_selected_id != record.selected_first_input_id
+        ):
+            changed = True
+        if not str(record.long_term_memory or "").strip():
+            record.long_term_memory = (
+                str(default_memory.content or "")
+                if default_memory is not None
+                else prompt_assets.DEFAULT_LONG_TERM_MEMORY
+            )
+            changed = True
+        if not str(record.final_long_term_memory_id or "").strip() and default_memory is not None:
+            record.final_long_term_memory_id = default_memory.id
+            changed = True
+    if changed:
+        _persist(state)
+
+
+def _ensure_selected_prompt_visible(state: PromptState) -> None:
+    """普通账号下，选中的最终设定若属于隐藏空间，则回退到第一条普通记录。
+
+    防止隐藏账号选中的隐藏 prompt 通过全局 SYSTEM_PROMPT 泄露到普通账号的聊天上下文。
+    """
+    if state.hidden_space:
+        return
+    selected = str(state.selected_record_id or "").strip()
+    if not selected:
+        return
+    if any(record.id == selected for record in state.records):
+        return
+    if not any(record.id == selected for record in state.hidden_records):
+        return
+    fallback = state.records[0] if state.records else None
+    settings.set(
+        AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID,
+        fallback.id if fallback is not None else "",
+    )
+    settings.set(AppStorageKeys.SYSTEM_PROMPT, fallback.prompt if fallback is not None else "")
+    state.selected_record_id = fallback.id if fallback is not None else ""
 
 
 def visible_records(state: PromptState) -> list[SystemPromptRecord]:
@@ -185,6 +250,7 @@ def bind_final_setting_sources(
     record_id: str,
     template_id: str,
     world_book_id: str,
+    long_term_memory_id: str | None = None,
     user_character_id: str,
     other_character_ids: list[str],
     user_character_name: str,
@@ -197,6 +263,8 @@ def bind_final_setting_sources(
 
     record.final_template_id = str(template_id or "").strip()
     record.final_world_book_id = str(world_book_id or "").strip()
+    if long_term_memory_id is not None:
+        record.final_long_term_memory_id = str(long_term_memory_id or "").strip()
     record.final_user_character_id = str(user_character_id or "").strip()
     record.final_other_character_ids = [
         str(item or "").strip() for item in other_character_ids
@@ -216,10 +284,14 @@ def save_prompt(
     record_id: str,
     title: str,
     prompt: str,
-    first_input: str = "",
+    first_input: str | None = None,
+    first_inputs: list[FirstInputRecord] | None = None,
+    selected_first_input_id: str | None = None,
+    long_term_memory: str | None = None,
     preserve_blank_title: bool = False,
     final_template_id: str | None = None,
     final_world_book_id: str | None = None,
+    final_long_term_memory_id: str | None = None,
     final_user_character_id: str | None = None,
     final_other_character_ids: list[str] | None = None,
     final_user_character_name: str | None = None,
@@ -228,18 +300,39 @@ def save_prompt(
     record_id = str(record_id or "").strip()
     title = str(title or "").strip()
     prompt = str(prompt or "").strip()
-    first_input = str(first_input or "").strip()
+    normalized_first_input = (
+        str(first_input or "").strip() if first_input is not None else None
+    )
 
     existing = get_record(state, record_id) if record_id else None
 
     if existing is not None:
         existing.title = title
         existing.prompt = prompt
-        existing.first_input = first_input
+        if first_inputs is not None:
+            existing.first_inputs = list(first_inputs)
+        if selected_first_input_id is not None:
+            existing.selected_first_input_id = str(selected_first_input_id or "")
+        if normalized_first_input is not None and first_inputs is None:
+            selected = next(
+                (
+                    item
+                    for item in existing.first_inputs
+                    if item.id == existing.selected_first_input_id
+                ),
+                None,
+            )
+            if selected is not None:
+                selected.content = normalized_first_input
+                selected.updated_at = now_iso()
+        if long_term_memory is not None:
+            existing.long_term_memory = str(long_term_memory or "").strip()
         if final_template_id is not None:
             existing.final_template_id = str(final_template_id or "")
         if final_world_book_id is not None:
             existing.final_world_book_id = str(final_world_book_id or "")
+        if final_long_term_memory_id is not None:
+            existing.final_long_term_memory_id = str(final_long_term_memory_id or "")
         if final_user_character_id is not None:
             existing.final_user_character_id = str(final_user_character_id or "")
         if final_other_character_ids is not None:
@@ -250,6 +343,7 @@ def save_prompt(
             existing.final_other_character_names = [
                 str(item or "") for item in final_other_character_names
             ]
+        existing.__post_init__()
         existing.updated_at = now_iso()
         settings.set(AppStorageKeys.SYSTEM_PROMPT, existing.prompt)
         settings.set(AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID, existing.id)
@@ -267,9 +361,13 @@ def save_prompt(
     record = SystemPromptRecord(
         title=new_title,
         prompt=prompt,
-        first_input=first_input,
+        first_input=normalized_first_input or "",
+        first_inputs=list(first_inputs or []),
+        selected_first_input_id=str(selected_first_input_id or ""),
+        long_term_memory=str(long_term_memory or ""),
         final_template_id=str(final_template_id or ""),
         final_world_book_id=str(final_world_book_id or ""),
+        final_long_term_memory_id=str(final_long_term_memory_id or ""),
         final_user_character_id=str(final_user_character_id or ""),
         final_other_character_ids=[str(item or "") for item in (final_other_character_ids or [])],
         final_user_character_name=str(final_user_character_name or ""),
@@ -311,7 +409,108 @@ def delete_record(state: PromptState, record_id: str) -> PromptState:
 
 def selected_first_input(state: PromptState) -> str:
     """当前选中最终设定的首轮输入（未设置则为空串）。"""
-    record = get_record(state, state.selected_record_id)
+    return first_input_for_record(state, state.selected_record_id)
+
+
+def first_input_for_record(state: PromptState, record_id: str) -> str:
+    record = get_record(state, record_id)
     if record is None:
         return ""
-    return str(record.first_input or "").strip()
+    record.__post_init__()
+    selected = next(
+        item for item in record.first_inputs if item.id == record.selected_first_input_id
+    )
+    return str(selected.content or "").strip()
+
+
+def create_first_input(state: PromptState, record_id: str) -> FirstInputRecord:
+    record = get_record(state, record_id)
+    if record is None:
+        raise ValueError("无法新建首轮输入：最终设定不存在。")
+    record.__post_init__()
+    next_number = len(record.first_inputs) + 1
+    existing_titles = {str(item.title or "").strip() for item in record.first_inputs}
+    title = f"首轮输入 {next_number}"
+    while title in existing_titles:
+        next_number += 1
+        title = f"首轮输入 {next_number}"
+    item = FirstInputRecord(title=title, content="")
+    record.first_inputs.append(item)
+    record.selected_first_input_id = item.id
+    record.first_input = ""
+    record.updated_at = now_iso()
+    _persist(state)
+    return item
+
+
+def select_first_input(state: PromptState, record_id: str, first_input_id: str) -> None:
+    record = get_record(state, record_id)
+    if record is None:
+        raise ValueError("无法选择首轮输入：最终设定不存在。")
+    selected = next(
+        (item for item in record.first_inputs if item.id == first_input_id),
+        None,
+    )
+    if selected is None:
+        raise ValueError("无法选择首轮输入：记录不存在。")
+    record.selected_first_input_id = selected.id
+    record.first_input = str(selected.content or "")
+    record.updated_at = now_iso()
+    _persist(state)
+
+
+def update_first_input(
+    state: PromptState,
+    record_id: str,
+    first_input_id: str,
+    *,
+    title: str,
+    content: str,
+) -> None:
+    record = get_record(state, record_id)
+    if record is None:
+        raise ValueError("无法保存首轮输入：最终设定不存在。")
+    selected = next(
+        (item for item in record.first_inputs if item.id == first_input_id),
+        None,
+    )
+    if selected is None:
+        raise ValueError("无法保存首轮输入：记录不存在。")
+    selected.title = str(title or "").strip()
+    selected.content = str(content or "").strip()
+    selected.updated_at = now_iso()
+    if record.selected_first_input_id == selected.id:
+        record.first_input = selected.content
+    record.updated_at = selected.updated_at
+    _persist(state)
+
+
+def delete_first_input(state: PromptState, record_id: str, first_input_id: str) -> str:
+    record = get_record(state, record_id)
+    if record is None:
+        raise ValueError("无法删除首轮输入：最终设定不存在。")
+    record.__post_init__()
+    if len(record.first_inputs) <= 1:
+        raise ValueError("每个最终设定至少需要保留一条首轮输入。")
+    record.first_inputs = [
+        item for item in record.first_inputs if item.id != first_input_id
+    ]
+    if not any(item.id == record.selected_first_input_id for item in record.first_inputs):
+        record.selected_first_input_id = record.first_inputs[0].id
+    record.__post_init__()
+    record.updated_at = now_iso()
+    _persist(state)
+    return record.selected_first_input_id
+
+
+def long_term_memory_for_record(state: PromptState, record_id: str) -> str:
+    from app.services import prompt_assets
+
+    record = get_record(state, record_id)
+    hidden_space = bool(record is not None and record in state.hidden_records)
+    default_memory = prompt_assets.current_default_long_term_memory(
+        hidden_space=hidden_space
+    )
+    if record is None:
+        return default_memory
+    return str(record.long_term_memory or "").strip() or default_memory

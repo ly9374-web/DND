@@ -1,179 +1,80 @@
+"""Import a public bundle only into a fresh prompt store; never migrate user data."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 from app.config import AppStorageKeys, settings
-from app.models import FixedTemplateRecord, PromptTextRecord, SystemPromptRecord
+from app.models import FixedTemplateRecord, FirstInputRecord, PromptTextRecord, SystemPromptRecord
+from app.services.public_prompt_bundle import CATEGORIES, DEFAULT_FIELDS, SOURCE_FIELDS, TEXT_FIELDS, TEMPLATE_FIELDS
 
-
-PUBLIC_ASSETS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "public_prompt_assets"
-    / "naruto_public.json"
-)
-PUBLIC_ASSET_SEED_VERSION = 1
-REMOVED_BUILTIN_PROMPT_TITLES = {"小说生成", "无prompt"}
-
-
-def _decode_records(key: str) -> list[dict]:
-    raw = settings.get(key, "")
-    try:
-        decoded = raw if isinstance(raw, list) else json.loads(raw or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        decoded = []
-    return [item for item in decoded if isinstance(item, dict)]
-
-
-def _encode_records(records) -> str:
-    return json.dumps([record.to_dict() for record in records], ensure_ascii=False)
-
-
-def _unique_public_record(records: list[dict], title: str, label: str) -> dict:
-    matches = [item for item in records if str(item.get("title", "")).strip() == title]
-    if len(matches) != 1:
-        raise RuntimeError(
-            f'公开种子数据中的{label}“{title}”应当恰好存在一条，实际为 {len(matches)} 条。'
-        )
-    return matches[0]
-
-
-def _upsert_text_record(
-    records: list[PromptTextRecord],
-    public_records: list[dict],
-    title: str,
-    label: str,
-) -> PromptTextRecord:
-    existing = next(
-        (item for item in records if str(item.title or "").strip() == title), None
-    )
-    if existing is not None:
-        return existing
-    source = _unique_public_record(public_records, title, label)
-    record = PromptTextRecord(title=title, content=str(source.get("content", "")))
-    records.append(record)
-    return record
-
-
-def _upsert_template(
-    records: list[FixedTemplateRecord], public_records: list[dict], title: str
-) -> FixedTemplateRecord:
-    existing = next(
-        (item for item in records if str(item.title or "").strip() == title), None
-    )
-    if existing is not None:
-        return existing
-    source = _unique_public_record(public_records, title, "固定模板")
-    record = FixedTemplateRecord(
-        title=title,
-        background_intro=str(source.get("background_intro", "")),
-        dm_core_tasks=str(source.get("dm_core_tasks", "")),
-        response_format=str(source.get("response_format", "")),
-    )
-    records.append(record)
-    return record
-
-
-def _upsert_final_setting(
-    records: list[SystemPromptRecord], public_records: list[dict], title: str
-) -> SystemPromptRecord:
-    existing = next(
-        (item for item in records if str(item.title or "").strip() == title), None
-    )
-    if existing is not None:
-        return existing
-    source = _unique_public_record(public_records, title, "最终设定")
-    record = SystemPromptRecord(
-        title=title,
-        prompt=str(source.get("prompt", "")),
-        first_input=str(source.get("first_input", "")),
-    )
-    records.append(record)
-    return record
+PUBLIC_ASSETS_PATH = Path(__file__).resolve().parents[2] / "public_prompt_assets" / "ordinary.json"
+PUBLIC_ASSET_SEED_VERSION = 2
 
 
 def seed_public_prompt_assets_if_needed() -> bool:
-    """Import the public allowlist once without replacing existing user assets."""
-    if settings.int(AppStorageKeys.PUBLIC_PROMPT_ASSET_SEED_VERSION, 0) >= PUBLIC_ASSET_SEED_VERSION:
+    # Even empty existing lists belong to the user: do not resurrect deleted assets.
+    keys = list(CATEGORIES.values())
+    keys += ["hidden" + key[0].upper() + key[1:] for key in CATEGORIES.values()]
+    if settings.get(AppStorageKeys.PUBLIC_PROMPT_ASSET_SEED_VERSION) is not None:
+        return False
+    if any(settings.get(key) is not None for key in keys):
+        return False
+    if settings.get(AppStorageKeys.SYSTEM_PROMPT) or settings.get(AppStorageKeys.CHAT_RECORD_INDEX) or settings.get(AppStorageKeys.CHAT_RECORDS):
         return False
 
     payload = json.loads(PUBLIC_ASSETS_PATH.read_text(encoding="utf-8"))
-    if int(payload.get("schema_version", 0)) != 1:
-        raise RuntimeError("不支持的公开 Prompt 资产版本。")
+    if payload.get("schema_version") != 2:
+        raise ValueError("不支持的公开 Prompt 资产版本")
+    records, mapping = {}, {}
+    for cat in CATEGORIES:
+        items = payload.get(cat)
+        if not isinstance(items, list):
+            raise ValueError(f"公开资产缺少 {cat}")
+        records[cat], mapping[cat] = [], {}
+        for source in items:
+            asset_id = source.get("asset_id")
+            if not asset_id or asset_id in mapping[cat]:
+                raise ValueError("公开资产标识缺失或重复")
+            if cat == "final_settings":
+                inputs = [FirstInputRecord(**{key: item[key] for key in ("title", "content")}) for item in source["first_inputs"]]
+                selected = source["selected_first_input_index"]
+                if not isinstance(selected, int) or selected < 0 or selected >= len(inputs):
+                    raise ValueError("公开资产首次输入选择无效")
+                record = SystemPromptRecord(
+                    title=source["title"], prompt=source["prompt"], long_term_memory=source["long_term_memory"],
+                    first_inputs=inputs, selected_first_input_id=inputs[selected].id,
+                )
+            elif cat == "fixed_templates":
+                record = FixedTemplateRecord(**{key: source[key] for key in TEMPLATE_FIELDS})
+            else:
+                record = PromptTextRecord(**{key: source[key] for key in TEXT_FIELDS})
+            records[cat].append(record)
+            mapping[cat][asset_id] = record
 
-    world_books = [
-        PromptTextRecord.from_dict(item)
-        for item in _decode_records(AppStorageKeys.WORLD_BOOK_RECORDS)
-    ]
-    character_cards = [
-        PromptTextRecord.from_dict(item)
-        for item in _decode_records(AppStorageKeys.CHARACTER_CARD_RECORDS)
-    ]
-    templates = [
-        FixedTemplateRecord.from_dict(item)
-        for item in _decode_records(AppStorageKeys.FIXED_TEMPLATE_RECORDS)
-    ]
-    final_settings = [
-        SystemPromptRecord.from_dict(item)
-        for item in _decode_records(AppStorageKeys.SYSTEM_PROMPT_RECORDS)
-        if str(item.get("title", "")).strip() not in REMOVED_BUILTIN_PROMPT_TITLES
-    ]
-    hidden_final_settings = [
-        SystemPromptRecord.from_dict(item)
-        for item in _decode_records(AppStorageKeys.HIDDEN_SYSTEM_PROMPT_RECORDS)
-        if str(item.get("title", "")).strip() not in REMOVED_BUILTIN_PROMPT_TITLES
-    ]
+    for source, record in zip(payload["final_settings"], records["final_settings"]):
+        sources = source["sources"]
+        for name, (field, cat) in SOURCE_FIELDS.items():
+            ref = sources.get(name, "")
+            setattr(record, field, mapping[cat][ref].id if ref else "")
+        record.final_other_character_ids = [mapping["character_cards"][ref].id for ref in sources.get("other_characters", [])]
+        ref = sources.get("user_character")
+        record.final_user_character_name = mapping["character_cards"][ref].title if ref else ""
+        record.final_other_character_names = [mapping["character_cards"][ref].title for ref in sources.get("other_characters", [])]
 
-    public_world_books = list(payload.get("world_books") or [])
-    public_character_cards = list(payload.get("character_cards") or [])
-    public_templates = list(payload.get("fixed_templates") or [])
-    public_final_settings = list(payload.get("final_settings") or [])
-
-    world_book = _upsert_text_record(
-        world_books, public_world_books, "火影忍者", "世界书"
-    )
-    seeded_characters = {
-        title: _upsert_text_record(
-            character_cards, public_character_cards, title, "角色卡"
-        )
-        for title in ("日向雏田", "油女志乃", "犬冢牙")
-    }
-    user_character = seeded_characters["油女志乃"]
-    other_characters = [
-        seeded_characters["日向雏田"],
-        seeded_characters["犬冢牙"],
-    ]
-    default_template = _upsert_template(templates, public_templates, "默认模板")
-    final_setting = _upsert_final_setting(
-        final_settings, public_final_settings, "火影忍者·油女志乃"
-    )
-
-    # The published final prompt is self-contained. Link the world and characters,
-    # but leave the template unlinked because its original private template was not
-    # part of the upload allowlist.
-    if not final_setting.final_world_book_id:
-        final_setting.final_world_book_id = world_book.id
-    if not final_setting.final_user_character_id:
-        final_setting.final_user_character_id = user_character.id
-    if not final_setting.final_other_character_ids:
-        final_setting.final_other_character_ids = [item.id for item in other_characters]
-    if not final_setting.final_user_character_name:
-        final_setting.final_user_character_name = user_character.title
-    if not final_setting.final_other_character_names:
-        final_setting.final_other_character_names = [item.title for item in other_characters]
-
-    updates = {
-        AppStorageKeys.WORLD_BOOK_RECORDS: _encode_records(world_books),
-        AppStorageKeys.CHARACTER_CARD_RECORDS: _encode_records(character_cards),
-        AppStorageKeys.FIXED_TEMPLATE_RECORDS: _encode_records(templates),
+    updates = {key: json.dumps([r.to_dict() for r in records[cat]], ensure_ascii=False) for cat, key in CATEGORIES.items()}
+    for name, (key, cat) in DEFAULT_FIELDS.items():
+        ref = payload.get("defaults", {}).get(name, "")
+        chosen = mapping[cat][ref] if ref else next(iter(records[cat]), None)
+        updates[key] = chosen.id if chosen else ""
+        if name == "final_setting":
+            updates[AppStorageKeys.SYSTEM_PROMPT] = chosen.prompt if chosen else ""
+    updates.update({
         AppStorageKeys.FIXED_TEMPLATE_DEFAULT_SEEDED: True,
-        AppStorageKeys.SELECTED_FIXED_TEMPLATE_RECORD_ID: default_template.id,
-        AppStorageKeys.SYSTEM_PROMPT_RECORDS: _encode_records(final_settings),
-        AppStorageKeys.HIDDEN_SYSTEM_PROMPT_RECORDS: _encode_records(hidden_final_settings),
-        AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID: final_setting.id,
-        AppStorageKeys.SYSTEM_PROMPT: final_setting.prompt,
-        AppStorageKeys.SYSTEM_PROMPT_RECORD_NEXT_INDEX: max(1, len(final_settings) + 1),
+        AppStorageKeys.LONG_TERM_MEMORY_DEFAULT_SEEDED: True,
+        AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED: True,
+        AppStorageKeys.SYSTEM_PROMPT_RECORD_NEXT_INDEX: len(records["final_settings"]) + 1,
         AppStorageKeys.PUBLIC_PROMPT_ASSET_SEED_VERSION: PUBLIC_ASSET_SEED_VERSION,
-    }
+    })
     settings.set_many_atomic(updates)
     return True

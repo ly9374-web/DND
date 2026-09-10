@@ -119,9 +119,45 @@ cd /d 项目目录
 
 API Key、Prompt、URL 收藏和聊天记录统一保存在自身目录的 `.python_app_data` 中。整个"普通模式独立版"文件夹移动后，这些本地数据会一起带走。虚拟环境不放在项目内（Mac/Linux 在 `~/.local/share/project-venvs/DND/`，Windows 在 `%USERPROFILE%\.local\share\project-venvs\DND\`），因此文件夹拷到别的电脑时会自动重建环境，不影响数据。
 
+### 图生视频
+
+在“图生视频”区域选择模型后立即生效，时长下拉框位于输入图片下方。
+
+- **Wan 2.2 I2V Fast**：使用 Replicate 的 `wan-video/wan-2.2-i2v-fast`，配置 `REPLICATE_API_TOKEN`；可选约 5、6、7、7.5 秒，实际为 81、97、113、121 帧 / 16 FPS，无音频。
+- **Seedance 2.0 Mini**：使用 OpenRouter 的 `bytedance/seedance-2.0-mini`，支持 4–15 秒的整数时长。
+- **Seedance 1.5 Pro**：使用 OpenRouter 的 `bytedance/seedance-1-5-pro`，支持 4–12 秒的整数时长。
+
+两个 Seedance 共用 APIkey 页面的 OpenRouter Key（或 Streamlit Secrets 中的 `OPENROUTER_API_KEY`），默认 5 秒、720p、开启原生声音，画面比例按输入图片匹配。图生视频仍通过已有 Cloudinary 配置上传输入图片。
+
+Seedance 点击“加载视频播放”后取回内存，画面与原生音轨通过同一播放器播放。点击“下载视频”才保存文件；应用不会自动保存视频到磁盘。历史记录保留服务商 URL，链接失效后无法重新加载，需要长期保留的视频请手动下载。旧视频记录不会因移除旧模型而删除。
+
+时长与音频能力依据 2026-09-10 的 [OpenRouter 模型列表](https://openrouter.ai/api/v1/videos/models) 和 [Replicate 参数](https://replicate.com/wan-video/wan-2.2-i2v-fast/api/schema)，集中配置于 `app/video_models.py`。当前未进行真实生成验证。
+
+### 发布普通区 Prompt
+
+提交 GitHub 前，先保存应用中的编辑，再运行：
+
+```bash
+python tools/export_public_prompt_assets.py
+python tools/export_public_prompt_assets.py --check
+```
+
+导出文件为 `public_prompt_assets/ordinary.json`，包含普通区全部世界书、角色卡、固定模板、最终设定、长期记忆和快捷输入。导出不按名称筛选，保留本地当前正文、多个首次输入和普通区内的来源关联；新增、改名后重新导出即可。`--check` 会在导出过期时返回失败。支持 `--source` 指定设置文件，默认遵循 `VS_IMAGE_NOVEL_DATA_DIR`。
+
+隐藏区、聊天记录及索引、密钥、媒体、URL 收藏不会进入导出文件。`.python_app_data/` 和 `.prompt_migration_backups/` 都被 Git 忽略，不要强制添加这些目录。最终设定若引用隐藏区或已不存在的来源，导出会提示并省略该关联，保留普通区最终正文，不修改本地关联。
+
+新安装只在没有既有 Prompt 数据或历史初始化标记时导入公开资产；已有安装不覆盖、不自动合并、不复活已删除的条目。旧版 `naruto_public.json` 和按标题写死的初始化逻辑已移除。普通区内容修改后需要重新导出，单独 `git push` 不会读取本地运行数据。
+
+`tools/migrate_prompt_spaces.py` 是本机这次分区调整的一次性工具，不参与应用启动或发布导出。默认只预览；`--apply` 才会备份整个数据目录并移动完整原记录。运行前必须停止本项目所有应用实例。它保留普通区的火影世界书、三张指定角色卡和火影最终设定，其余这三类记录追加到隐藏区；固定模板、长期记忆、快捷输入、聊天文件、索引和计数器不改。独立备份和迁移校验报告位于 `.prompt_migration_backups/`。
+
 本版本只包含普通模式与短 Story Brain：
 
-- 保留普通聊天、图片/视频生成、世界书、角色卡、固定模板、最终设定、URL 收藏和原有普通历史。
+- 保留普通聊天、图片/视频生成、世界书、角色卡、固定模板、长期记忆规则、最终设定、URL 收藏和原有普通历史。
+- 每个最终设定可绑定一份长期记忆规则，并保存多条可命名、可切换的首轮输入。
+- Prompt 的“快捷输入”可保存名称和多行内容，底部支持保存、新建和删除。在聊天输入框任意位置输入 `/` 或 `／` 可打开候选列表，继续输入名称可筛选；点击或按方向键、Enter 选择后，只替换指令片段，保留前后文字，不直接发送。Esc 关闭列表，粘贴网址不会触发。
+- 默认快捷输入“图片”保留原 `/图片` 的提示词，可编辑、改名或删除；发送后作为普通聊天进入上下文。普通账号仅可见普通快捷输入，私密账号可见全部，新建条目归属私密；编辑普通条目或续聊普通记录时保留原归属。
+- 下拉框中的“重发 · 操作”为固定指令，选择后只填入 `/重发`，再次发送才执行。整条消息为 `/重发` 或 `／重发` 时，用当前设置重发上一轮存储的用户内容，成功后替换原问答，失败保留原问答和记忆；后台任务执行期间不可重发。
+- 每条聊天只保留当前版和上一版 Story Brain 快照（含更新进度），自动或手动更新后淘汰更早版本。撤回、重发跨过记忆更新边界时恢复可用快照；超出范围或旧记录没有快照时明确提示，保留当前记忆。快照随聊天保存并遵循同一账号归属，图片和视频不随重发删除。
 - 不包含 Agent 模式、Agent Prompt 或 Agent 聊天记录。
 - 不包含长 Story Brain 图谱、角色/关系/事件编辑器或 Memory Pack 调用。
 - 旧聊天记录里的长 Story Brain 原始字段仅作为不可见兼容归档保留，不显示、不修改，也不会发送给模型。

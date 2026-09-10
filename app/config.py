@@ -1,8 +1,11 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import streamlit as st
+
+from app.video_models import normalize_video_model
 
 
 # =========================
@@ -42,9 +45,9 @@ class AppStorageKeys:
     PAGE2_UNEXPECTED_EVENT_THRESHOLD = "page2UnexpectedEventThreshold"
     PAGE2_TEMPERATURE = "page2Temperature"
     PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER = "page2SelectedVideoGenerationProvider"
+    PAGE2_IMAGE_ASPECT_RATIOS = "page2ImageAspectRatios"
 
-    DOMOAI_API_KEY = "domoaiApiKey"
-    ZHIPU_API_KEY = "zhipuApiKey"
+    OPENROUTER_API_KEY = "openrouterApiKey"
     DEEPSEEK_API_KEY = "deepseekApiKey"
     KEYLINK_DEEPSEEK_V4_PRO_API_KEY = "keylinkDeepseekV4ProApiKey"
     KEYLINK_DEEPSEEK_V4_PRO_ENABLED = "keylinkDeepseekV4ProEnabled"
@@ -58,10 +61,22 @@ class AppStorageKeys:
 
     WORLD_BOOK_RECORDS = "worldBookRecords"
     CHARACTER_CARD_RECORDS = "characterCardRecords"
+    LONG_TERM_MEMORY_RECORDS = "longTermMemoryRecords"
+    QUICK_INPUT_RECORDS = "quickInputRecords"
+    HIDDEN_QUICK_INPUT_RECORDS = "hiddenQuickInputRecords"
+    QUICK_INPUT_DEFAULT_SEEDED = "quickInputDefaultSeeded"
+    LONG_TERM_MEMORY_DEFAULT_SEEDED = "longTermMemoryDefaultSeeded"
+    DEFAULT_LONG_TERM_MEMORY_RECORD_ID = "defaultLongTermMemoryRecordID"
+    HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID = "hiddenDefaultLongTermMemoryRecordID"
     FIXED_TEMPLATE_RECORDS = "fixedTemplateRecords"
     SELECTED_FIXED_TEMPLATE_RECORD_ID = "selectedFixedTemplateRecordID"
     FIXED_TEMPLATE_DEFAULT_SEEDED = "fixedTemplateDefaultSeeded"
     PUBLIC_PROMPT_ASSET_SEED_VERSION = "publicPromptAssetSeedVersion"
+
+    HIDDEN_WORLD_BOOK_RECORDS = "hiddenWorldBookRecords"
+    HIDDEN_CHARACTER_CARD_RECORDS = "hiddenCharacterCardRecords"
+    HIDDEN_LONG_TERM_MEMORY_RECORDS = "hiddenLongTermMemoryRecords"
+    HIDDEN_FIXED_TEMPLATE_RECORDS = "hiddenFixedTemplateRecords"
 
     CHAT_RECORDS = "chatRecords"
     CHAT_RECORD_NEXT_INDEX = "chatRecordNextIndex"
@@ -126,6 +141,23 @@ class SettingsStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.values = {}
         self.load()
+        self._migrate_video_settings()
+
+    def _migrate_video_settings(self):
+        # Only retire credentials and the active selection; media history stays intact.
+        changed = False
+        for key in ("domoaiApiKey", "zhipuApiKey"):
+            if key in self.values:
+                del self.values[key]
+                changed = True
+        key = AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER
+        if key in self.values:
+            model = normalize_video_model(self.values[key])
+            if model != self.values[key]:
+                self.values[key] = model
+                changed = True
+        if changed:
+            self.save()
 
     def load(self):
         if not self.path.exists():
@@ -135,15 +167,67 @@ class SettingsStore:
         try:
             text = self.path.read_text(encoding="utf-8")
             self.values = json.loads(text)
-        except Exception:
+        except Exception as exc:
+            # 文件损坏（如写入中途被打断导致 JSON 截断）时，绝不静默置空——
+            # 否则下一次 save() 会把空状态写回磁盘，造成全部数据丢失。
+            # 先把损坏文件转移保存，再尝试从最近备份恢复。
+            corrupt_path = self.path.with_name(
+                f"{self.path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            try:
+                os.replace(self.path, corrupt_path)
+                debug_log(
+                    f"[SettingsStore] 主文件损坏，已移至 {corrupt_path.name}: {exc}"
+                )
+            except Exception:
+                corrupt_path = None
+                debug_log(f"[SettingsStore] 主文件损坏且无法转移: {exc}")
+
             self.values = {}
+            if corrupt_path is not None:
+                backup = self.path.with_name(
+                    self.path.name.replace(".json", "") + ".last-good.json"
+                )
+                if backup.exists():
+                    try:
+                        self.values = json.loads(
+                            backup.read_text(encoding="utf-8")
+                        )
+                        debug_log(
+                            f"[SettingsStore] 已从备份 {backup.name} 恢复 {len(self.values)} 个键"
+                        )
+                    except Exception as backup_exc:
+                        debug_log(
+                            f"[SettingsStore] 备份 {backup.name} 也无法读取: {backup_exc}"
+                        )
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self.values, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload = json.dumps(self.values, ensure_ascii=False, indent=2)
+
+        # 原子写入：先写临时文件再 os.replace，防止写入中途被打断
+        # （进程被杀/断电）导致主文件截断损坏。
+        data_tmp = self.path.with_name(f".{self.path.name}.tmp")
+        try:
+            data_tmp.write_text(payload, encoding="utf-8")
+
+            # 每次成功写入前，保留一份最近完好的备份用于损坏自恢复。
+            if self.path.exists():
+                backup = self.path.with_name(
+                    self.path.name.replace(".json", "") + ".last-good.json"
+                )
+                try:
+                    backup.write_text(
+                        self.path.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                except Exception as backup_exc:
+                    debug_log(f"[SettingsStore] 写滚动备份失败(不影响主流程): {backup_exc}")
+
+            os.replace(data_tmp, self.path)
+        except Exception:
+            if data_tmp.exists():
+                data_tmp.unlink()
+            raise
 
     def get(self, key, default=None):
         return self.values.get(key, default)
@@ -418,33 +502,16 @@ class KeyLinkDeepSeekV4ProConfig:
 
 
 # =========================
-# 对应 Swift: DomoAIConfig
+# OpenRouter 视频配置
 # =========================
 
-class DomoAIConfig:
+class OpenRouterConfig:
     @staticmethod
     def api_key():
-        domoai_api_key = settings.get(AppStorageKeys.DOMOAI_API_KEY, "")
-        effective_domoai_api_key = get_effective_api_key(
-            domoai_api_key,
-            "DOMOAI_API_KEY",
+        return get_effective_api_key(
+            settings.get(AppStorageKeys.OPENROUTER_API_KEY, ""),
+            "OPENROUTER_API_KEY",
         )
-        return effective_domoai_api_key
-
-
-# =========================
-# 对应 Swift: ZhipuConfig
-# =========================
-
-class ZhipuConfig:
-    @staticmethod
-    def api_key():
-        zhipu_api_key = settings.get(AppStorageKeys.ZHIPU_API_KEY, "")
-        effective_zhipu_api_key = get_effective_api_key(
-            zhipu_api_key,
-            "ZHIPU_API_KEY",
-        )
-        return effective_zhipu_api_key
 
 
 # =========================

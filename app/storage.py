@@ -137,6 +137,7 @@ class ChatRecordStore:
                 created_at=record.created_at,
                 updated_at=record.updated_at,
                 file_name=file_name,
+                hidden=bool(getattr(record, "hidden", False)),
             ),
             scope=scope,
         )
