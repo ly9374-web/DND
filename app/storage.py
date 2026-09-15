@@ -138,6 +138,8 @@ class ChatRecordStore:
                 updated_at=record.updated_at,
                 file_name=file_name,
                 hidden=bool(getattr(record, "hidden", False)),
+                branch_group_id=str(getattr(record, "branch_group_id", "") or ""),
+                branch_number=getattr(record, "branch_number", None),
             ),
             scope=scope,
         )

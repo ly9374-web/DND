@@ -6,13 +6,15 @@ import io
 import math
 import secrets
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, List, Optional
 
 from PIL import Image, ImageOps
 
-from app.api.chat_clients import GrokAPIClient, DeepSeekAPIClient
+from app.api.chat_clients import DeepSeekAPIClient, GrokAPIClient, OpenRouterChatAPIClient
 from app.api.media_clients import (
+    ANILLUSTRIOUS_PROVIDER,
+    WAI_ILLUSTRIOUS_PROVIDER,
     IMAGE_ASPECT_RATIO,
     IMAGE_ASPECT_RATIOS,
     CloudinaryUploader,
@@ -21,10 +23,11 @@ from app.api.media_clients import (
     ReplicateImageAPIClient,
     ReplicateVideoAPIClient,
     download_url_as_base64,
-    try_download_url_as_base64,
 )
 from app.config import AppStorageKeys, settings
 from app.models import (
+    CHAT_MODEL_LABELS,
+    CHAT_MODEL_OPTIONS,
     ChatRecord,
     GeneratedImageRecord,
     GeneratedMediaKind,
@@ -33,6 +36,7 @@ from app.models import (
     grok_api_model_for_chat_model,
     normalize_chat_model,
     now_iso,
+    openrouter_api_model_for_chat_model,
 )
 from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
 from app.services.image_prompts import build_image_prompt_system_prompt
@@ -44,16 +48,14 @@ from app.video_models import (
 )
 DEFAULT_SYSTEM_PROMPT = ""
 STORY_BRAIN_SHORT = "story_brain_short"
-STORY_BRAIN_UPDATE_MODELS = ["deepseekPro", "deepseekFlash", "grok"]
-STORY_BRAIN_UPDATE_MODEL_LABELS = {
-    "deepseekPro": "DeepSeek Pro",
-    "deepseekFlash": "DeepSeek Flash",
-    "grok": "Grok",
-}
+STORY_BRAIN_UPDATE_MODELS = list(CHAT_MODEL_OPTIONS)
+STORY_BRAIN_UPDATE_MODEL_LABELS = dict(CHAT_MODEL_LABELS)
 INVALID_STORY_BRAIN_TEXTS = {"未解析到 DeepSeek 回复内容。"}
 
 def normalize_story_brain_update_model(value) -> str:
     model = str(value or "").strip()
+    if model == "grok":
+        return "grok1"
     if model == "deepseek":
         return "deepseekFlash"
     if model in STORY_BRAIN_UPDATE_MODELS:
@@ -61,7 +63,7 @@ def normalize_story_brain_update_model(value) -> str:
     return "deepseekFlash"
 
 UNEXPECTED_EVENT_PROMPT = """
-本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况可以是场景中的角色主动了什么话，或做了什么行为。
+本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况可以是场景中的角色主动了什么话，或做了什么行为，也可能是什么突发事件。
 """.strip()
 
 
@@ -210,39 +212,41 @@ def reset_context_settings():
     return
 
 
-def save_context_to_settings(ctx: Page2Context):
-    settings.set(AppStorageKeys.SYSTEM_PROMPT, str(ctx.system_prompt or "").strip())
-    settings.set(AppStorageKeys.PAGE2_CONTEXT_TURN_COUNT, int(max(0, ctx.context_turn_count)))
-    settings.set(
-        AppStorageKeys.PAGE2_SELECTED_CHAT_MODEL,
-        normalize_chat_model(ctx.selected_chat_model),
-    )
-    settings.set(
-        AppStorageKeys.PAGE2_CHAT_REASONING_ENABLED,
-        bool(ctx.chat_reasoning_enabled),
-    )
-    settings.set(
-        AppStorageKeys.PAGE2_STORY_BRAIN_UPDATE_MODEL,
-        normalize_story_brain_update_model(ctx.story_brain_update_model),
-    )
-    settings.set(
-        AppStorageKeys.PAGE2_STORY_BRAIN_REASONING_ENABLED,
-        bool(ctx.story_brain_reasoning_enabled),
-    )
-    settings.set(AppStorageKeys.PAGE2_STORY_BRAIN_TURNS, max(1, int(ctx.story_brain_turns)))
-    settings.set(
-        AppStorageKeys.PAGE2_UNEXPECTED_EVENT_ENABLED,
-        bool(ctx.unexpected_event_enabled),
-    )
-    settings.set(
-        AppStorageKeys.PAGE2_UNEXPECTED_EVENT_THRESHOLD,
-        min(100, max(0, int(ctx.unexpected_event_threshold))),
-    )
-    settings.set(AppStorageKeys.PAGE2_TEMPERATURE, float(ctx.temperature))
-    settings.set(
-        AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER,
-        normalize_video_model(ctx.selected_video_generation_provider),
-    )
+def save_context_to_settings(ctx: Page2Context) -> bool:
+    """Atomically persist a changed context and skip no-op page reruns."""
+    updates = {
+        AppStorageKeys.SYSTEM_PROMPT: str(ctx.system_prompt or "").strip(),
+        AppStorageKeys.PAGE2_CONTEXT_TURN_COUNT: int(max(0, ctx.context_turn_count)),
+        AppStorageKeys.PAGE2_SELECTED_CHAT_MODEL: normalize_chat_model(
+            ctx.selected_chat_model
+        ),
+        AppStorageKeys.PAGE2_CHAT_REASONING_ENABLED: bool(
+            ctx.chat_reasoning_enabled
+        ),
+        AppStorageKeys.PAGE2_STORY_BRAIN_UPDATE_MODEL: (
+            normalize_story_brain_update_model(ctx.story_brain_update_model)
+        ),
+        AppStorageKeys.PAGE2_STORY_BRAIN_REASONING_ENABLED: bool(
+            ctx.story_brain_reasoning_enabled
+        ),
+        AppStorageKeys.PAGE2_STORY_BRAIN_TURNS: max(1, int(ctx.story_brain_turns)),
+        AppStorageKeys.PAGE2_UNEXPECTED_EVENT_ENABLED: bool(
+            ctx.unexpected_event_enabled
+        ),
+        AppStorageKeys.PAGE2_UNEXPECTED_EVENT_THRESHOLD: min(
+            100,
+            max(0, int(ctx.unexpected_event_threshold)),
+        ),
+        AppStorageKeys.PAGE2_TEMPERATURE: float(ctx.temperature),
+        AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER: normalize_video_model(
+            ctx.selected_video_generation_provider
+        ),
+    }
+    if all(settings.get(key) == value for key, value in updates.items()):
+        return False
+
+    settings.set_many_atomic(updates)
+    return True
 
 
 def build_context_messages(
@@ -288,6 +292,16 @@ def _send_with_current_chat_model(
             model=deepseek_model,
             thinking_enabled=ctx.chat_reasoning_enabled,
             reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
+        )
+
+    openrouter_model = openrouter_api_model_for_chat_model(ctx.selected_chat_model)
+    if openrouter_model is not None:
+        return OpenRouterChatAPIClient.send_message(
+            system_prompt=effective_system_prompt,
+            context_messages=context_messages,
+            user_message=user_message,
+            temperature=ctx.temperature,
+            model=openrouter_model,
         )
 
     grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
@@ -363,33 +377,23 @@ def generate_short_story_brain(
 {existing_story_brain or "暂无"}
 """.strip()
 
-    update_model = normalize_story_brain_update_model(ctx.story_brain_update_model)
     story_brain_system_prompt = (
         str(long_term_memory_prompt or "").strip()
         or DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
     )
-    deepseek_model = deepseek_api_model_for_chat_model(update_model)
-    if deepseek_model is not None:
-        raw_text = DeepSeekAPIClient.send_message(
-            system_prompt=story_brain_system_prompt,
-            context_messages=[],
-            user_message=generator_user_message,
-            temperature=ctx.temperature,
-            model=deepseek_model,
-            thinking_enabled=ctx.story_brain_reasoning_enabled,
-            reasoning_effort="high" if ctx.story_brain_reasoning_enabled else None,
-            max_tokens=50000,
-        )
-    else:
-        raw_text = GrokAPIClient.send_message(
-            system_prompt=story_brain_system_prompt,
-            context_messages=[],
-            user_message=generator_user_message,
-            model="grok-4.3",
-            temperature=ctx.temperature,
-            thinking_enabled=ctx.story_brain_reasoning_enabled,
-            reasoning_effort="high" if ctx.story_brain_reasoning_enabled else None,
-        )
+    story_brain_ctx = replace(
+        ctx,
+        selected_chat_model=normalize_story_brain_update_model(
+            ctx.story_brain_update_model
+        ),
+        chat_reasoning_enabled=ctx.story_brain_reasoning_enabled,
+    )
+    raw_text = _send_with_current_chat_model(
+        ctx=story_brain_ctx,
+        system_prompt=story_brain_system_prompt,
+        context_messages=[],
+        user_message=generator_user_message,
+    )
 
     updated_story_brain = _strip_plain_text_output(raw_text)
     if updated_story_brain in INVALID_STORY_BRAIN_TEXTS:
@@ -398,22 +402,31 @@ def generate_short_story_brain(
 
 
 def generate_image_prompt(
-    conversation_text: str,
-    mode: str = "normal",
-    subject: str = "",
     *,
     ctx: Page2Context,
+    turns: list[Page2ConversationTurn],
+    story_brain_short: str = "",
+    story_brain_enabled: bool = True,
+    mode: str = "normal",
+    subject: str = "",
 ) -> str:
-    conversation_text = str(conversation_text or "").strip()
-    if not conversation_text:
+    if not build_recent_image_prompt_conversation(turns):
         raise ValueError("暂无助手回复内容。")
 
-    return _send_with_current_chat_model(
+    user_message = build_image_prompt_system_prompt(mode, subject)
+    if story_brain_enabled:
+        user_message = _inject_short_story_brain_into_user_prompt(
+            user_message,
+            story_brain_short,
+        )
+    reply = _strip_plain_text_output(_send_with_current_chat_model(
         ctx=ctx,
-        system_prompt=build_image_prompt_system_prompt(mode, subject),
-        context_messages=[],
-        user_message=conversation_text,
-    )
+        context_messages=build_context_messages(turns, ctx.context_turn_count),
+        user_message=user_message,
+    ))
+    if not reply or reply in INVALID_STORY_BRAIN_TEXTS:
+        raise ValueError("模型没有返回可用的图片 prompt，请重试。")
+    return reply
 
 
 def generate_video_prompt(*, ctx: Page2Context, image_prompt: str, story_text: str) -> str:
@@ -439,11 +452,13 @@ def generate_image(
     prompt: str,
     image_urls: Optional[list[str]] = None,
     aspect_ratio: str = IMAGE_ASPECT_RATIO,
+    refiner_prompt: str = "",
 ) -> GeneratedImageRecord:
     provider = str(provider or "").strip()
     if provider == "grokQuality":
         provider = "grokpro2k"
     prompt = str(prompt or "").strip()
+    refiner_prompt = str(refiner_prompt or "").strip()
     image_urls = image_urls or []
     image_urls = [str(url).strip() for url in image_urls if str(url).strip()]
 
@@ -474,13 +489,11 @@ def generate_image(
             prompt=prompt,
             image_urls=image_urls,
             aspect_ratio=aspect_ratio,
+            refiner_prompt=refiner_prompt,
         )
 
     image_url = getattr(result, "image_url", None)
     image_base64 = getattr(result, "image_data_base64", None)
-
-    if image_url and not image_base64:
-        image_base64 = try_download_url_as_base64(image_url)
 
     return GeneratedImageRecord(
         provider=provider,
@@ -657,11 +670,17 @@ def upsert_chat_record(
     existing_title = None
     existing_created_at = None
     existing_hidden = None
+    existing_branch_group_id = ""
+    existing_branch_number = None
     for item in ChatRecordStore.load_index(scope=scope):
         if item.id == record_id:
             existing_title = item.title
             existing_created_at = item.created_at
             existing_hidden = bool(getattr(item, "hidden", False))
+            existing_branch_group_id = str(
+                getattr(item, "branch_group_id", "") or ""
+            )
+            existing_branch_number = getattr(item, "branch_number", None)
             break
 
     record = ChatRecord(
@@ -682,6 +701,8 @@ def upsert_chat_record(
         ),
         final_setting_id=str(final_setting_id or ""),
         story_brain_checkpoints=list(story_brain_checkpoints or [])[-2:],
+        branch_group_id=existing_branch_group_id,
+        branch_number=existing_branch_number,
         # 已有记录沿用创建时的账号归属；新记录按当前账号标记。
         hidden=existing_hidden if existing_hidden is not None else bool(hidden),
         created_at=existing_created_at or now,

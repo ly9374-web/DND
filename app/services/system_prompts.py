@@ -133,7 +133,7 @@ def load_state(hidden_space: bool = False) -> PromptState:
 
 
 def _ensure_record_defaults(state: PromptState) -> None:
-    """Migrate old final settings to named first inputs and the default memory."""
+    """Migrate first inputs and memory bindings without changing saved memory text."""
     from app.services import prompt_assets
 
     prompt_assets.load_long_term_memories(hidden_space=True)
@@ -158,13 +158,8 @@ def _ensure_record_defaults(state: PromptState) -> None:
             or before_selected_id != record.selected_first_input_id
         ):
             changed = True
-        if not str(record.long_term_memory or "").strip():
-            record.long_term_memory = (
-                str(default_memory.content or "")
-                if default_memory is not None
-                else prompt_assets.DEFAULT_LONG_TERM_MEMORY
-            )
-            changed = True
+        # Creation supplies the selected memory rules. An empty saved value is
+        # intentional; loading must not replace it with the current default.
         if not str(record.final_long_term_memory_id or "").strip() and default_memory is not None:
             record.final_long_term_memory_id = default_memory.id
             changed = True

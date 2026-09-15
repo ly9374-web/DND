@@ -3,13 +3,13 @@ from __future__ import annotations
 import streamlit as st
 
 
-def apply_dark_mode() -> None:
+def apply_dark_mode(*, animate_background: bool = True) -> None:
     """
     Force a consistent dark theme across the whole app.
     Streamlit's theme config covers most widgets; this CSS patch handles the rest
     (sidebar, separators, some widget surfaces, and general typography contrast).
     """
-    st.html(
+    css = (
         """
 <style>
 /* ===== Night mode (global) ===== */
@@ -195,6 +195,43 @@ header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] button {
 }
 [data-testid="stSidebar"] * {
   color: var(--nm-text) !important;
+}
+
+/* Share the first row with the native collapse control. */
+[data-testid="stSidebarContent"]:has(.st-key-sidebar_back) {
+  position: relative;
+}
+[data-testid="stSidebarContent"]:has(.st-key-sidebar_back) [data-testid="stSidebarHeader"] {
+  position: absolute;
+  top: 1rem;
+  right: 1.25rem;
+  width: 2.375rem;
+  height: 2.375rem;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  z-index: 1;
+}
+[data-testid="stSidebarContent"]:has(.st-key-sidebar_back) [data-testid="stLogoSpacer"] {
+  display: none;
+}
+[data-testid="stSidebarContent"]:has(.st-key-sidebar_back) [data-testid="stSidebarCollapseButton"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  visibility: visible;
+  opacity: 1;
+}
+[data-testid="stSidebarContent"]:has(.st-key-sidebar_back) [data-testid="stSidebarUserContent"] {
+  padding-top: 1rem;
+}
+[data-testid="stSidebar"] .st-key-sidebar_back {
+  width: calc(100% - 3rem);
+}
+[data-testid="stSidebar"] .st-key-sidebar_back button {
+  min-height: 2.375rem;
 }
 
 /* Headers / captions */
@@ -551,5 +588,29 @@ div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas,
 }
 
 </style>
-        """,
+        """
     )
+
+    if not animate_background:
+        css = css.replace(
+            "</style>",
+            """
+/* Keep the background appearance on content-heavy pages without continuously
+ * repainting full-viewport masks and filters. */
+.stApp::before {
+  animation: none;
+  filter: hue-rotate(26deg);
+}
+.stApp::after {
+  animation: none;
+  opacity: 0.30;
+  filter: hue-rotate(26deg);
+  will-change: auto;
+  -webkit-mask-position: center;
+  mask-position: center;
+}
+</style>
+            """,
+        )
+
+    st.html(css)

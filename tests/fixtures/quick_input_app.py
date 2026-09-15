@@ -39,6 +39,8 @@ st.title("快捷输入交互验证")
 st.session_state.hidden_unlocked = st.checkbox("私密账号")
 busy = st.checkbox("等待回复")
 view = st.radio("页面", ["聊天", "管理"])
+if not any(item.title == "场景" for item in quick_inputs.load_quick_inputs()):
+    quick_inputs.save_quick_input("", "场景", "公开测试场景描述")
 if st.session_state.hidden_unlocked:
     if not any(item.title == "私密测试" for item in quick_inputs.load_quick_inputs(True)):
         quick_inputs.save_quick_input("", "私密测试", "私密测试内容", hidden_space=True)

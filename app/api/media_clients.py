@@ -20,12 +20,33 @@ from app.video_models import VIDEO_MODELS, WAN_DURATION_FRAMES, WAN_FPS, WAN_MOD
 
 IMAGE_ASPECT_RATIO = "1:1"
 IMAGE_ASPECT_RATIOS = ("3:4", "4:3", "1:1")
+ANILLUSTRIOUS_PROVIDER = "anillustrious-v4"
+ANILLUSTRIOUS_VERSION = (
+    "aisha-ai-official/anillustrious-v4:"
+    "80441e2c32a55f2fcf9b77fa0a74c6c86ad7deac51eed722b9faedb253265cb4"
+)
+ANILLUSTRIOUS_DIMENSIONS = {
+    "3:4": (768, 1024),
+    "4:3": (1024, 768),
+    "1:1": (1024, 1024),
+}
+WAI_ILLUSTRIOUS_PROVIDER = "wai-nsfw-illustrious-v12"
+WAI_ILLUSTRIOUS_VERSION = (
+    "aisha-ai-official/wai-nsfw-illustrious-v12:"
+    "0fc0fa9885b284901a6f9c0b4d67701fd7647d157b88371427d63f8089ce140e"
+)
+IMAGE_GENERATION_MAX_ATTEMPTS = 3
+IMAGE_GENERATION_RETRY_INTERVAL_SECONDS = 3
 
 
 @dataclass
 class GeneratedImageResult:
     image_url: Optional[str] = None
     image_data_base64: Optional[str] = None
+
+
+class ReplicateTerminalPredictionError(RuntimeError):
+    """A prediction reached a terminal state without a usable image."""
 
 
 def validate_http_response(response):
@@ -82,19 +103,35 @@ def parse_image_response(data):
     raise RuntimeError("未识别图片生成响应：" + str(data))
 
 
-def download_url_as_base64(url):
+def download_image_bytes(url):
     response = requests.get(url, timeout=120)
     validate_http_response(response)
-    return base64.b64encode(response.content).decode("ascii")
+    content = response.content
+    if not content:
+        raise RuntimeError("服务商返回的图片文件为空。")
+    return content
 
 
-def try_download_url_as_base64(url):
+def download_url_as_base64(url):
+    return base64.b64encode(download_image_bytes(url)).decode("ascii")
+
+
+def image_url_is_expired(url):
+    """Return true only when the server explicitly rejects the image URL."""
+    parsed = urlsplit(str(url or ""))
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return True
     try:
-        return download_url_as_base64(url)
-    except Exception as exc:
-        debug_log("Failed to cache image URL as base64:", str(exc))
-        return None
-
+        response = requests.get(
+            url, timeout=(5, 15), stream=True, allow_redirects=True,
+        )
+    except requests.RequestException:
+        # A temporary network failure must not delete a user's media record.
+        return False
+    try:
+        return response.status_code in (401, 403, 404, 410)
+    finally:
+        response.close()
 
 class GrokImageAPIClient:
     IMAGE_GENERATION_URL = "https://api.x.ai/v1/images/generations"
@@ -173,21 +210,39 @@ class GrokImageAPIClient:
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", body)
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=3600,
-        )
+        for attempt in range(1, IMAGE_GENERATION_MAX_ATTEMPTS + 1):
+            response = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=3600,
+            )
 
-        debug_log("====== Grok Image HTTP Status ======")
-        debug_log(response.status_code)
-        debug_log("====== Grok Image Raw Response ======")
-        debug_log(response.text)
+            debug_log("====== Grok Image HTTP Status ======")
+            debug_log(response.status_code)
+            debug_log("====== Grok Image Raw Response ======")
+            debug_log(response.text)
 
-        validate_http_response(response)
+            try:
+                validate_http_response(response)
+                return parse_image_response(response.json())
+            except (RuntimeError, ValueError) as exc:
+                if attempt >= IMAGE_GENERATION_MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Grok 连续 {IMAGE_GENERATION_MAX_ATTEMPTS} 次未返回图片。"
+                        f"最后错误：{exc}"
+                    ) from exc
+                debug_log(
+                    "[Grok Image] retry",
+                    attempt + 1,
+                    "of",
+                    IMAGE_GENERATION_MAX_ATTEMPTS,
+                    "after:",
+                    str(exc),
+                )
+                time.sleep(IMAGE_GENERATION_RETRY_INTERVAL_SECONDS)
 
-        return parse_image_response(response.json())
+        raise RuntimeError("Grok 未返回图片。")
 
 
 class ReplicateImageAPIClient:
@@ -202,15 +257,35 @@ class ReplicateImageAPIClient:
     }
 
     @classmethod
-    def generate_image(cls, provider, prompt, image_urls=None, aspect_ratio=IMAGE_ASPECT_RATIO):
+    def generate_image(
+        cls,
+        provider,
+        prompt,
+        image_urls=None,
+        aspect_ratio=IMAGE_ASPECT_RATIO,
+        refiner_prompt="",
+    ):
         image_urls = image_urls or []
         image_urls = [url.strip() for url in image_urls if str(url).strip()]
+        refiner_prompt = str(refiner_prompt or "").strip()
 
-        if provider not in cls.MODELS:
+        versioned_providers = {
+            ANILLUSTRIOUS_PROVIDER,
+            WAI_ILLUSTRIOUS_PROVIDER,
+        }
+        if provider not in cls.MODELS and provider not in versioned_providers:
             raise ValueError("未知 Replicate provider: " + str(provider))
+        if provider in versioned_providers:
+            if image_urls:
+                raise ValueError(f"{provider} 仅支持文生图，不能使用参考图片 URL。")
+            if aspect_ratio not in ANILLUSTRIOUS_DIMENSIONS:
+                raise ValueError(f"{provider} 图片尺寸请选择 3:4、4:3 或 1:1。")
 
-        model = cls.MODELS[provider]
-        url = "https://api.replicate.com/v1/models/" + model + "/predictions"
+        if provider in versioned_providers:
+            url = "https://api.replicate.com/v1/predictions"
+        else:
+            model = cls.MODELS[provider]
+            url = "https://api.replicate.com/v1/models/" + model + "/predictions"
 
         effective_replicate_api_token = ReplicateConfig.api_token()
         if not effective_replicate_api_token:
@@ -244,6 +319,38 @@ class ReplicateImageAPIClient:
                 "safety_filter_level": "block_only_high",
                 "allow_fallback_model": False,
             }
+        elif provider == ANILLUSTRIOUS_PROVIDER:
+            width, height = ANILLUSTRIOUS_DIMENSIONS[aspect_ratio]
+            input_body = {
+                "steps": 40,
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "scheduler": "DPM++ 2M SDE Karras",
+                "refiner": bool(refiner_prompt),
+                "refiner_strength": 0.4,
+                "prompt_conjunction": True,
+            }
+            if refiner_prompt:
+                input_body["refiner_prompt"] = refiner_prompt
+        elif provider == WAI_ILLUSTRIOUS_PROVIDER:
+            width, height = ANILLUSTRIOUS_DIMENSIONS[aspect_ratio]
+            input_body = {
+                "batch_size": 1,
+                "cfg_scale": 5.86,
+                "clip_skip": 2,
+                "guidance_rescale": 1,
+                "height": height,
+                "model": "WAI-NSFW-Illustrious-SDXL-v12",
+                "pag_scale": 0,
+                "prepend_preprompt": True,
+                "prompt": prompt,
+                "scheduler": "DPM++ 2M SDE Karras",
+                "seed": -1,
+                "steps": 40,
+                "vae": "WAI-NSFW-Illustrious-SDXL-v12",
+                "width": width,
+            }
         else:
             input_body = {
                 "prompt": prompt,
@@ -252,36 +359,77 @@ class ReplicateImageAPIClient:
                 "output_format": "jpg",
             }
 
-        body = {
-            "input": input_body,
-        }
+        body = {"input": input_body}
+        if provider == ANILLUSTRIOUS_PROVIDER:
+            body["version"] = ANILLUSTRIOUS_VERSION
+        elif provider == WAI_ILLUSTRIOUS_PROVIDER:
+            body["version"] = WAI_ILLUSTRIOUS_VERSION
 
         debug_log("====== Replicate Image Request ======")
         debug_log("URL:", url)
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", body)
 
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=(15, 90),
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                "Replicate 生图请求连接中断，无法确认任务是否已创建。"
-                "请先到 Replicate 查看任务记录，避免重复提交。"
-            ) from exc
+        max_attempts = IMAGE_GENERATION_MAX_ATTEMPTS
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=(15, 90),
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    "Replicate 生图请求连接中断，无法确认任务是否已创建。"
+                    "请先到 Replicate 查看任务记录，避免重复提交。"
+                ) from exc
 
-        debug_log("====== Replicate Image HTTP Status ======")
-        debug_log(response.status_code)
-        debug_log("====== Replicate Image Raw Response ======")
-        debug_log(response.text)
+            debug_log("====== Replicate Image HTTP Status ======")
+            debug_log(response.status_code)
+            debug_log("====== Replicate Image Raw Response ======")
+            debug_log(response.text)
 
-        validate_http_response(response)
+            try:
+                validate_http_response(response)
+            except RuntimeError as exc:
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"{provider} 连续 {max_attempts} 次未返回图片。"
+                        f"最后错误：{exc}"
+                    ) from exc
+                debug_log(
+                    "[Replicate Image] retry",
+                    attempt + 1,
+                    "of",
+                    max_attempts,
+                    "after:",
+                    str(exc),
+                )
+                time.sleep(cls.POLL_INTERVAL_SECONDS)
+                continue
 
-        return cls._wait_for_image(response.json(), effective_replicate_api_token)
+            try:
+                return cls._wait_for_image(
+                    response.json(), effective_replicate_api_token
+                )
+            except ReplicateTerminalPredictionError as exc:
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"{provider} 连续 {max_attempts} 次未返回图片。"
+                        f"最后错误：{exc}"
+                    ) from exc
+                debug_log(
+                    "[Replicate Image] retry",
+                    attempt + 1,
+                    "of",
+                    max_attempts,
+                    "after:",
+                    str(exc),
+                )
+                time.sleep(cls.POLL_INTERVAL_SECONDS)
+
+        raise RuntimeError(f"{provider} 未返回图片。")
 
     @classmethod
     def _wait_for_image(cls, data, api_token):
@@ -312,7 +460,9 @@ class ReplicateImageAPIClient:
             )
             if status in {"failed", "error", "canceled", "cancelled", "aborted"}:
                 reason = str(data.get("error") or status)
-                raise RuntimeError(f"Replicate 生图任务未成功（{status}）：{reason}。{task_hint}")
+                raise ReplicateTerminalPredictionError(
+                    f"Replicate 生图任务未成功（{status}）：{reason}。{task_hint}"
+                )
 
             # Sync mode can return ready file outputs while status is processing.
             if data.get("output"):
@@ -320,7 +470,9 @@ class ReplicateImageAPIClient:
                 if str(result.image_url or "").strip():
                     return result
             if status == "succeeded":
-                raise RuntimeError("Replicate 生图任务已结束，但未返回可用图片。" + task_hint)
+                raise ReplicateTerminalPredictionError(
+                    "Replicate 生图任务已结束，但未返回可用图片。" + task_hint
+                )
             if status not in {"starting", "processing"}:
                 raise RuntimeError(f"Replicate 生图任务状态无法识别：{status or '空'}。{task_hint}")
             if not prediction_id:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from app.api.chat_clients import DeepSeekAPIClient, GrokAPIClient
+from app.api.chat_clients import DeepSeekAPIClient, GrokAPIClient, OpenRouterChatAPIClient
 from app.config import AppStorageKeys, FINAL_SETTING_SYNC_BACKUP_PATH, settings
 from app.models import (
     FirstInputRecord,
@@ -13,6 +13,7 @@ from app.models import (
     grok_api_model_for_chat_model,
     normalize_chat_model,
     now_iso,
+    openrouter_api_model_for_chat_model,
 )
 from app.services.public_prompt_seed import seed_public_prompt_assets_if_needed
 from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
@@ -42,9 +43,9 @@ CHARACTER_CARD_SYSTEM_PROMPT = """我会给你一个大致的角色介绍，你�
 
 使用Markdown格式输出，直接输出可放入角色卡的正文，不要附加解释。"""
 
-WORLD_BOOK_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中世界书的细化助手，我将会给你一个对于这个世界背景的大致介绍，你需要根据这个世界背景的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC选项。需要足够关键，足够影响这个世界的运行逻辑。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
+WORLD_BOOK_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中世界书的细化助手，我将会给你一个对于这个世界背景的大致介绍，你需要根据这个世界背景的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC选项。需要足够关键，每个问题之间用换行隔开保证易读性，足够影响这个世界的运行逻辑。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
 
-CHARACTER_CARD_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中的角色卡细化助手，我将会给你一个对于这个角色的大致介绍，你需要根据这个角色的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC三个选项。需要足够关键，足够影响这个角色的日常决策，和其他角色的互动，说话的口吻，其他角色对待她的方式和态度。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
+CHARACTER_CARD_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中的角色卡细化助手，我将会给你一个对于这个角色的大致介绍，你需要根据这个角色的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC三个选项。需要足够关键，每个问题之间用换行隔开保证易读性，足够影响这个角色的日常决策，和其他角色的互动，说话的口吻，其他角色对待她的方式和态度。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
 
 DEFAULT_TEMPLATE_BACKGROUND = """1. 背景介绍
    -你是一名负责主持沉浸式文字角色扮演游戏的 Dungeon Master（DM）。你不是配合用户续写故事的助手，而是一个持续模拟世界运行的主持者。
@@ -724,6 +725,15 @@ def _send_generation(
             reasoning_effort=effective_effort,
             max_tokens=max_tokens,
         )
+    elif (openrouter_model := openrouter_api_model_for_chat_model(selected_model)) is not None:
+        output = OpenRouterChatAPIClient.send_message(
+            system_prompt=system_prompt,
+            context_messages=[],
+            user_message=user_prompt,
+            temperature=0.8,
+            model=openrouter_model,
+            max_tokens=max_tokens,
+        )
     else:
         grok_model = grok_api_model_for_chat_model(selected_model) or "grok-4.3"
         if grok_model == "grok-4.6" and not thinking_enabled:
@@ -751,24 +761,26 @@ def _without_leading_heading(text: str, headings: set[str]) -> str:
     return "\n".join(lines).strip()
 
 
+_CHARACTER_PERSONALITY_HEADING = re.compile(
+    r"^(#{1,6})\s*(?:\d+\s*[.、．)]\s*)?角色性格\s*[:：]?\s*$"
+)
+_MARKDOWN_HEADING = re.compile(r"^(#{1,6})(?:\s|[^#])")
+
+
 def _without_character_personality_section(text: str) -> str:
     """Remove explicit Markdown character-personality sections from a card."""
     lines = str(text or "").strip().splitlines()
     kept_lines: list[str] = []
     skipped_heading_level: int | None = None
-    personality_heading = re.compile(
-        r"^(#{1,6})\s*(?:\d+\s*[.、．)]\s*)?角色性格\s*[:：]?\s*$"
-    )
-    markdown_heading = re.compile(r"^(#{1,6})(?:\s|[^#])")
 
     for line in lines:
-        personality_match = personality_heading.match(line.strip())
+        personality_match = _CHARACTER_PERSONALITY_HEADING.match(line.strip())
         if personality_match:
             skipped_heading_level = len(personality_match.group(1))
             continue
 
         if skipped_heading_level is not None:
-            heading_match = markdown_heading.match(line.strip())
+            heading_match = _MARKDOWN_HEADING.match(line.strip())
             if heading_match and len(heading_match.group(1)) <= skipped_heading_level:
                 skipped_heading_level = None
             else:
@@ -777,6 +789,59 @@ def _without_character_personality_section(text: str) -> str:
         kept_lines.append(line)
 
     return "\n".join(kept_lines).strip()
+
+
+def _restore_character_personality_section(original: str, synced: str) -> str:
+    """Restore the user-card personality section omitted from final prompts."""
+    synced_lines = str(synced or "").strip().splitlines()
+    if any(_CHARACTER_PERSONALITY_HEADING.match(line.strip()) for line in synced_lines):
+        return "\n".join(synced_lines).strip()
+
+    original_lines = str(original or "").strip().splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(original_lines)
+            if _CHARACTER_PERSONALITY_HEADING.match(line.strip())
+        ),
+        None,
+    )
+    if start is None:
+        return "\n".join(synced_lines).strip()
+
+    heading_match = _CHARACTER_PERSONALITY_HEADING.match(original_lines[start].strip())
+    heading_level = len(heading_match.group(1))
+    end = len(original_lines)
+    for index in range(start + 1, len(original_lines)):
+        next_heading = _MARKDOWN_HEADING.match(original_lines[index].strip())
+        if next_heading and len(next_heading.group(1)) <= heading_level:
+            end = index
+            break
+
+    personality = "\n".join(original_lines[start:end]).strip()
+    if not personality:
+        return "\n".join(synced_lines).strip()
+
+    insert_at = len(synced_lines)
+    if end < len(original_lines):
+        following_heading = original_lines[end].strip()
+        insert_at = next(
+            (
+                index
+                for index, line in enumerate(synced_lines)
+                if line.strip() == following_heading
+            ),
+            len(synced_lines),
+        )
+    return "\n\n".join(
+        part
+        for part in (
+            "\n".join(synced_lines[:insert_at]).strip(),
+            personality,
+            "\n".join(synced_lines[insert_at:]).strip(),
+        )
+        if part
+    )
 
 
 def other_character_section_names(other_characters: list[PromptTextRecord]) -> list[str]:
@@ -875,6 +940,43 @@ def _parse_final_sections(prompt: str) -> dict[str, tuple[str, int]]:
     return result
 
 
+def _parse_available_final_sections(prompt: str) -> dict[str, tuple[str, int]]:
+    """Parse the usable final-setting sections without requiring all six."""
+    lines = str(prompt or "").strip().splitlines()
+    positions: dict[str, list[int]] = {heading: [] for heading in FINAL_SECTION_HEADINGS}
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped in positions:
+            positions[stripped].append(index)
+
+    for heading, found in positions.items():
+        if len(found) > 1:
+            line_numbers = "、".join(str(item + 1) for item in found)
+            raise ValueError(
+                f'同步失败：分区标题“{heading}”重复（第 {line_numbers} 行）。'
+                "本次未写入任何内容。"
+            )
+
+    present = [
+        (heading, positions[heading][0])
+        for heading in FINAL_SECTION_HEADINGS
+        if positions[heading]
+    ]
+    if [position for _, position in present] != sorted(position for _, position in present):
+        raise ValueError(
+            "同步失败：现有分区的顺序不正确，必须按 1—6 排列。"
+            "本次未写入任何内容。"
+        )
+
+    result: dict[str, tuple[str, int]] = {}
+    for index, (heading, heading_position) in enumerate(present):
+        end_position = present[index + 1][1] if index + 1 < len(present) else len(lines)
+        content = "\n".join(lines[heading_position + 1 : end_position]).strip()
+        if content:
+            result[heading] = (content, heading_position + 2)
+    return result
+
+
 def _parse_other_character_sections(
     content: str,
     *,
@@ -933,6 +1035,54 @@ def _parse_other_character_sections(
                 f'（第 {line_number} 行起）。为防止误清空角色卡，本次未写入任何内容。'
             )
         parsed_contents.append(character_content)
+    return parsed_contents
+
+
+def _parse_available_other_character_sections(
+    content: str,
+    *,
+    content_start_line: int,
+    expected_names: list[str],
+) -> list[str | None]:
+    """Return content for the character headings that are still present."""
+    if not expected_names:
+        return []
+
+    lines = str(content or "").splitlines()
+    headings = [f"### {name}" for name in expected_names]
+    parsed_contents: list[str | None] = [None] * len(expected_names)
+    found_sections: list[tuple[int, int]] = []
+
+    for expected_index, heading in enumerate(headings):
+        # Duplicate names are ambiguous, so leave all of those links untouched.
+        if headings.count(heading) > 1:
+            continue
+        found = [index for index, line in enumerate(lines) if line.strip() == heading]
+        if len(found) > 1:
+            line_numbers = "、".join(str(content_start_line + item) for item in found)
+            raise ValueError(
+                f'同步失败：角色标题“{heading}”重复（第 {line_numbers} 行）。'
+                "本次未写入任何内容。"
+            )
+        if found:
+            found_sections.append((expected_index, found[0]))
+
+    found_sections.sort(key=lambda item: item[1])
+    if [item[0] for item in found_sections] != sorted(item[0] for item in found_sections):
+        raise ValueError(
+            "同步失败：“4. 其他角色”中的现有角色顺序已改变。"
+            "本次未写入任何内容。"
+        )
+
+    for index, (expected_index, heading_position) in enumerate(found_sections):
+        end_position = (
+            found_sections[index + 1][1]
+            if index + 1 < len(found_sections)
+            else len(lines)
+        )
+        character_content = "\n".join(lines[heading_position + 1 : end_position]).strip()
+        if character_content:
+            parsed_contents[expected_index] = character_content
     return parsed_contents
 
 
@@ -1039,37 +1189,18 @@ def sync_final_setting(
     first_inputs: list[FirstInputRecord],
     selected_first_input_id: str,
 ) -> list[str]:
-    """Validate and atomically sync one final setting back to its linked source assets."""
+    """Atomically save a final setting and sync every linked source still available."""
     if record is None:
         raise ValueError("同步失败：当前没有选中最终设定。")
 
-    required_links = {
+    source_links = {
         "固定模板": str(record.final_template_id or "").strip(),
         "世界书": str(record.final_world_book_id or "").strip(),
         "长期记忆": str(record.final_long_term_memory_id or "").strip(),
         "用户角色": str(record.final_user_character_id or "").strip(),
     }
-    missing_links = [label for label, record_id in required_links.items() if not record_id]
-    if missing_links:
-        raise ValueError(
-            "同步失败：该最终设定是旧记录或不是通过组合流程创建，"
-            "缺少来源关联（"
-            + "、".join(missing_links)
-            + "）。请重新新建最终设定；本次未写入任何内容。"
-        )
-
     other_ids = [str(item or "").strip() for item in record.final_other_character_ids]
     other_names = [str(item or "").strip() for item in record.final_other_character_names]
-    if len(other_ids) != len(other_names) or any(not item for item in other_ids + other_names):
-        raise ValueError(
-            "同步失败：该最终设定的其他角色来源关联不完整。"
-            "请重新新建最终设定；本次未写入任何内容。"
-        )
-    if len(set(other_ids)) != len(other_ids) or len(set(other_names)) != len(other_names):
-        raise ValueError(
-            "同步失败：该最终设定的其他角色关联存在重复。"
-            "请重新新建最终设定；本次未写入任何内容。"
-        )
 
     templates, hidden_templates = _load_template_spaces()
     world_books, hidden_world_books = _load_text_record_spaces(
@@ -1085,7 +1216,7 @@ def sync_final_setting(
         (
             item
             for item in templates + hidden_templates
-            if item.id == required_links["固定模板"]
+            if item.id == source_links["固定模板"]
         ),
         None,
     )
@@ -1093,7 +1224,7 @@ def sync_final_setting(
         (
             item
             for item in world_books + hidden_world_books
-            if item.id == required_links["世界书"]
+            if item.id == source_links["世界书"]
         ),
         None,
     )
@@ -1101,7 +1232,7 @@ def sync_final_setting(
         (
             item
             for item in long_term_memories + hidden_long_term_memories
-            if item.id == required_links["长期记忆"]
+            if item.id == source_links["长期记忆"]
         ),
         None,
     )
@@ -1109,54 +1240,42 @@ def sync_final_setting(
         (
             item
             for item in character_cards + hidden_character_cards
-            if item.id == required_links["用户角色"]
+            if item.id == source_links["用户角色"]
         ),
         None,
     )
-    other_characters = [
-        next(
-            (
-                item
-                for item in character_cards + hidden_character_cards
-                if item.id == record_id
-            ),
-            None,
-        )
-        for record_id in other_ids
-    ]
-    deleted_sources = []
-    if template is None:
-        deleted_sources.append("固定模板")
-    if world_book is None:
-        deleted_sources.append("世界书")
-    if long_term_memory_record is None:
-        deleted_sources.append("长期记忆")
-    if user_character is None:
-        deleted_sources.append("用户角色卡")
-    deleted_sources.extend(
-        f'角色卡“{name}”'
-        for name, character in zip(other_names, other_characters)
-        if character is None
-    )
-    if deleted_sources:
-        raise ValueError(
-            "同步失败：以下关联来源已被删除："
-            + "、".join(deleted_sources)
-            + "。请重新新建最终设定；本次未写入任何内容。"
-        )
 
-    sections = _parse_final_sections(prompt)
-    other_contents = _parse_other_character_sections(
-        sections["4. 其他角色"][0],
-        content_start_line=sections["4. 其他角色"][1],
-        expected_names=other_names,
-    )
-    user_name = str(record.final_user_character_name or "").strip()
-    if not user_name:
-        raise ValueError(
-            "同步失败：该最终设定缺少创建时的用户角色名称，"
-            "无法安全恢复“{用户角色名}”。请重新新建最终设定。"
+    character_by_id = {
+        item.id: item for item in character_cards + hidden_character_cards
+    }
+    linked_other_characters: list[tuple[str, PromptTextRecord | None]] = []
+    seen_other_ids: set[str] = set()
+    for index in range(max(len(other_ids), len(other_names))):
+        record_id = other_ids[index] if index < len(other_ids) else ""
+        linked_name = other_names[index] if index < len(other_names) else ""
+        character = None
+        if record_id and record_id not in seen_other_ids:
+            seen_other_ids.add(record_id)
+            character = character_by_id.get(record_id)
+        name = (
+            linked_name or str(character.title or "").strip()
+            if character is not None
+            else linked_name
         )
+        if name:
+            linked_other_characters.append((name, character))
+
+    sections = _parse_available_final_sections(prompt)
+    other_contents: list[str | None] = []
+    if "4. 其他角色" in sections:
+        other_contents = _parse_available_other_character_sections(
+            sections["4. 其他角色"][0],
+            content_start_line=sections["4. 其他角色"][1],
+            expected_names=[name for name, _ in linked_other_characters],
+        )
+    user_name = str(record.final_user_character_name or "").strip()
+    if not user_name and user_character is not None:
+        user_name = str(user_character.title or "").strip()
 
     updated_labels: list[str] = []
     changed_at = now_iso()
@@ -1168,29 +1287,50 @@ def sync_final_setting(
             item.updated_at = changed_at
             updated_labels.append(label)
 
-    update_text_record(world_book, sections["2. 世界书"][0], f'世界书“{world_book.title or "未命名"}”')
-    update_text_record(
-        long_term_memory_record,
-        long_term_memory,
-        f'长期记忆“{long_term_memory_record.title or "未命名"}”',
-    )
-    for name, character, content in zip(other_names, other_characters, other_contents):
-        restored_content = content.replace(user_name, "{用户角色名}")
+    if world_book is not None and "2. 世界书" in sections:
+        update_text_record(
+            world_book,
+            sections["2. 世界书"][0],
+            f'世界书“{world_book.title or "未命名"}”',
+        )
+    if long_term_memory_record is not None:
+        update_text_record(
+            long_term_memory_record,
+            long_term_memory,
+            f'长期记忆“{long_term_memory_record.title or "未命名"}”',
+        )
+    if user_character is not None and "3. 用户角色" in sections:
+        update_text_record(
+            user_character,
+            _restore_character_personality_section(
+                user_character.content,
+                sections["3. 用户角色"][0],
+            ),
+            f'角色卡“{user_character.title or "未命名"}”',
+        )
+    for (name, character), content in zip(linked_other_characters, other_contents):
+        if character is None or content is None:
+            continue
+        restored_content = content.replace(user_name, "{用户角色名}") if user_name else content
         update_text_record(character, restored_content, f'角色卡“{name}”')
 
-    background = sections["1. 背景介绍"][0]
-    dm_core = sections["5. DM 的核心任务"][0]
-    response_format = sections["6. 回复格式要求"][0]
-    if (
-        template.background_intro != background
-        or template.dm_core_tasks != dm_core
-        or template.response_format != response_format
-    ):
-        template.background_intro = background
-        template.dm_core_tasks = dm_core
-        template.response_format = response_format
-        template.updated_at = changed_at
-        updated_labels.append(f'固定模板“{template.title or "未命名"}”')
+    if template is not None:
+        template_changed = False
+        template_sections = (
+            ("1. 背景介绍", "background_intro"),
+            ("5. DM 的核心任务", "dm_core_tasks"),
+            ("6. 回复格式要求", "response_format"),
+        )
+        for heading, attribute in template_sections:
+            if heading not in sections:
+                continue
+            content = sections[heading][0]
+            if getattr(template, attribute) != content:
+                setattr(template, attribute, content)
+                template_changed = True
+        if template_changed:
+            template.updated_at = changed_at
+            updated_labels.append(f'固定模板“{template.title or "未命名"}”')
 
     record.title = str(title or "").strip()
     record.prompt = str(prompt or "").strip()

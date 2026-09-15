@@ -5,9 +5,14 @@ from uuid import uuid4
 import streamlit as st
 
 from app.config import AppStorageKeys, settings, user_facing_error_message
-from app.models import CHAT_MODEL_LABELS, CHAT_MODEL_OPTIONS
+from app.models import (
+    CHAT_MODEL_LABELS,
+    CHAT_MODEL_OPTIONS,
+    chat_model_supports_reasoning,
+)
 from app.services import prompt_assets, quick_inputs, system_prompts
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
+from web import prompt_draft_guard
 
 
 PROMPT_SECTIONS = ["最终设定", "世界书", "角色卡", "固定模板", "长期记忆", "快捷输入"]
@@ -54,6 +59,8 @@ def _render_section_buttons() -> str:
     columns = st.columns(len(PROMPT_SECTIONS))
     for index, label in enumerate(PROMPT_SECTIONS):
         with columns[index]:
+            if label != section:
+                prompt_draft_guard.navigation(f"ordinary_prompt_section_{index}")
             if st.button(
                 label,
                 type="primary" if section == label else "secondary",
@@ -329,12 +336,19 @@ def _render_first_input_editor(state, selected_record, *, is_guest: bool) -> Non
         selected_record.first_inputs[0],
     )
     with name_col:
+        first_input_title_key = f"system_prompt_first_input_title_{selected_record.id}_{selected_input.id}"
+        prompt_draft_guard.protect(
+            first_input_title_key,
+            selected_input.title,
+            "首轮输入名称",
+            requires_commit=False,
+        )
         first_input_title = st.text_input(
             "首轮输入名称",
             value=selected_input.title,
             label_visibility="collapsed",
             disabled=is_guest,
-            key=f"system_prompt_first_input_title_{selected_record.id}_{selected_input.id}",
+            key=first_input_title_key,
             placeholder="首轮输入名称",
         )
     with delete_col:
@@ -344,13 +358,20 @@ def _render_first_input_editor(state, selected_record, *, is_guest: bool) -> Non
             disabled=is_guest or len(selected_record.first_inputs) <= 1,
             key=f"system_prompt_first_input_delete_{selected_record.id}_{selected_input.id}",
         )
+    first_input_body_key = f"system_prompt_first_input_body_{selected_record.id}_{selected_input.id}"
+    prompt_draft_guard.protect(
+        first_input_body_key,
+        selected_input.content,
+        "首轮输入内容",
+        requires_commit=False,
+    )
     first_input_content = st.text_area(
         "首轮输入内容",
         value=selected_input.content,
         height=180,
         disabled=is_guest,
         label_visibility="collapsed",
-        key=f"system_prompt_first_input_body_{selected_record.id}_{selected_input.id}",
+        key=first_input_body_key,
         help="新对话没有上文且用户输入“开始”时，当前选中项会替代“开始”发送给模型，并写入聊天记录和后续上下文。",
     )
 
@@ -444,18 +465,34 @@ def _render_final_settings(is_guest: bool) -> None:
     with right:
         record_key = selected_record.id if selected_record else "new"
         st.subheader("编辑" if not is_guest else "预览")
+        title_key = f"system_prompt_title_{record_key}"
+        prompt_key = f"system_prompt_body_{record_key}"
+        memory_key = f"system_prompt_long_term_memory_{record_key}"
+        prompt_draft_guard.protect(
+            title_key, selected_record.title if selected_record else "", "最终设定名称"
+        )
+        prompt_draft_guard.protect(
+            prompt_key, selected_record.prompt if selected_record else "", "最终设定 prompt"
+        )
+        prompt_draft_guard.protect(
+            memory_key,
+            selected_record.long_term_memory if selected_record else prompt_assets.current_default_long_term_memory(
+                hidden_space=_hidden_space()
+            ),
+            "最终设定长期记忆",
+        )
         title = st.text_input(
             "记录名称",
             value=selected_record.title if selected_record else "",
             disabled=is_guest,
-            key=f"system_prompt_title_{record_key}",
+            key=title_key,
         )
         prompt = st.text_area(
             "prompt",
             value=selected_record.prompt if selected_record else "",
             height=360,
             disabled=is_guest,
-            key=f"system_prompt_body_{record_key}",
+            key=prompt_key,
         )
         long_term_memory = st.text_area(
             "长期记忆",
@@ -468,13 +505,14 @@ def _render_final_settings(is_guest: bool) -> None:
             ),
             height=360,
             disabled=is_guest,
-            key=f"system_prompt_long_term_memory_{record_key}",
+            key=memory_key,
             help="Story Brain 生成和更新时使用的规则。",
         )
         _render_first_input_editor(state, selected_record, is_guest=is_guest)
 
         save_col, sync_col, new_col, delete_col = st.columns(4)
-        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest):
+        prompt_draft_guard.save_action("system_prompt_save", title_key, prompt_key, memory_key)
+        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest, key="system_prompt_save"):
             system_prompts.save_prompt(
                 state,
                 record_id=selected_record.id if selected_record else "",
@@ -483,6 +521,7 @@ def _render_final_settings(is_guest: bool) -> None:
                 long_term_memory=long_term_memory,
                 preserve_blank_title=True,
             )
+            prompt_draft_guard.saved(title_key, prompt_key, memory_key)
             st.session_state["page2_final_setting_id"] = state.selected_record_id
             _sync_page2_prompt_widget(prompt)
             st.session_state["prompt_settings_flash"] = "已保存最终设定。"
@@ -506,6 +545,7 @@ def _render_final_settings(is_guest: bool) -> None:
             except Exception as exc:
                 sync_error = user_facing_error_message(exc)
             else:
+                prompt_draft_guard.saved(title_key, prompt_key, memory_key)
                 _sync_page2_prompt_widget(prompt)
                 if updated_labels:
                     details = "、".join(updated_labels)
@@ -553,7 +593,10 @@ def _clear_refinement_flow(kind: str) -> None:
 
 def _render_generation_reasoning_selector(kind: str, model: str) -> str:
     key = f"{kind}_generator_reasoning"
-    if model == "grok2":
+    if not chat_model_supports_reasoning(model):
+        options = ["不可用"]
+        default = "不可用"
+    elif model == "grok2":
         options = ["low", "medium", "high", "xhigh"]
         default = "high"
     else:
@@ -561,7 +604,15 @@ def _render_generation_reasoning_selector(kind: str, model: str) -> str:
         default = "开思考"
     if st.session_state.get(key) not in options:
         st.session_state[key] = default
-    selected = st.selectbox("思考模式", options=options, key=key)
+    selected = st.selectbox(
+        "思考模式",
+        options=options,
+        key=key,
+        disabled=not chat_model_supports_reasoning(model),
+    )
+    if not chat_model_supports_reasoning(model):
+        st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
+        return "off"
     return selected if model == "grok2" else "high" if selected == "开思考" else "off"
 
 
@@ -671,6 +722,9 @@ def _render_refinement_dialog(kind: str) -> None:
         st.caption("可以回答全部或部分问题，也可以自由补充选项之外的设定。")
         with st.container(border=True, height=420):
             st.markdown(questions)
+        prompt_draft_guard.protect(
+            answer_key, "", f"{label}细化回答", requires_commit=False
+        )
         answers = st.text_area("你的回答", height=260, key=answer_key)
         final_error = str(
             st.session_state.pop(_refinement_state_key(kind, "final_error"), "") or ""
@@ -726,6 +780,9 @@ def _render_world_book_dialog() -> None:
         error = str(st.session_state.pop(_refinement_state_key("world_book", "error"), "") or "")
         if error:
             st.error(error)
+        prompt_draft_guard.protect(
+            "world_book_generator_description", "", "世界背景介绍", requires_commit=False
+        )
         description = st.text_area("世界背景介绍", height=320, key="world_book_generator_description")
         generate_col, cancel_col = st.columns(2)
         with generate_col:
@@ -769,6 +826,21 @@ def _render_character_card_dialog() -> None:
         )
         if error:
             st.error(error)
+        prompt_draft_guard.protect(
+            "character_card_generator_identity", "", "角色身份", requires_commit=False
+        )
+        prompt_draft_guard.protect(
+            "character_card_generator_relationship",
+            "",
+            "角色与用户角色的关系",
+            requires_commit=False,
+        )
+        prompt_draft_guard.protect(
+            "character_card_generator_personality", "", "角色性格", requires_commit=False
+        )
+        prompt_draft_guard.protect(
+            "character_card_generator_other", "", "角色卡其他设定", requires_commit=False
+        )
         identity = st.text_area("角色身份", height=130, key="character_card_generator_identity")
         relationship = st.text_area(
             "角色与用户角色的关系",
@@ -846,22 +918,32 @@ def _render_text_asset(
     with right:
         record_key = selected_record.id if selected_record else "new"
         st.subheader("编辑" if not is_guest else "预览")
+        title_key = f"{kind}_title_{record_key}"
+        content_key = f"{kind}_content_{record_key}"
+        prompt_draft_guard.protect(
+            title_key, selected_record.title if selected_record else "", f"{content_label}名称"
+        )
+        prompt_draft_guard.protect(
+            content_key, selected_record.content if selected_record else "", content_label
+        )
         title = st.text_input(
             title_label,
             value=selected_record.title if selected_record else "",
             disabled=is_guest,
-            key=f"{kind}_title_{record_key}",
+            key=title_key,
         )
         content = st.text_area(
             content_label,
             value=selected_record.content if selected_record else "",
             height=520,
             disabled=is_guest,
-            key=f"{kind}_content_{record_key}",
+            key=content_key,
         )
         save_col, new_col, delete_col = st.columns(3)
-        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest):
+        prompt_draft_guard.save_action(f"{kind}_save", title_key, content_key)
+        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest, key=f"{kind}_save"):
             record = save_record(selected_record.id if selected_record else "", title, content)
+            prompt_draft_guard.saved(title_key, content_key)
             st.session_state[f"{select_key}_pending"] = record.id
             st.session_state["prompt_settings_flash"] = f"已保存{content_label}。"
             st.rerun()
@@ -924,35 +1006,56 @@ def _render_fixed_templates(is_guest: bool) -> None:
     with right:
         record_key = selected_record.id if selected_record else "new"
         st.subheader("编辑" if not is_guest else "预览")
+        title_key = f"fixed_template_title_{record_key}"
+        background_key = f"fixed_template_background_{record_key}"
+        dm_core_key = f"fixed_template_dm_core_{record_key}"
+        response_key = f"fixed_template_response_{record_key}"
+        prompt_draft_guard.protect(
+            title_key, selected_record.title if selected_record else "", "固定模板名称"
+        )
+        prompt_draft_guard.protect(
+            background_key,
+            selected_record.background_intro if selected_record else "",
+            "固定模板背景介绍",
+        )
+        prompt_draft_guard.protect(
+            dm_core_key, selected_record.dm_core_tasks if selected_record else "", "DM 的核心任务"
+        )
+        prompt_draft_guard.protect(
+            response_key,
+            selected_record.response_format if selected_record else "",
+            "固定模板回复格式要求",
+        )
         title = st.text_input(
             "模板名称",
             value=selected_record.title if selected_record else "",
             disabled=is_guest,
-            key=f"fixed_template_title_{record_key}",
+            key=title_key,
         )
         background = st.text_area(
             "背景介绍",
             value=selected_record.background_intro if selected_record else "",
             height=360,
             disabled=is_guest,
-            key=f"fixed_template_background_{record_key}",
+            key=background_key,
         )
         dm_core = st.text_area(
             "DM 的核心任务",
             value=selected_record.dm_core_tasks if selected_record else "",
             height=520,
             disabled=is_guest,
-            key=f"fixed_template_dm_core_{record_key}",
+            key=dm_core_key,
         )
         response_format = st.text_area(
             "回复格式要求",
             value=selected_record.response_format if selected_record else "",
             height=420,
             disabled=is_guest,
-            key=f"fixed_template_response_{record_key}",
+            key=response_key,
         )
         save_col, new_col, delete_col = st.columns(3)
-        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest):
+        prompt_draft_guard.save_action("fixed_template_save", title_key, background_key, dm_core_key, response_key)
+        if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest, key="fixed_template_save"):
             record = prompt_assets.save_fixed_template(
                 selected_record.id if selected_record else "",
                 title,
@@ -963,6 +1066,7 @@ def _render_fixed_templates(is_guest: bool) -> None:
                 hidden_space=hidden_space,
             )
             st.session_state[f"{select_key}_pending"] = record.id
+            prompt_draft_guard.saved(title_key, background_key, dm_core_key, response_key)
             st.session_state["prompt_settings_flash"] = "已保存，并设为当前固定模板。"
             st.rerun()
         if new_col.button("新建", use_container_width=True, disabled=is_guest):
@@ -1029,11 +1133,22 @@ def _render_long_term_memories(is_guest: bool) -> None:
     with right:
         record_key = selected_record.id if selected_record else "new"
         st.subheader("编辑" if not is_guest else "预览")
+        title_key = f"long_term_memory_title_{record_key}"
+        content_key = f"long_term_memory_content_{record_key}"
+        memory_baseline = (
+            selected_record.content
+            if selected_record
+            else prompt_assets.current_default_long_term_memory(hidden_space=hidden_space)
+        )
+        prompt_draft_guard.protect(
+            title_key, selected_record.title if selected_record else "", "长期记忆名称"
+        )
+        prompt_draft_guard.protect(content_key, memory_baseline, "长期记忆")
         title = st.text_input(
             "长期记忆名称",
             value=selected_record.title if selected_record else "",
             disabled=is_guest,
-            key=f"long_term_memory_title_{record_key}",
+            key=title_key,
         )
         content = st.text_area(
             "长期记忆",
@@ -1046,10 +1161,11 @@ def _render_long_term_memories(is_guest: bool) -> None:
             ),
             height=620,
             disabled=is_guest,
-            key=f"long_term_memory_content_{record_key}",
+            key=content_key,
             help="这段内容会作为 Story Brain 生成和更新时的规则。",
         )
         save_col, new_col, delete_col = st.columns(3)
+        prompt_draft_guard.save_action("long_term_memory_save", title_key, content_key)
         if save_col.button(
             "保存",
             type="primary",
@@ -1064,6 +1180,7 @@ def _render_long_term_memories(is_guest: bool) -> None:
                 hidden_space=hidden_space,
             )
             st.session_state[f"{select_key}_pending"] = record.id
+            prompt_draft_guard.saved(title_key, content_key)
             default_key = (
                 AppStorageKeys.HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID
                 if hidden_space
@@ -1150,16 +1267,25 @@ def _render_quick_inputs(is_guest: bool) -> None:
     with right:
         st.subheader("预览" if is_guest else "编辑" if selected else "新建快捷输入")
         record_key = f"{scope}_{selected['id'] if selected else 'new'}"
+        title_key = f"quick_input_title_{record_key}"
+        content_key = f"quick_input_content_{record_key}"
+        prompt_draft_guard.protect(
+            title_key, selected["title"] if selected else "", "快捷输入名称"
+        )
+        prompt_draft_guard.protect(
+            content_key, selected["content"] if selected else "", "快捷输入内容", strip_on_save=False
+        )
         title = st.text_input(
             "快捷输入名称", value=selected["title"] if selected else "",
-            key=f"quick_input_title_{record_key}", disabled=is_guest,
+            key=title_key, disabled=is_guest,
         )
         content = st.text_area(
             "快捷输入内容", value=selected["content"] if selected else "",
-            key=f"quick_input_content_{record_key}", height=420, disabled=is_guest,
+            key=content_key, height=420, disabled=is_guest,
             help="聊天时输入 / 或 ／ 选择条目，只填入内容，不会直接发送。",
         )
         save_col, new_col, delete_col = st.columns(3)
+        prompt_draft_guard.save_action("quick_input_save", title_key, content_key)
         if save_col.button("保存", type="primary", use_container_width=True,
                            disabled=is_guest, key="quick_input_save"):
             try:
@@ -1170,6 +1296,7 @@ def _render_quick_inputs(is_guest: bool) -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                prompt_draft_guard.saved(title_key, content_key)
                 st.session_state.pop(new_key, None)
                 st.session_state[f"{select_key}_pending"] = record.id
                 st.session_state["prompt_settings_flash"] = "已保存快捷输入。"

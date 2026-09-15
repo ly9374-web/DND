@@ -43,10 +43,11 @@ class VideoPromptTests(unittest.TestCase):
         self.turns[7].assistant_message = "第八轮编辑后"
         self.assertEqual(resolve_video_story(self.image, self.turns), "第八轮编辑后")
 
-    def test_undo_only_falls_back_to_original_predecessor_not_reused_round_number(self):
+    def test_undo_never_falls_back_or_reuses_a_round_number(self):
         replacement = Page2ConversationTurn(id="new8", assistant_message="新的第八轮")
-        self.assertEqual(resolve_video_story(self.image, self.turns[:-1] + [replacement]), "故事7")
-        with self.assertRaisesRegex(ValueError, "上一轮也不存在"):
+        with self.assertRaisesRegex(ValueError, "原轮次已撤回"):
+            resolve_video_story(self.image, self.turns[:-1] + [replacement])
+        with self.assertRaisesRegex(ValueError, "原轮次已撤回"):
             resolve_video_story(self.image, self.turns[:-2] + [replacement])
         self.image.source_turn_id = "t1"
         self.image.previous_source_turn_id = ""
@@ -74,17 +75,25 @@ class VideoPromptTests(unittest.TestCase):
             self.ctx.selected_chat_model = model
             long_reply = "她转身微笑。" * 60
             with patch.object(page2_service.DeepSeekAPIClient, "send_message", return_value=long_reply) as deepseek, \
-                 patch.object(page2_service.GrokAPIClient, "send_message", return_value=long_reply) as grok:
+                 patch.object(page2_service.GrokAPIClient, "send_message", return_value=long_reply) as grok, \
+                 patch.object(page2_service.OpenRouterChatAPIClient, "send_message", return_value=long_reply) as openrouter:
                 result = page2_service.generate_video_prompt(ctx=self.ctx, image_prompt=self.image.prompt, story_text="编辑后故事")
-            client = deepseek if deepseek.called else grok
+            client = next(item for item in (deepseek, grok, openrouter) if item.called)
             args = client.call_args.kwargs
             self.assertEqual(args["system_prompt"], VIDEO_PROMPT_SYSTEM_PROMPT)
             self.assertEqual(args["context_messages"], [])
             self.assertEqual(args["user_message"], "图片prompt：\n蓝衣女子站在画面左侧\n\n本轮故事内容：\n编辑后故事")
-            expected_model = page2_service.deepseek_api_model_for_chat_model(model) or page2_service.grok_api_model_for_chat_model(model)
+            expected_model = (
+                page2_service.deepseek_api_model_for_chat_model(model)
+                or page2_service.grok_api_model_for_chat_model(model)
+                or page2_service.openrouter_api_model_for_chat_model(model)
+            )
             self.assertEqual(args["model"], expected_model)
             self.assertEqual(result, long_reply)  # 200 字仅为提示词要求，不截断、不再次调用。
-            self.assertEqual(deepseek.call_count + grok.call_count, 1)
+            self.assertEqual(
+                deepseek.call_count + grok.call_count + openrouter.call_count,
+                1,
+            )
 
     def test_missing_inputs_and_empty_response_do_not_fill_editor(self):
         with patch.object(page2_service, "_send_with_current_chat_model", return_value="") as send:
@@ -115,7 +124,7 @@ class VideoPromptTests(unittest.TestCase):
             with patch.object(page2, "_upsert_record"), patch.object(page2.url_favorites, "clear_preview_url"):
                 page2._apply_operation(task)
             self.assertEqual(task.result.source_turn_id, "t8")
-            self.assertEqual(task.result.previous_source_turn_id, "t7")
+            self.assertEqual(task.result.previous_source_turn_id, "")
         self.assertEqual(latest_image_prompt_source(self.turns)["source_turn_id"], "t9")
 
     def test_result_updates_only_source_image_and_does_not_add_chat_or_video(self):

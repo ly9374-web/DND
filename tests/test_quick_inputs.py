@@ -19,24 +19,32 @@ class QuickInputTests(unittest.TestCase):
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
 
-    def test_default_seed_is_public_editable_and_never_resurrected(self):
-        first = quick_inputs.load_quick_inputs()[0]
-        self.assertEqual(first.title, "图片")
-        self.assertEqual(quick_inputs.load_quick_inputs(True)[0].id, first.id)
-        quick_inputs.save_quick_input(first.id, "新名称", "自定义内容")
-        self.assertEqual(quick_inputs.load_quick_inputs()[0].content, "自定义内容")
-        quick_inputs.delete_quick_input(first.id)
+    def test_removed_image_default_is_not_seeded_or_resurrected(self):
         self.assertEqual(quick_inputs.load_quick_inputs(), [])
         self.assertTrue(self.store.bool(AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED))
+        self.assertTrue(self.store.bool(AppStorageKeys.QUICK_INPUT_IMAGE_REMOVAL_MIGRATED))
+
+    def test_migration_removes_only_the_untouched_legacy_image_default(self):
+        legacy = next(iter(quick_inputs._REMOVED_DEFAULT_IMAGE_CONTENTS))
+        self.store.set(AppStorageKeys.QUICK_INPUT_RECORDS, json.dumps([
+            {"id": "legacy", "title": "图片", "content": legacy},
+            {"id": "custom", "title": "图片", "content": "用户改写过的内容"},
+        ], ensure_ascii=False))
+        self.store.set(AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED, True)
+        self.store.set(AppStorageKeys.QUICK_INPUT_IMAGE_REMOVAL_MIGRATED, False)
+        records = quick_inputs.load_quick_inputs()
+        self.assertEqual([(item.id, item.content) for item in records], [
+            ("custom", "用户改写过的内容"),
+        ])
 
     def test_visibility_and_edit_ownership(self):
-        public = quick_inputs.load_quick_inputs()[0]
+        public = quick_inputs.save_quick_input("", "公开快捷", "公开内容")
         private = quick_inputs.save_quick_input("", "图片", "私密内容", hidden_space=True)
         self.assertEqual([r.id for r in quick_inputs.load_quick_inputs()], [public.id])
         self.assertEqual(len(quick_inputs.load_quick_inputs(True)), 2)
         self.assertEqual([r["space"] for r in quick_inputs.quick_input_options(True)], ["普通", "私密"])
         self.assertNotIn("私密内容", json.dumps(quick_inputs.quick_input_options(), ensure_ascii=False))
-        quick_inputs.save_quick_input(public.id, "图片", "公开修改", hidden_space=True)
+        quick_inputs.save_quick_input(public.id, "公开快捷", "公开修改", hidden_space=True)
         self.assertEqual(quick_inputs.load_quick_inputs()[0].content, "公开修改")
         with self.assertRaises(ValueError):
             quick_inputs.save_quick_input(private.id, "图片", "非法修改")
@@ -45,13 +53,13 @@ class QuickInputTests(unittest.TestCase):
         self.assertEqual(quick_inputs.load_quick_inputs(True)[1].content, "私密内容")
 
     def test_duplicate_names_validated_in_original_space(self):
-        public = quick_inputs.load_quick_inputs()[0]
+        public = quick_inputs.save_quick_input("", "已有条目", "原内容")
         quick_inputs.save_quick_input("", "普通条目", "内容")
         quick_inputs.save_quick_input("", "普通条目", "私密内容", hidden_space=True)
         with self.assertRaises(ValueError):
             quick_inputs.save_quick_input(public.id, "普通条目", "内容", hidden_space=True)
         with self.assertRaises(ValueError):
-            quick_inputs.save_quick_input("", " 图片 ", "内容")
+            quick_inputs.save_quick_input("", " 普通条目 ", "内容")
         with self.assertRaises(ValueError):
             quick_inputs.save_quick_input("", "", "内容")
         with self.assertRaises(ValueError):
@@ -72,6 +80,14 @@ class QuickInputTests(unittest.TestCase):
         )
         self.assertEqual(script.count("</script>"), 1)
         self.assertNotIn(value, script)
+
+    def test_operation_choices_are_marked_and_submitted_immediately(self):
+        script = quick_input_script([], scope="ordinary", show_space=False)
+
+        self.assertIn('"label": "重发（操作）"', script)
+        self.assertIn('"kind": "command"', script)
+        self.assertIn('item?.kind === "command"', script)
+        self.assertIn('if (operation) submitOperation(input, next);', script)
 
     def test_chat_creation_uses_account_but_continuation_keeps_ownership(self):
         from app.models import Page2ConversationTurn

@@ -10,6 +10,7 @@ from app.config import (
     XAIConfig,
     DeepSeekConfig,
     KeyLinkDeepSeekV4ProConfig,
+    OpenRouterConfig,
     debug_log,
     mask_authorization_header,
 )
@@ -599,5 +600,115 @@ class DeepSeekAPIClient:
             )
         raise RuntimeError(
             "DeepSeek 未返回可用的最终内容"
+            f"（finish_reason={finish_reason}）。"
+        )
+
+
+# =========================
+# OpenRouter Chat Completions
+# =========================
+
+class OpenRouterChatAPIClient:
+    CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+    DEFAULT_MODEL = "mistralai/mistral-large-2512"
+    SUPPORTED_MODELS = {DEFAULT_MODEL}
+
+    @classmethod
+    def send_message(
+        cls,
+        system_prompt,
+        context_messages,
+        user_message,
+        temperature=0.8,
+        model=DEFAULT_MODEL,
+        max_tokens=20000,
+    ):
+        model = str(model or cls.DEFAULT_MODEL).strip()
+        if model not in cls.SUPPORTED_MODELS:
+            raise ValueError("未知 OpenRouter 聊天模型：" + model)
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for message in context_messages:
+            if isinstance(message, GrokInputMessage):
+                messages.append(message.to_dict())
+            elif isinstance(message, dict):
+                messages.append(message)
+        messages.append({"role": "user", "content": user_message})
+
+        api_key = OpenRouterConfig.api_key()
+        if not api_key:
+            raise RuntimeError(
+                "缺少 OpenRouter API Key。请在 APIkey 页面填写，或在 Streamlit Secrets 配置 OPENROUTER_API_KEY。"
+            )
+
+        headers = {
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = int(max_tokens)
+
+        debug_log("====== OpenRouter Chat Request ======")
+        debug_log("URL:", cls.CHAT_URL)
+        debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
+        debug_log("Body:", json.dumps(body, ensure_ascii=False))
+
+        response = post_with_network_retry(
+            cls.CHAT_URL,
+            headers=headers,
+            json_body=body,
+            timeout=3600,
+            label="OpenRouter Chat",
+        )
+
+        debug_log("====== OpenRouter Chat HTTP Status ======")
+        debug_log(response.status_code)
+        debug_log("====== OpenRouter Chat Raw Response ======")
+        debug_log(response.text)
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"OpenRouter 返回了无法解析的响应（HTTP {response.status_code}）。"
+            ) from exc
+
+        if data.get("error"):
+            debug_log("====== OpenRouter Chat Error ======")
+            debug_log(data.get("error"))
+            raise RuntimeError("OpenRouter API error: " + str(data.get("error")))
+        if int(response.status_code) >= 400:
+            raise RuntimeError(f"OpenRouter API HTTP 错误：{response.status_code}")
+
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenRouter 响应缺少 choices，没有可用的模型输出。")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise RuntimeError("OpenRouter 响应中的 choice 格式异常。")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("OpenRouter 响应缺少 message。")
+
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                str(item.get("text") or item.get("content") or "")
+                for item in content
+                if isinstance(item, dict)
+            )
+        content = str(content or "").strip()
+        if content:
+            return content
+
+        finish_reason = str(first.get("finish_reason") or "unknown")
+        raise RuntimeError(
+            "OpenRouter 未返回可用的最终内容"
             f"（finish_reason={finish_reason}）。"
         )

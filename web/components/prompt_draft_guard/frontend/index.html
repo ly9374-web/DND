@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><title>prompt_draft_guard</title></head>
+  <body style="margin:0;width:0;height:0;overflow:hidden;background:transparent">
+    <script>
+      const host = window.parent
+      const doc = host.document
+      host.__dndPromptDraftGuard?.destroy?.()
+      const state = host.__dndPromptDraftState ||= {
+        drafts: new Map(), acknowledgements: new Set(), pending: null,
+      }
+      let config = { scope: "", page: "", fields: [], serverDrafts: {}, navigationKeys: [] }
+      let observer = null
+      let overlay = null
+      let syncTimer = null
+      let actionTimer = null
+      let revision = 0
+      let replaying = false
+      const bound = new Map()
+      const tabId = host.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+      function post(type, payload = {}) {
+        host.postMessage({ isStreamlitMessage: true, type, ...payload }, "*")
+      }
+      function storageKey(widgetKey) {
+        return `dnd.promptDraft.v1:${config.scope}:${widgetKey}`
+      }
+      function read(widgetKey) {
+        const key = storageKey(widgetKey)
+        if (state.drafts.has(key)) return state.drafts.get(key)
+        try {
+          const entry = JSON.parse(localStorage.getItem(key) || "null")
+          if (entry && typeof entry === "object") {
+            state.drafts.set(key, entry)
+            return entry
+          }
+        } catch (_) {}
+        return null
+      }
+      function write(widgetKey, entry) {
+        state.drafts.set(storageKey(widgetKey), entry)
+        try { localStorage.setItem(storageKey(widgetKey), JSON.stringify(entry)) } catch (_) {}
+      }
+      function remove(widgetKey) {
+        // A tombstone prevents a stale server snapshot from resurrecting a discarded draft.
+        write(widgetKey, { widget_key: widgetKey, deleted: true, updated_at: Date.now() / 1000 })
+      }
+      function normalized(value) { return String(value ?? "").trim() }
+      function equal(field, left, right) {
+        return field.requires_commit && field.strip_on_save !== false ? normalized(left) === normalized(right) : String(left ?? "") === String(right ?? "")
+      }
+      function fieldFor(key) { return config.fields.find(field => field.widget_key === key) }
+      function entryFor(field) {
+        let entry = read(field.widget_key)
+        if (entry?.deleted) return null
+        if (!entry) {
+          entry = config.serverDrafts?.[field.widget_key]
+          if (entry) write(field.widget_key, entry)
+        }
+        if (!entry) return null
+        if (equal(field, entry.value, field.baseline)) return null
+        // Keep an older version in storage, but do not overwrite a newer saved record.
+        if (!equal(field, entry.baseline, field.baseline)) return null
+        return entry
+      }
+      function cssEscape(value) {
+        return host.CSS?.escape ? host.CSS.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, "\\$&")
+      }
+      function findElement(field) {
+        return doc.querySelector(`.st-key-${cssEscape(field.widget_key)}`)
+          ?.querySelector("textarea,input[type='text'],input:not([type])") || null
+      }
+      function currentDrafts() {
+        return config.fields.flatMap(field => {
+          const element = findElement(field)
+          const entry = entryFor(field)
+          return element && !element.disabled && entry ? [{ field, entry }] : []
+        })
+      }
+      function blockingDrafts() {
+        return currentDrafts().filter(({ field }) => field.requires_commit)
+      }
+      function syncNow() {
+        host.clearTimeout(syncTimer)
+        const prefix = storageKey("")
+        const drafts = [], cleared = []
+        for (const [key, entry] of state.drafts) {
+          if (!key.startsWith(prefix)) continue
+          const widgetKey = key.slice(prefix.length)
+          if (entry.deleted) cleared.push(widgetKey)
+          else drafts.push({ ...entry, widget_key: widgetKey, accepted: false })
+        }
+        const receiptRevision = `${tabId}:${Date.now()}:${++revision}`
+        post("streamlit:setComponentValue", {
+          value: { event: "snapshot", scope: config.scope, page: config.page,
+            drafts, cleared, revision: receiptRevision }, dataType: "json",
+        })
+        return `${config.scope}:${receiptRevision}`
+      }
+      function scheduleSync() {
+        host.clearTimeout(syncTimer)
+        syncTimer = host.setTimeout(syncNow, 250)
+      }
+      function nativeSet(element, value) {
+        const proto = element instanceof host.HTMLTextAreaElement
+          ? host.HTMLTextAreaElement.prototype : host.HTMLInputElement.prototype
+        Object.getOwnPropertyDescriptor(proto, "value").set.call(element, String(value ?? ""))
+        element.dispatchEvent(new host.Event("input", { bubbles: true }))
+      }
+      function applyEntry(field, entry, commit = false) {
+        const element = findElement(field)
+        if (!element) return
+        if (element.value !== String(entry.value ?? "")) nativeSet(element, entry.value)
+        if (commit) {
+          element.dispatchEvent(new host.Event("change", { bubbles: true }))
+          element.focus()
+          element.blur()
+        }
+      }
+      function unbind(item) {
+        item.element.removeEventListener("input", item.onInput)
+        item.element.removeEventListener("change", item.onChange)
+        item.element.removeEventListener("blur", item.onChange)
+      }
+      function bind(field) {
+        const element = findElement(field)
+        if (!element || element.disabled) return
+        const previous = bound.get(field.widget_key)
+        if (previous?.element === element) {
+          previous.field = field
+          return
+        }
+        if (previous) unbind(previous)
+        const entry = entryFor(field)
+        // Restore quietly when returning to a record or refreshing the page.
+        if (entry) applyEntry(field, entry)
+        const item = { element, field }
+        item.onInput = event => {
+          if (event.isTrusted) state.pending = null
+          const current = item.field
+          if (equal(current, element.value, current.baseline)) remove(current.widget_key)
+          else write(current.widget_key, {
+            widget_key: current.widget_key, label: current.label,
+            value: element.value, baseline: current.baseline,
+            updated_at: Date.now() / 1000, writer: tabId,
+          })
+        }
+        item.onChange = scheduleSync
+        element.addEventListener("input", item.onInput)
+        element.addEventListener("change", item.onChange)
+        element.addEventListener("blur", item.onChange)
+        bound.set(field.widget_key, item)
+      }
+      function scan() {
+        for (const [key, item] of bound) {
+          if (!fieldFor(key) || !item.element.isConnected) { unbind(item); bound.delete(key) }
+        }
+        config.fields.forEach(bind)
+      }
+      function closeOverlay() { overlay?.remove(); overlay = null }
+      function ensureStyle() {
+        if (doc.getElementById("dnd-prompt-draft-guard-style")) return
+        const style = doc.createElement("style")
+        style.id = "dnd-prompt-draft-guard-style"
+        style.textContent = `
+          .dnd-prompt-guard{position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.66)}
+          .dnd-prompt-guard-panel{box-sizing:border-box;width:min(620px,94vw);border:1px solid rgba(96,165,250,.34);border-radius:14px;background:#0b1520;color:#e5e7eb;box-shadow:0 28px 90px rgba(0,0,0,.62);padding:22px;font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+          .dnd-prompt-guard-panel h3{margin:0 0 8px;color:#fff;font-size:18px}.dnd-prompt-guard-panel p{margin:0 0 14px;color:#bac7d5}
+          .dnd-prompt-guard-list{max-height:180px;overflow:auto;margin:0 0 18px;padding:10px 12px;border-radius:8px;background:#101d2a;color:#93c5fd;white-space:pre-wrap}
+          .dnd-prompt-guard-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:9px}.dnd-prompt-guard-actions button{min-height:38px;padding:0 14px;border:1px solid #334155;border-radius:8px;background:#162231;color:#e5e7eb;cursor:pointer}
+          .dnd-prompt-guard-actions .primary{border-color:#3b82f6;background:#1d4ed8;color:#fff}.dnd-prompt-guard-actions .danger{border-color:#7f1d1d;background:#3a1519;color:#fecaca}
+        `
+        doc.head.appendChild(style)
+      }
+      function buttonFor(key) {
+        return doc.querySelector(`.st-key-${cssEscape(key)}`)?.querySelector("button") || null
+      }
+      function navigationKey(target) {
+        return config.navigationKeys.find(key => target.closest?.(`.st-key-${cssEscape(key)}`)) || ""
+      }
+      function replay(key) {
+        const scope = config.scope, page = config.page
+        actionTimer = host.setTimeout(() => {
+          if (scope !== config.scope || page !== config.page || !config.navigationKeys.includes(key)) return
+          const button = buttonFor(key)
+          if (!button || button.disabled) return
+          replaying = true
+          try { button.click() } finally { replaying = false }
+        }, 0)
+      }
+      function showDialog(action) {
+        if (overlay) return
+        const drafts = blockingDrafts()
+        if (!drafts.length) return
+        ensureStyle()
+        overlay = doc.createElement("div")
+        overlay.className = "dnd-prompt-guard"
+        overlay.setAttribute("role", "dialog")
+        overlay.setAttribute("aria-modal", "true")
+        overlay.setAttribute("aria-label", "修改尚未保存，是否离开？")
+        const panel = doc.createElement("div")
+        panel.className = "dnd-prompt-guard-panel"
+        const title = doc.createElement("h3")
+        title.textContent = "修改尚未保存，是否离开？"
+        const message = doc.createElement("p")
+        message.textContent = "当前页面有未保存的修改，请选择如何处理。"
+        const list = doc.createElement("div")
+        list.className = "dnd-prompt-guard-list"
+        list.textContent = drafts.map(({ field }) => `• ${field.label}`).join("\n")
+        const actions = doc.createElement("div")
+        actions.className = "dnd-prompt-guard-actions"
+        const keep = doc.createElement("button")
+        keep.textContent = "继续编辑"
+        const discard = doc.createElement("button")
+        discard.className = "danger"
+        discard.textContent = "放弃修改并离开"
+        const save = doc.createElement("button")
+        save.className = "primary"
+        save.textContent = "保存并离开"
+        keep.onclick = () => { closeOverlay(); findElement(drafts[0].field)?.focus() }
+        discard.onclick = () => {
+          for (const { field } of drafts) {
+            const element = findElement(field)
+            if (element) nativeSet(element, field.baseline)
+            remove(field.widget_key)
+          }
+          closeOverlay()
+          state.pending = { scope: config.scope, page: config.page, action,
+            phase: "discard", receipt: syncNow(), started: Date.now() }
+        }
+        save.onclick = () => {
+          // Flush editor values first; click the registered save button only after the bridge acknowledges them.
+          const fields = drafts.map(({ field, entry }) => ({ key: field.widget_key,
+            value: entry.value, saveKey: field.save_key, confirmed: false }))
+          if (fields.some(field => !field.saveKey || !buttonFor(field.saveKey))) {
+            message.textContent = "请先在当前编辑器中保存，再切换页面。"
+            return
+          }
+          drafts.forEach(({ field, entry }) => applyEntry(field, entry, true))
+          closeOverlay()
+          state.pending = { scope: config.scope, page: config.page, action, fields,
+            phase: "commit", receipt: syncNow(), started: Date.now() }
+        }
+        actions.append(keep, discard, save)
+        panel.append(title, message, list, actions)
+        overlay.appendChild(panel)
+        doc.body.appendChild(overlay)
+        keep.focus()
+      }
+      function onClick(event) {
+        if (replaying || event.target.closest?.(".dnd-prompt-guard")) return
+        // A subsequent user action cancels any incomplete save-and-leave request.
+        state.pending = null
+        const action = navigationKey(event.target)
+        if (!action || event.target.closest?.("button")?.disabled || !blockingDrafts().length) return
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        showDialog(action)
+      }
+      function resumePending() {
+        const request = state.pending
+        if (!request) return
+        if (request.scope !== config.scope || request.page !== config.page || Date.now() - request.started > 10000) {
+          state.pending = null
+          return
+        }
+        if (request.phase === "discard") {
+          if (request.receipt === config.receipt) { state.pending = null; replay(request.action) }
+          return
+        }
+        if (request.fields.every(field => field.confirmed)) {
+          state.pending = null
+          replay(request.action)
+          return
+        }
+        if (request.phase === "commit" && request.receipt !== config.receipt) return
+        const next = request.fields.find(field => !field.confirmed)
+        if (request.phase === "saving" && request.saveKey === next.saveKey) return
+        const button = buttonFor(next.saveKey)
+        if (!button || button.disabled) { state.pending = null; return }
+        request.phase = "saving"
+        request.saveKey = next.saveKey
+        actionTimer = host.setTimeout(() => {
+          if (state.pending !== request) return
+          replaying = true
+          try { button.click() } finally { replaying = false }
+        }, 0)
+      }
+      function update(next) {
+        if (config.scope !== next.scope || config.page !== next.page) {
+          closeOverlay()
+          host.clearTimeout(syncTimer)
+          host.clearTimeout(actionTimer)
+          for (const item of bound.values()) unbind(item)
+          bound.clear()
+        }
+        config = next
+        let changed = false
+        for (const ack of config.savedFields || []) {
+          const id = `${config.scope}:${ack.revision}`
+          if (state.acknowledgements.has(id)) continue
+          state.acknowledgements.add(id)
+          const entry = read(ack.widget_key)
+          if (entry && !entry.deleted && String(entry.value) === String(ack.value)) {
+            remove(ack.widget_key)
+            changed = true
+          }
+          const request = state.pending
+          if (request?.scope === config.scope) {
+            for (const field of request.fields || []) {
+              if (field.key === ack.widget_key && String(field.value) === String(ack.value)) field.confirmed = true
+            }
+          }
+        }
+        // Reconcile before binding/restoring so a successfully saved value is never reapplied as a draft.
+        for (const field of config.fields) {
+          const entry = read(field.widget_key) || config.serverDrafts?.[field.widget_key]
+          if (entry && !entry.deleted && equal(field, entry.value, field.baseline)) {
+            remove(field.widget_key)
+            changed = true
+          }
+        }
+        scan()
+        observer?.disconnect()
+        observer = new host.MutationObserver(scan)
+        observer.observe(doc.body, { childList: true, subtree: true })
+        resumePending()
+        if (changed && !state.pending) scheduleSync()
+      }
+      doc.addEventListener("click", onClick, true)
+      // No startup, storage-conflict or browser-unload dialogs: only explicit in-app navigation is guarded.
+      const guardApi = {
+        destroy() {
+          closeOverlay()
+          host.clearTimeout(syncTimer)
+          host.clearTimeout(actionTimer)
+          observer?.disconnect()
+          doc.removeEventListener("click", onClick, true)
+          for (const item of bound.values()) unbind(item)
+          bound.clear()
+        },
+      }
+      host.__dndPromptDraftGuard = guardApi
+      window.addEventListener("unload", () => guardApi.destroy(), { once: true })
+      window.addEventListener("message", event => {
+        if (event.data?.type !== "streamlit:render") return
+        const args = event.data.args || {}
+        update({ scope: String(args.scope || ""), page: String(args.page || ""),
+          fields: Array.isArray(args.fields) ? args.fields : [], serverDrafts: args.server_drafts || {},
+          navigationKeys: args.navigation_keys || [], savedFields: args.saved_fields || [], receipt: args.receipt || "" })
+        post("streamlit:setFrameHeight", { height: 0 })
+      })
+      post("streamlit:componentReady", { apiVersion: 1 })
+      post("streamlit:setFrameHeight", { height: 0 })
+    </script>
+  </body>
+</html>

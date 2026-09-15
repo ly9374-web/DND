@@ -5,6 +5,7 @@ import streamlit as st
 from app.config import APP_TITLE
 from app.ui.theme import apply_dark_mode
 from web.nav import back, goto, nav_init, nav_state
+from web import prompt_draft_guard
 from web.pages.home import render as render_home
 from web.pages.model_settings import render as render_model_settings
 from web.pages.page2 import (
@@ -82,10 +83,12 @@ def _render_guest_countdown():
 
 def _render_sidebar():
     current = nav_state().page
-    st.sidebar.header(APP_TITLE)
     can_go_back = current == "home" or bool(nav_state().history)
+    if current != "home" and (not nav_state().history or nav_state().history[-1][0] != current):
+        prompt_draft_guard.navigation("sidebar_back")
     if st.sidebar.button(
         "返回",
+        key="sidebar_back",
         use_container_width=True,
         disabled=not can_go_back or (current == "main" and page2_operation_queue_busy()),
     ):
@@ -111,7 +114,6 @@ def main():
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    apply_dark_mode()
     nav_init(default_page="signin")
 
     if "auth_ok" not in st.session_state:
@@ -141,11 +143,14 @@ def main():
         goto("home", push_history=False)
 
     page = nav_state().page
+    prompt_draft_guard.begin()
+    apply_dark_mode(animate_background=page in {"signin", "home"})
     if page != "signin":
         _render_sidebar()
 
     _, render = PAGES.get(page, PAGES["home"])
     render()
+    prompt_draft_guard.render()
 
 
 if __name__ == "__main__":

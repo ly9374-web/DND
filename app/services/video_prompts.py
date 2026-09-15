@@ -21,10 +21,7 @@ def latest_image_prompt_source(turns: list[Page2ConversationTurn]) -> dict[str, 
     for index in range(len(turns) - 1, -1, -1):
         turn = turns[index]
         if str(turn.assistant_message or "").strip() and not turn.is_loading:
-            return {
-                "source_turn_id": turn.id,
-                "previous_source_turn_id": turns[index - 1].id if index else "",
-            }
+            return {"source_turn_id": turn.id}
     return {}
 
 
@@ -38,9 +35,7 @@ def resolve_video_story(source: GeneratedImageRecord, turns: list[Page2Conversat
     by_id = {turn.id: turn for turn in turns}
     turn = by_id.get(source.source_turn_id)
     if turn is None:
-        turn = by_id.get(source.previous_source_turn_id)
-        if turn is None:
-            raise ValueError("图片对应的原轮次已撤回，紧邻的上一轮也不存在，无法生成视频 prompt。")
+        raise ValueError("图片对应的原轮次已撤回，无法生成视频 prompt。")
     text = str(turn.assistant_message or "").strip()
     if turn.is_loading or not text:
         raise ValueError("图片对应的故事轮次没有可用的助手回复，无法生成视频 prompt。")

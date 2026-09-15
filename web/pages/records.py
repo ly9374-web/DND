@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import uuid
 
 import streamlit as st
 
@@ -65,6 +66,9 @@ def render(
     action_columns = st.columns([1, 1, 1, 1] if has_extra_action else [1, 1, 1])
     with action_columns[0]:
         if st.button("打开", type="primary", use_container_width=True):
+            # Opening a record should start at its latest message, including when
+            # the same record is reopened and is already present in session state.
+            st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
             goto(open_page, record_id=item.id)
     with action_columns[1]:
         new_title = st.text_input("重命名", value=item.title or "", key="records_rename_title")

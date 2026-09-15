@@ -6,7 +6,7 @@ from pathlib import Path
 
 def quick_input_script(options: list[dict[str, str]], *, scope: str, show_space: bool) -> str:
     options = [*options, {
-        "id": "command:resend", "title": "重发", "label": "重发 · 操作",
+        "id": "command:resend", "title": "重发", "label": "重发（操作）",
         "content": "/重发", "space": "", "kind": "command",
     }]
     # Contents are data, never executable markup (including literal </script>).

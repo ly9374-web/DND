@@ -70,7 +70,7 @@ if st.button("模拟生成完成"):
         app.selectbox(key="_page2_image_prompt_mode").select("normal").run()
         app.run()
         app.selectbox(key="_page2_image_prompt_mode").select("first_person").run()
-        self.assertEqual(app.text_input(key="_page2_image_prompt_subject").value, "角色乙")
+        self.assertEqual(len(app.text_input), 0)
         self.assertEqual(len(app.exception), 0)
 
     def test_generated_image_prompt_can_be_written_after_render_and_edited(self):
@@ -82,6 +82,108 @@ if st.button("模拟生成完成"):
         app.run()
         self.assertEqual(app.text_area(key="_page2_image_prompt").value, "手动修改模型结果")
         self.assertEqual(len(app.exception), 0)
+
+    def test_empty_image_prompt_queues_prompt_then_image_but_nonempty_skips_prompt(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        turn = Page2ConversationTurn(id="t8", assistant_message="第八轮")
+        session = SessionState(
+            page2_operation_scope_id="scope",
+            page2_operation_queue=[],
+            page2_active_operation=None,
+            page2_operation_notice="",
+            page2_turns=[turn],
+            page2_image_prompt_source={"source_turn_id": "t8"},
+        )
+        with patch.object(page2.st, "session_state", session):
+            image_task = page2._queue_image_generation(
+                provider="grok", prompt="", image_urls=[], aspect_ratio="3:4",
+                mode="normal", subject="",
+            )
+            self.assertEqual([task.kind for task in session.page2_operation_queue], [
+                "image_prompt", "image",
+            ])
+            prompt_task = session.page2_operation_queue[0]
+            self.assertEqual(
+                image_task.payload["prompt_operation_id"], prompt_task.id
+            )
+            self.assertEqual(image_task.payload["prompt"], "")
+
+            session.page2_operation_queue = []
+            image_task = page2._queue_image_generation(
+                provider="grok", prompt="手工图片 prompt", image_urls=[],
+                aspect_ratio="3:4", mode="normal", subject="",
+                refiner_prompt="correct hands",
+            )
+            self.assertEqual([task.kind for task in session.page2_operation_queue], ["image"])
+            self.assertEqual(image_task.payload["prompt_operation_id"], "")
+            self.assertEqual(
+                image_task.payload["image_prompt_source"], {"source_turn_id": "t8"}
+            )
+            self.assertEqual(image_task.payload["refiner_prompt"], "correct hands")
+
+    def test_user_operations_of_the_same_kind_append_in_click_order(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        session = SessionState(
+            page2_operation_scope_id="scope",
+            page2_operation_queue=[],
+            page2_active_operation=None,
+            page2_operation_notice="",
+        )
+        ctx = page2_service.default_context()
+        with patch.object(page2.st, "session_state", session):
+            page2._queue_chat_message(
+                ctx=ctx,
+                user_text="第一条",
+                hide_user_message=False,
+                story_brain_enabled=True,
+            )
+            page2._queue_chat_message(
+                ctx=ctx,
+                user_text="第二条",
+                hide_user_message=False,
+                story_brain_enabled=True,
+            )
+            page2._enqueue_operation(
+                "image",
+                "第一张图",
+                {"prompt": "one"},
+                allow_same_kind=True,
+            )
+            page2._enqueue_operation(
+                "image",
+                "第二张图",
+                {"prompt": "two"},
+                allow_same_kind=True,
+            )
+
+        self.assertEqual(
+            [task.kind for task in session.page2_operation_queue],
+            ["chat", "chat", "image", "image"],
+        )
+        self.assertEqual(
+            [task.payload.get("user_text") for task in session.page2_operation_queue[:2]],
+            ["第一条", "第二条"],
+        )
+
+    def test_first_person_has_no_subject_requirement_but_closeup_does(self):
+        from app.services.image_prompts import build_image_prompt_system_prompt
+
+        self.assertIn(
+            "以我为第一人称视角",
+            build_image_prompt_system_prompt("first_person", ""),
+        )
+        with self.assertRaisesRegex(ValueError, "主体不能为空"):
+            build_image_prompt_system_prompt("closeup", "")
 
     def test_long_story_brain_implementation_is_not_packaged(self):
         self.assertFalse((ROOT / "agent_extension").exists())
@@ -173,7 +275,7 @@ if st.button("模拟生成完成"):
         self.assertNotIn("characters", str(kwargs))
         self.assertNotIn("Memory Pack", str(kwargs))
 
-    def test_image_prompt_uses_latest_assistant_reply_including_image_command(self):
+    def test_image_prompt_uses_latest_conversation_and_story_brain_without_chat_turn(self):
         from web.pages import page2
 
         class SessionState(dict):
@@ -183,11 +285,7 @@ if st.button("模拟生成完成"):
         ctx = page2_service.default_context()
         turns = [
             Page2ConversationTurn(user_message="继续", assistant_message="剧情回复"),
-            Page2ConversationTurn(
-                user_message="/图片",
-                assistant_message="最新的场景描述",
-                is_context_excluded=True,
-            ),
+            Page2ConversationTurn(user_message="查看四周", assistant_message="最新的场景描述"),
         ]
         task = page2._Page2OperationTask(
             kind="image_prompt",
@@ -195,7 +293,11 @@ if st.button("模拟生成完成"):
             payload={"ctx": ctx, "mode": "closeup", "subject": "艾琳"},
             scope_id="test-scope",
         )
-        session_state = SessionState(page2_turns=turns)
+        session_state = SessionState(
+            page2_turns=turns,
+            page2_story_brain_short="雨夜旅店",
+            page2_story_brain_enabled=True,
+        )
 
         with patch.object(page2.st, "session_state", session_state):
             with patch.object(
@@ -208,25 +310,33 @@ if st.button("模拟生成完成"):
 
         self.assertEqual(result, "最终图片 prompt")
         generate_prompt.assert_called_once_with(
-            "最新的场景描述",
             ctx=ctx,
+            turns=turns,
+            story_brain_short="雨夜旅店",
+            story_brain_enabled=True,
             mode="closeup",
             subject="艾琳",
         )
+        self.assertEqual(session_state.page2_turns, turns)
 
     def test_image_prompt_modes_follow_current_chat_model(self):
         models = [
-            ("grok1", "grok-4.3", False),
-            ("grok2", "grok-4.6", False),
-            ("deepseekPro", "deepseek-v4-pro", True),
-            ("deepseekFlash", "deepseek-v4-flash", True),
+            ("grok1", "grok-4.3", "grok"),
+            ("grok2", "grok-4.6", "grok"),
+            ("deepseekPro", "deepseek-v4-pro", "deepseek"),
+            ("deepseekFlash", "deepseek-v4-flash", "deepseek"),
+            (
+                "mistralLarge2512",
+                "mistralai/mistral-large-2512",
+                "openrouter",
+            ),
         ]
         modes = [
-            ("normal", "", "主要人物："),
-            ("first_person", "艾琳", "以“艾琳”为第一人称"),
-            ("closeup", "艾琳", "艾琳的人物特写"),
+            ("normal", "", "以第三人称视角描述一下当前场景"),
+            ("first_person", "", "以我为第一人称视角"),
+            ("closeup", "艾琳", "艾琳当前的人物特写"),
         ]
-        for selected, api_model, is_deepseek in models:
+        for selected, api_model, provider in models:
             for mode, subject, prompt_marker in modes:
                 for reasoning in (False, True):
                     with self.subTest(model=selected, mode=mode, reasoning=reasoning):
@@ -238,30 +348,55 @@ if st.button("模拟生成完成"):
                         with (
                             patch.object(page2_service.GrokAPIClient, "send_message") as grok,
                             patch.object(page2_service.DeepSeekAPIClient, "send_message") as deepseek,
+                            patch.object(
+                                page2_service.OpenRouterChatAPIClient,
+                                "send_message",
+                            ) as openrouter,
                         ):
-                            client = deepseek if is_deepseek else grok
-                            other_client = grok if is_deepseek else deepseek
+                            clients = {
+                                "grok": grok,
+                                "deepseek": deepseek,
+                                "openrouter": openrouter,
+                            }
+                            client = clients[provider]
                             client.return_value = "最终图片 prompt"
                             result = page2_service.generate_image_prompt(
-                                "最新助手回复",
                                 ctx=ctx,
+                                turns=[Page2ConversationTurn(
+                                    user_message="观察房间",
+                                    assistant_message="最新助手回复",
+                                )],
+                                story_brain_short="旅店停电",
+                                story_brain_enabled=True,
                                 mode=mode,
                                 subject=subject,
                             )
 
                         self.assertEqual(result, "最终图片 prompt")
-                        other_client.assert_not_called()
+                        for name, other_client in clients.items():
+                            if name != provider:
+                                other_client.assert_not_called()
                         self.assertEqual(client.call_count, 1)
                         kwargs = client.call_args.kwargs
                         self.assertEqual(kwargs["model"], api_model)
                         self.assertEqual(kwargs["temperature"], 0.6)
-                        self.assertEqual(
-                            kwargs["thinking_enabled"], reasoning or selected == "grok2"
-                        )
-                        self.assertEqual(kwargs["user_message"], "最新助手回复")
-                        self.assertEqual(kwargs["context_messages"], [])
-                        self.assertIn(prompt_marker, kwargs["system_prompt"])
-                        self.assertNotIn(ctx.system_prompt, kwargs["system_prompt"])
+                        if provider == "openrouter":
+                            self.assertNotIn("thinking_enabled", kwargs)
+                            self.assertNotIn("reasoning_effort", kwargs)
+                        else:
+                            self.assertEqual(
+                                kwargs["thinking_enabled"],
+                                reasoning or selected == "grok2",
+                            )
+                        self.assertIn(prompt_marker, kwargs["user_message"])
+                        self.assertTrue(kwargs["user_message"].startswith(
+                            "<当前故事背景>旅店停电</当前故事背景>"
+                        ))
+                        self.assertEqual(kwargs["context_messages"], [
+                            {"role": "user", "content": "观察房间"},
+                            {"role": "assistant", "content": "最新助手回复"},
+                        ])
+                        self.assertEqual(kwargs["system_prompt"], ctx.system_prompt)
                         self.assertEqual(ctx.system_prompt, "聊天专用系统设定")
 
     def test_image_command_turn_round_trips_and_is_excluded_from_context(self):
@@ -312,7 +447,8 @@ if st.button("模拟生成完成"):
             __setattr__ = dict.__setitem__
 
         defaults = json.loads((ROOT / "app/default_prompts/quick_inputs.json").read_text())
-        for text in ["/图片", "/图片 追加内容", defaults[0]["content"]]:
+        self.assertEqual(defaults, [])
+        for text in ["/图片", "/图片 追加内容"]:
             with self.subTest(text=text):
                 ctx = page2_service.default_context()
                 ctx.story_brain_turns = 1
@@ -459,7 +595,7 @@ if st.button("模拟生成完成"):
         self.assertEqual(saved_default.content, "前端保存后的最新默认规则")
         self.assertEqual(created.content, "前端保存后的最新默认规则")
 
-    def test_legacy_final_setting_uses_latest_saved_default_memory(self):
+    def test_legacy_final_setting_keeps_empty_memory_when_binding_default(self):
         legacy = SystemPromptRecord.from_dict(
             {"title": "旧最终设定", "prompt": "旧 prompt", "first_input": "开始"}
         )
@@ -485,7 +621,7 @@ if st.button("模拟生成完成"):
                 )
                 system_prompts._ensure_record_defaults(state)
 
-        self.assertEqual(legacy.long_term_memory, "最新迁移规则")
+        self.assertEqual(legacy.long_term_memory, "")
         self.assertEqual(legacy.final_long_term_memory_id, default_record.id)
 
     def test_story_brain_update_uses_final_setting_long_term_memory_prompt(self):
@@ -680,6 +816,238 @@ if st.button("模拟生成完成"):
 
         self.assertIn('长期记忆“默认”', updated)
         self.assertEqual(saved_memories[0]["content"], "前端编辑后的记忆规则")
+
+    def test_one_click_sync_writes_user_character_and_preserves_personality(self):
+        user = PromptTextRecord(
+            title="狼影2",
+            content="\n\n".join(
+                [
+                    "## 1. 角色身份\n旧身份",
+                    "## 3. 角色性格\n冷静但记仇",
+                    "## 5. 角色能力\n-旧能力",
+                ]
+            ),
+        )
+        prompt = "\n\n".join(
+            [
+                "3. 用户角色",
+                "## 1. 角色身份\n新身份",
+                "## 5. 角色能力\n-读心：可以读取目标的真实想法",
+            ]
+        )
+        final = SystemPromptRecord(
+            title="学校2",
+            prompt=prompt,
+            final_user_character_id=user.id,
+            final_user_character_name=user.title,
+        )
+        state = system_prompts.PromptState(
+            hidden_space=False,
+            records=[final],
+            hidden_records=[],
+            next_index=2,
+            hidden_next_index=1,
+            selected_record_id=final.id,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SettingsStore(Path(temp_dir) / "user_defaults.json")
+            store.set(
+                "characterCardRecords",
+                json.dumps([user.to_dict()], ensure_ascii=False),
+            )
+            store.set("longTermMemoryDefaultSeeded", True)
+            with (
+                patch.object(prompt_assets, "settings", store),
+                patch.object(
+                    prompt_assets,
+                    "FINAL_SETTING_SYNC_BACKUP_PATH",
+                    Path(temp_dir) / "sync-backup.json",
+                ),
+            ):
+                updated = prompt_assets.sync_final_setting(
+                    state,
+                    final,
+                    title=final.title,
+                    prompt=prompt,
+                    long_term_memory="",
+                    first_inputs=list(final.first_inputs),
+                    selected_first_input_id=final.selected_first_input_id,
+                )
+
+            saved_user = json.loads(store.get("characterCardRecords", "[]"))[0]
+
+        self.assertIn('角色卡“狼影2”', updated)
+        self.assertIn("新身份", saved_user["content"])
+        self.assertIn("-读心：可以读取目标的真实想法", saved_user["content"])
+        self.assertIn("## 3. 角色性格\n冷静但记仇", saved_user["content"])
+        self.assertLess(
+            saved_user["content"].index("## 3. 角色性格"),
+            saved_user["content"].index("## 5. 角色能力"),
+        )
+
+    def test_one_click_sync_skips_missing_other_characters_and_syncs_the_rest(self):
+        template = FixedTemplateRecord(
+            title="模板",
+            background_intro="旧背景",
+            dm_core_tasks="旧任务",
+            response_format="旧格式",
+        )
+        world = PromptTextRecord(title="世界", content="旧世界")
+        user = PromptTextRecord(title="主角", content="主角内容")
+        missing_heading_character = PromptTextRecord(title="甲", content="甲的旧内容")
+        remaining_character = PromptTextRecord(title="乙", content="乙的旧内容")
+        deleted_character = PromptTextRecord(title="丙", content="丙的旧内容")
+        memory = PromptTextRecord(title="默认", content="旧记忆规则")
+        prompt = "\n\n".join(
+            [
+                "1. 背景介绍\n新背景",
+                "2. 世界书\n新世界",
+                "3. 用户角色\n主角内容",
+                "4. 其他角色\n### 乙\n乙与主角并肩行动\n\n### 丙\n丙的新内容",
+                "5. DM 的核心任务\n新任务",
+                "6. 回复格式要求\n新格式",
+            ]
+        )
+        final = SystemPromptRecord(
+            title="最终设定",
+            prompt=prompt,
+            long_term_memory="旧记忆规则",
+            final_template_id=template.id,
+            final_world_book_id=world.id,
+            final_long_term_memory_id=memory.id,
+            final_user_character_id=user.id,
+            final_user_character_name=user.title,
+            final_other_character_ids=[
+                missing_heading_character.id,
+                remaining_character.id,
+                deleted_character.id,
+            ],
+            final_other_character_names=["甲", "乙", "丙"],
+        )
+        state = system_prompts.PromptState(
+            hidden_space=False,
+            records=[final],
+            hidden_records=[],
+            next_index=2,
+            hidden_next_index=1,
+            selected_record_id=final.id,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SettingsStore(Path(temp_dir) / "user_defaults.json")
+            store.set("fixedTemplateRecords", json.dumps([template.to_dict()], ensure_ascii=False))
+            store.set("worldBookRecords", json.dumps([world.to_dict()], ensure_ascii=False))
+            store.set(
+                "characterCardRecords",
+                json.dumps(
+                    [
+                        user.to_dict(),
+                        missing_heading_character.to_dict(),
+                        remaining_character.to_dict(),
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+            store.set("longTermMemoryRecords", json.dumps([memory.to_dict()], ensure_ascii=False))
+            store.set("longTermMemoryDefaultSeeded", True)
+            store.set("defaultLongTermMemoryRecordID", memory.id)
+            with (
+                patch.object(prompt_assets, "settings", store),
+                patch.object(
+                    prompt_assets,
+                    "FINAL_SETTING_SYNC_BACKUP_PATH",
+                    Path(temp_dir) / "sync-backup.json",
+                ),
+            ):
+                updated = prompt_assets.sync_final_setting(
+                    state,
+                    final,
+                    title=final.title,
+                    prompt=prompt,
+                    long_term_memory="新记忆规则",
+                    first_inputs=list(final.first_inputs),
+                    selected_first_input_id=final.selected_first_input_id,
+                )
+
+            saved_characters = {
+                item["title"]: item
+                for item in json.loads(store.get("characterCardRecords", "[]"))
+            }
+            saved_worlds = json.loads(store.get("worldBookRecords", "[]"))
+
+        self.assertEqual(saved_characters["甲"]["content"], "甲的旧内容")
+        self.assertEqual(saved_characters["乙"]["content"], "乙与{用户角色名}并肩行动")
+        self.assertEqual(saved_worlds[0]["content"], "新世界")
+        self.assertIn('角色卡“乙”', updated)
+        self.assertNotIn('角色卡“甲”', updated)
+        self.assertNotIn('角色卡“丙”', updated)
+
+    def test_one_click_sync_skips_missing_links_and_prompt_sections(self):
+        template = FixedTemplateRecord(
+            title="模板",
+            background_intro="旧背景",
+            dm_core_tasks="旧任务",
+            response_format="旧格式",
+        )
+        memory = PromptTextRecord(title="默认", content="旧记忆规则")
+        prompt = "\n\n".join(
+            [
+                "1. 背景介绍\n新背景",
+                "3. 用户角色\n主角内容",
+                "5. DM 的核心任务\n新任务",
+                "6. 回复格式要求\n新格式",
+            ]
+        )
+        final = SystemPromptRecord(
+            title="最终设定",
+            prompt=prompt,
+            long_term_memory="旧记忆规则",
+            final_template_id=template.id,
+            final_long_term_memory_id=memory.id,
+        )
+        state = system_prompts.PromptState(
+            hidden_space=False,
+            records=[final],
+            hidden_records=[],
+            next_index=2,
+            hidden_next_index=1,
+            selected_record_id=final.id,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SettingsStore(Path(temp_dir) / "user_defaults.json")
+            store.set("fixedTemplateRecords", json.dumps([template.to_dict()], ensure_ascii=False))
+            store.set("longTermMemoryRecords", json.dumps([memory.to_dict()], ensure_ascii=False))
+            store.set("longTermMemoryDefaultSeeded", True)
+            store.set("defaultLongTermMemoryRecordID", memory.id)
+            with (
+                patch.object(prompt_assets, "settings", store),
+                patch.object(
+                    prompt_assets,
+                    "FINAL_SETTING_SYNC_BACKUP_PATH",
+                    Path(temp_dir) / "sync-backup.json",
+                ),
+            ):
+                updated = prompt_assets.sync_final_setting(
+                    state,
+                    final,
+                    title="改名后的最终设定",
+                    prompt=prompt,
+                    long_term_memory="新记忆规则",
+                    first_inputs=list(final.first_inputs),
+                    selected_first_input_id=final.selected_first_input_id,
+                )
+
+            saved_templates = json.loads(store.get("fixedTemplateRecords", "[]"))
+            saved_finals = json.loads(store.get("systemPromptRecords", "[]"))
+
+        self.assertEqual(saved_templates[0]["background_intro"], "新背景")
+        self.assertEqual(saved_templates[0]["dm_core_tasks"], "新任务")
+        self.assertEqual(saved_templates[0]["response_format"], "新格式")
+        self.assertEqual(saved_finals[0]["title"], "改名后的最终设定")
+        self.assertIn('固定模板“模板”', updated)
+        self.assertIn('长期记忆“默认”', updated)
 
     def test_manual_story_brain_update_defers_next_update_by_five_turns(self):
         from web.pages import page2

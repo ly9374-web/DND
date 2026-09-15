@@ -113,12 +113,26 @@ class ResendTests(unittest.TestCase):
                 page2._apply_operation(task)
         save.assert_not_called()
 
-    def test_busy_and_empty_guards_and_command_matching(self):
+    def test_resend_queues_behind_running_operations_and_keeps_empty_guard(self):
         ctx = page2_service.default_context()
         for kind in ["chat", "resend", "story_brain", "image", "video"]:
             self.session.page2_active_operation = page2._Page2OperationTask(kind=kind, label=kind, scope_id="test")
-            self.assertFalse(page2._queue_resend(ctx=ctx, story_brain_enabled=True))
-            self.assertEqual(self.session.page2_operation_queue, [])
+            self.assertTrue(page2._queue_resend(ctx=ctx, story_brain_enabled=True))
+            self.assertEqual(
+                [task.kind for task in self.session.page2_operation_queue],
+                ["resend"],
+            )
+            if kind in {"chat", "resend"}:
+                self.assertEqual(
+                    self.session.page2_operation_queue[0].payload["target_turn_id"],
+                    "",
+                )
+            else:
+                self.assertEqual(
+                    self.session.page2_operation_queue[0].payload["target_turn_id"],
+                    "t3",
+                )
+            self.session.page2_operation_queue = []
         self.session.page2_active_operation = None
         self.assertTrue(page2._queue_resend(ctx=ctx, story_brain_enabled=True))
         self.assertTrue(page2._operation_kind_busy("chat"))
@@ -129,6 +143,17 @@ class ResendTests(unittest.TestCase):
             self.assertTrue(page2._is_resend_command(text))
         for text in ["请/重发", "/重发 修改", "/重发/重发"]:
             self.assertFalse(page2._is_resend_command(text))
+
+    def test_deferred_resend_targets_latest_turn_when_it_reaches_front(self):
+        task = self.task()
+        task.payload["target_turn_id"] = ""
+        newer = Page2ConversationTurn(
+            id="t4", user_message="排队期间完成的消息", assistant_message="新回复"
+        )
+        self.session.page2_turns.append(newer)
+        with patch.object(page2_service, "send_message", return_value="重发回复") as send:
+            page2._prepare_operation(task)()
+        self.assertEqual(send.call_args.kwargs["user_message"], "排队期间完成的消息")
 
     def test_snapshots_evict_two_updates_ago_and_continuous_undo_reports_limit(self):
         first = memory("版本1", "t1", 2)
@@ -183,6 +208,7 @@ class ResendTests(unittest.TestCase):
                 with patch.object(page2, "get_arg", return_value=record_id), patch.object(page2_service, "load_context_from_settings", return_value=page2_service.default_context()), patch.object(page2_service, "save_context_to_settings"), patch.object(page2.url_favorites, "clear_preview_url"):
                     page2._load_record_from_nav_if_needed()
                 self.assertEqual(self.session.page2_story_brain_checkpoints, self.history)
+                self.assertTrue(self.session.page2_chat_scroll_to_bottom_request)
                 task = self.task()
                 task.scope_id = "record:saved"
                 page2._prepare_operation(task)

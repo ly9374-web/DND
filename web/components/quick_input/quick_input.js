@@ -19,7 +19,6 @@
       gap:12px;padding:9px 12px;border-radius:6px;cursor:pointer;white-space:pre-wrap;overflow-wrap:anywhere;}
     #${menuId} [aria-selected=true]{background:#334155;}
     #${menuId} small{color:#aab8cc;flex-shrink:0;}
-    #${menuId} .quick-input-empty{padding:9px 12px;color:#aab8cc;}
     div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas.dnd-quick-input-open,
     .st-key-page2_chat_canvas.dnd-quick-input-open{
       padding-bottom:calc(14px + var(--dnd-quick-input-height)) !important;}
@@ -31,13 +30,15 @@
   let matches = [];
   let selected = saved?.selected || 0;
   let composing = saved?.composing || false;
+  let compositionSettling = false;
+  let compositionRevision = 0;
   let compositionBefore = null;
   let inserting = false;
   let pendingInput = null;
   const listen = (name, fn) => doc.addEventListener(name, fn, true);
   const inputTarget = (event) => event.target?.matches?.(selector);
 
-  function close() {
+  function hideMenu() {
     const canvas = active?.input.closest(".st-key-page2_chat_canvas");
     canvas?.classList.remove("dnd-quick-input-open");
     canvas?.style.removeProperty("--dnd-quick-input-height");
@@ -45,10 +46,14 @@
       for (const attr of ["aria-controls", "aria-expanded", "aria-activedescendant", "aria-autocomplete"])
         active.input.removeAttribute(attr);
     }
-    active = null;
-    matches = [];
     menu?.remove();
     menu = null;
+  }
+
+  function close() {
+    hideMenu();
+    active = null;
+    matches = [];
   }
 
   function position() {
@@ -98,6 +103,12 @@
     const query = token.slice(1).toLocaleLowerCase();
     matches = config.options.filter(item => item.title.toLocaleLowerCase().includes(query));
     selected = Math.min(selected, Math.max(0, matches.length - 1));
+    // Keep tracking the slash token so Backspace can reveal matches again, but
+    // do not reserve space or show an empty dropdown when nothing matches.
+    if (!matches.length) {
+      hideMenu();
+      return;
+    }
     if (!menu) {
       menu = doc.createElement("div");
       menu.id = menuId;
@@ -108,12 +119,6 @@
       doc.body.appendChild(menu);
     }
     menu.replaceChildren();
-    if (!matches.length) {
-      const empty = doc.createElement("div");
-      empty.className = "quick-input-empty";
-      empty.textContent = config.options.length ? "没有匹配的快捷输入" : "暂无快捷输入，请在 Prompt 中新建";
-      menu.appendChild(empty);
-    }
     matches.forEach((item, index) => {
       const row = doc.createElement("div");
       row.id = `${menuId}-${index}`;
@@ -137,13 +142,36 @@
     highlight();
   }
 
+  function isOperation(item) {
+    const label = String(item?.label || item?.title || "").trim();
+    return item?.kind === "command" || /(?:（操作）|\(操作\))$/u.test(label);
+  }
+
+  function submitOperation(input, expectedValue, attempts = 0) {
+    if (!input.isConnected || input.value !== expectedValue) return;
+    const button = doc.querySelector(
+      ".st-key-page2_chat_input [data-testid='stChatInputSubmitButton']"
+    );
+    if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") {
+      button.click();
+      return;
+    }
+    // Give React time to enable the submit button after receiving the input event.
+    if (attempts < 4) {
+      host.requestAnimationFrame(() => submitOperation(input, expectedValue, attempts + 1));
+    }
+  }
+
   function choose(index) {
     if (composing || !active) return;
     const item = matches[index];
     if (!item) return;
     const { input, start, end } = active;
-    const next = input.value.slice(0, start) + item.content + input.value.slice(end);
-    const caret = start + item.content.length;
+    const operation = isOperation(item);
+    const next = operation
+      ? item.content
+      : input.value.slice(0, start) + item.content + input.value.slice(end);
+    const caret = operation ? next.length : start + item.content.length;
     close();
     inserting = true;
     // Use the native setter so Streamlit's React-controlled draft receives the change.
@@ -156,6 +184,7 @@
     host.requestAnimationFrame(() => {
       if (input.isConnected && input.value === next && doc.activeElement === input)
         input.setSelectionRange(caret, caret);
+      if (operation) submitOperation(input, next);
     });
   }
 
@@ -171,6 +200,13 @@
     const before = pendingInput;
     pendingInput = null;
     if (composing || event.isComposing) return;
+    // Some IMEs emit selectionchange after compositionend but before this final
+    // input event. Once the committed value arrives, refresh() can safely adopt
+    // the new caret position and normal selection tracking can resume.
+    if (compositionSettling) {
+      compositionSettling = false;
+      compositionRevision += 1;
+    }
     const input = event.target;
     if (event.inputType === "insertText" && /^[\/／]$/.test(event.data || "") &&
         before?.input === input && before.type === "insertText") {
@@ -187,6 +223,8 @@
 
   function onCompositionStart(event) {
     if (!inputTarget(event)) return;
+    compositionSettling = false;
+    compositionRevision += 1;
     composing = true;
     compositionBefore = { input: event.target, start: event.target.selectionStart,
       end: event.target.selectionEnd, value: event.target.value };
@@ -194,6 +232,8 @@
   function onCompositionEnd(event) {
     if (!inputTarget(event)) return;
     composing = false;
+    compositionSettling = true;
+    const revision = ++compositionRevision;
     const before = compositionBefore;
     compositionBefore = null;
     if (/^[\/／]$/.test(event.data || "") && before) {
@@ -203,7 +243,11 @@
         prefix: before.value.slice(0, before.start), suffix: before.value.slice(before.end) };
     }
     // Chinese search becomes final after the browser's composition input event.
-    host.setTimeout(() => { if (active) refresh(); }, 0);
+    host.setTimeout(() => {
+      if (revision !== compositionRevision) return;
+      compositionSettling = false;
+      if (active) refresh();
+    }, 0);
   }
   function onPointerDown(event) {
     if (active && !menu?.contains(event.target)) close();
@@ -212,7 +256,8 @@
     if (active && event.target !== active.input && !menu?.contains(event.target)) close();
   }
   function onSelection() {
-    if (active && !composing && (active.input.selectionStart !== active.end ||
+    if (active && !composing && !compositionSettling &&
+        (active.input.selectionStart !== active.end ||
         active.input.selectionEnd !== active.end)) close();
   }
   function handleKey(event) {
@@ -220,6 +265,7 @@
       return false;
     if (!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key) ||
         event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return false;
+    if (event.key !== "Escape" && (!menu || !matches.length)) return false;
     event.preventDefault();
     event.stopImmediatePropagation();
     if (event.key === "Escape") close();

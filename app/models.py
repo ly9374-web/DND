@@ -25,6 +25,7 @@ class Page2ChatModel(str, Enum):
     GROK2 = "grok2"
     DEEPSEEK_PRO = "deepseekPro"
     DEEPSEEK_FLASH = "deepseekFlash"
+    MISTRAL_LARGE_2512 = "mistralLarge2512"
 
 
 CHAT_MODEL_OPTIONS = [model.value for model in Page2ChatModel]
@@ -33,6 +34,7 @@ CHAT_MODEL_LABELS = {
     Page2ChatModel.GROK2.value: "Grok 4.6",
     Page2ChatModel.DEEPSEEK_PRO.value: "DeepSeek Pro",
     Page2ChatModel.DEEPSEEK_FLASH.value: "DeepSeek Flash",
+    Page2ChatModel.MISTRAL_LARGE_2512.value: "Mistral Large 3 2512",
 }
 GROK_CHAT_MODEL_IDS = {
     Page2ChatModel.GROK1.value: "grok-4.3",
@@ -41,6 +43,9 @@ GROK_CHAT_MODEL_IDS = {
 DEEPSEEK_CHAT_MODEL_IDS = {
     Page2ChatModel.DEEPSEEK_PRO.value: "deepseek-v4-pro",
     Page2ChatModel.DEEPSEEK_FLASH.value: "deepseek-v4-flash",
+}
+OPENROUTER_CHAT_MODEL_IDS = {
+    Page2ChatModel.MISTRAL_LARGE_2512.value: "mistralai/mistral-large-2512",
 }
 
 
@@ -59,6 +64,14 @@ def deepseek_api_model_for_chat_model(value) -> str | None:
 
 def grok_api_model_for_chat_model(value) -> str | None:
     return GROK_CHAT_MODEL_IDS.get(normalize_chat_model(value))
+
+
+def openrouter_api_model_for_chat_model(value) -> str | None:
+    return OPENROUTER_CHAT_MODEL_IDS.get(normalize_chat_model(value))
+
+
+def chat_model_supports_reasoning(value) -> bool:
+    return openrouter_api_model_for_chat_model(value) is None
 
 
 class GeneratedMediaKind(str, Enum):
@@ -443,6 +456,11 @@ class ChatRecord:
     # At most two versions: current and previous, never a per-turn memory archive.
     story_brain_checkpoints: list = field(default_factory=list)
     final_setting_id: str = ""
+    # Records created from the same conversation snapshot share a branch group.
+    # The number is kept separately from the title so later manual renames do not
+    # break the next-number calculation.
+    branch_group_id: str = ""
+    branch_number: int | None = None
     # 记录是否属于隐藏账号（在隐藏账号中创建的聊天记录对普通账号不可见）。
     hidden: bool = False
     id: str = field(default_factory=new_id)
@@ -490,6 +508,14 @@ class ChatRecord:
                 or data.get("finalSettingID")
                 or ""
             ),
+            branch_group_id=str(
+                data.get("branch_group_id") or data.get("branchGroupID") or ""
+            ),
+            branch_number=optional_positive_int(
+                data.get("branch_number")
+                if "branch_number" in data
+                else data.get("branchNumber")
+            ),
             story_brain_checkpoints=deepcopy([
                 item for item in (data.get("story_brain_checkpoints") or [])
                 if isinstance(item, dict) and isinstance(item.get("state"), dict)
@@ -521,6 +547,8 @@ class ChatRecord:
                 self.story_brain_last_update_turn_id or ""
             ),
             "final_setting_id": str(self.final_setting_id or ""),
+            "branch_group_id": str(self.branch_group_id or ""),
+            "branch_number": optional_positive_int(self.branch_number),
             "story_brain_checkpoints": deepcopy(self.story_brain_checkpoints[-2:]),
             "hidden": bool(self.hidden),
             "created_at": self.created_at,
@@ -536,6 +564,8 @@ class ChatRecordIndexItem:
     updated_at: str
     file_name: str
     hidden: bool = False
+    branch_group_id: str = ""
+    branch_number: int | None = None
 
     @staticmethod
     def from_dict(data):
@@ -546,6 +576,14 @@ class ChatRecordIndexItem:
             updated_at=data.get("updated_at") or data.get("updatedAt") or now_iso(),
             file_name=data.get("file_name") or data.get("fileName") or "",
             hidden=bool(data.get("hidden", False)),
+            branch_group_id=str(
+                data.get("branch_group_id") or data.get("branchGroupID") or ""
+            ),
+            branch_number=optional_positive_int(
+                data.get("branch_number")
+                if "branch_number" in data
+                else data.get("branchNumber")
+            ),
         )
 
     def to_dict(self):
@@ -556,4 +594,6 @@ class ChatRecordIndexItem:
             "updated_at": self.updated_at,
             "file_name": self.file_name,
             "hidden": bool(self.hidden),
+            "branch_group_id": str(self.branch_group_id or ""),
+            "branch_number": optional_positive_int(self.branch_number),
         }

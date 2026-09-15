@@ -12,7 +12,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from app.config import AppStorageKeys, OpenRouterConfig, settings, user_facing_error_message
-from app.api.media_clients import download_video_bytes, is_openrouter_video_url
+from app.api.media_clients import (
+    download_image_bytes,
+    download_url_as_base64,
+    download_video_bytes,
+    image_url_is_expired,
+    is_openrouter_video_url,
+)
 from app.video_models import (
     VIDEO_MODELS, WAN_MODEL, WAN_DURATION_FRAMES, WAN_FPS,
     normalize_video_model, video_duration_label,
@@ -22,6 +28,7 @@ from app.models import (
     CHAT_MODEL_OPTIONS,
     GeneratedMediaKind,
     Page2ConversationTurn,
+    chat_model_supports_reasoning,
 )
 from app.services import chat_records, page2_service, quick_inputs, story_brain_history, system_prompts
 from app.services.video_prompts import (
@@ -29,6 +36,7 @@ from app.services.video_prompts import (
 )
 from web.components.video_prompt import render_editor_sizing, render_toast_style
 from web.components.quick_input import quick_input_script
+from web import prompt_draft_guard
 from web.nav import get_arg, goto
 from web.pages import url_favorites
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
@@ -65,6 +73,37 @@ def _chat_scope() -> str | None:
 
 def _decode_image_base64(b64: str) -> bytes:
     return base64.b64decode(b64.encode("ascii"))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _image_url_is_expired(url: str) -> bool:
+    return image_url_is_expired(url)
+
+
+def _image_download_suffix(url: str) -> str:
+    clean_url = str(url or "").split("?", 1)[0].lower()
+    for suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        if clean_url.endswith(suffix):
+            return ".jpg" if suffix == ".jpeg" else suffix
+    return ".png"
+
+
+def _delete_media_record(record_id: str) -> None:
+    st.session_state.page2_generated_media = [
+        item for item in st.session_state.page2_generated_media
+        if item.id != record_id
+    ]
+    if str(st.session_state.get("page2_selected_media_id", "") or "") == record_id:
+        st.session_state.page2_selected_media_id = ""
+    _upsert_record()
+
+
+def _save_image_record(record) -> None:
+    url = str(record.image_url_string or "").strip()
+    if not url:
+        raise RuntimeError("该图片没有可保存的 URL。")
+    record.image_data_base64 = download_url_as_base64(url)
+    _upsert_record()
 
 
 def _latest_image_media_id(media: list) -> str:
@@ -160,7 +199,7 @@ def _render_empty_space_submit_bridge(*, send_disabled: bool = False) -> None:
     """Keep drafts editable while blocking submission, including blank shortcuts."""
     sentinel_json = json.dumps(_EMPTY_SPACE_SUBMISSION_SENTINEL, ensure_ascii=False)
     hidden_space = bool(st.session_state.get("hidden_unlocked", False))
-    components.html(
+    st.iframe(
         quick_input_script(
             quick_inputs.quick_input_options(hidden_space=hidden_space),
             scope=f"{hidden_space}:{st.session_state.get('page2_record_id', '')}",
@@ -289,7 +328,7 @@ def _render_empty_space_submit_bridge(*, send_disabled: bool = False) -> None:
           }})();
         </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -304,10 +343,12 @@ def _ensure_state():
     st.session_state.setdefault("page2_generated_media", [])
     st.session_state.setdefault("page2_selected_media_id", "")
     st.session_state.setdefault("page2_pending_media_record_select", "")
+    st.session_state.setdefault("page2_media_selection_nonce", 0)
     st.session_state.setdefault("page2_image_prompt", "")
     st.session_state.setdefault("page2_image_prompt_mode", "normal")
     st.session_state.setdefault("page2_image_prompt_subject", "")
     st.session_state.setdefault("page2_image_prompt_source", {})
+    st.session_state.setdefault("page2_refiner_prompt", "")
     st.session_state.setdefault("page2_video_prompt", "")
     st.session_state.setdefault("page2_video_story_toast", None)
     st.session_state.setdefault("page2_story_brain_archive", {})
@@ -321,6 +362,8 @@ def _ensure_state():
     st.session_state.setdefault("page2_story_brain_checkpoints", [])
     st.session_state.setdefault("page2_operation_queue", [])
     st.session_state.setdefault("page2_active_operation", None)
+    st.session_state.setdefault("page2_active_media_operations", {})
+    st.session_state.setdefault("page2_media_completions", [])
     st.session_state.setdefault("page2_operation_scope_id", uuid.uuid4().hex)
     st.session_state.setdefault("page2_operation_notice", "")
     st.session_state.setdefault("page2_operation_error", "")
@@ -342,7 +385,7 @@ class _Page2OperationTask:
         self.id = uuid.uuid4().hex
         self.kind = str(kind or "")
         self.label = str(label or kind or "操作")
-        self.payload = dict(payload or {})
+        self.payload = deepcopy(payload or {})
         self.scope_id = str(scope_id or "")
         self.meta: dict = {}
         self._fn = None
@@ -380,23 +423,31 @@ class _Page2OperationTask:
         return self._done.is_set()
 
 
-def page2_operation_queue_busy() -> bool:
-    return bool(
-        st.session_state.get("page2_active_operation") is not None
-        or st.session_state.get("page2_operation_queue")
+def _operation_lane(task: _Page2OperationTask) -> str:
+    return task.kind if task.kind in {"image", "video"} else "chat"
+
+
+def _active_operations() -> list[_Page2OperationTask]:
+    # Keep the existing slot for chat and for an operation already running when
+    # this version is loaded. New image/video tasks use their own slots.
+    active = st.session_state.get("page2_active_operation")
+    return ([active] if active is not None else []) + list(
+        (st.session_state.get("page2_active_media_operations") or {}).values()
     )
+
+
+def _pending_operations() -> list[_Page2OperationTask]:
+    return _active_operations() + list(st.session_state.get("page2_operation_queue") or [])
+
+
+def page2_operation_queue_busy() -> bool:
+    return bool(_pending_operations())
 
 
 def _operation_kind_busy(kind: str) -> bool:
     """Return whether this kind of request is already running or queued."""
-    active = st.session_state.get("page2_active_operation")
     kinds = {"chat", "resend"} if kind == "chat" else {kind}
-    if active is not None and active.kind in kinds:
-        return True
-    return any(
-        task.kind in kinds
-        for task in list(st.session_state.get("page2_operation_queue") or [])
-    )
+    return any(task.kind in kinds for task in _pending_operations())
 
 
 def _story_brain_update_busy() -> bool:
@@ -449,13 +500,8 @@ def _has_earlier_operation(kind: str) -> bool:
 
 
 def _latest_earlier_operation(kind: str) -> _Page2OperationTask | None:
-    operations = []
-    active = st.session_state.get("page2_active_operation")
-    if active is not None:
-        operations.append(active)
-    operations.extend(list(st.session_state.get("page2_operation_queue") or []))
     kinds = {"chat", "resend"} if kind == "chat" else {kind}
-    matches = [task for task in operations if task.kind in kinds]
+    matches = [task for task in _pending_operations() if task.kind in kinds]
     return matches[-1] if matches else None
 
 
@@ -473,7 +519,7 @@ def _chat_edit_active() -> bool:
     return bool(target.get("turn_id") and target.get("role") in {"user", "assistant"})
 
 
-def _open_chat_edit(turn_id: str, role: str, text: str) -> bool:
+def _open_chat_edit(turn_id: str, role: str) -> bool:
     """Open one native message editor unless Story Brain is updating."""
     if _story_brain_update_busy() or role not in {"user", "assistant"} or not turn_id:
         return False
@@ -482,7 +528,7 @@ def _open_chat_edit(turn_id: str, role: str, text: str) -> bool:
         "turn_id": str(turn_id),
         "role": str(role),
     }
-    st.session_state[_chat_edit_widget_key(turn_id, role)] = str(text or "")
+    st.session_state.pop(_chat_edit_widget_key(turn_id, role), None)
     return True
 
 
@@ -517,6 +563,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state.page2_image_prompt_mode = "normal"
     st.session_state.page2_image_prompt_subject = ""
     st.session_state.page2_image_prompt_source = {}
+    st.session_state.page2_refiner_prompt = ""
     st.session_state.page2_video_prompt = ""
     st.session_state.page2_video_story_toast = None
     st.session_state.pop("page2_video_story_dialog", None)
@@ -531,12 +578,53 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state["page2_story_brain_checkpoints"] = []
     st.session_state["page2_operation_queue"] = []
     st.session_state["page2_active_operation"] = None
+    st.session_state["page2_active_media_operations"] = {}
+    st.session_state["page2_media_completions"] = []
     st.session_state["page2_operation_scope_id"] = uuid.uuid4().hex
     st.session_state["page2_operation_notice"] = ""
     st.session_state["page2_operation_error"] = ""
     st.session_state["page2_operation_outputs"] = {}
     _close_chat_edit()
     st.session_state.pop("page2_chat_input", None)
+    return True
+
+
+def branch_or_start_new_conversation():
+    """Branch a non-empty conversation; preserve the old empty-chat behavior."""
+    _ensure_state()
+    if page2_operation_queue_busy():
+        st.session_state["page2_operation_error"] = "队列执行中，请等待所有操作完成后再新建对话。"
+        return False
+
+    has_content = bool(
+        st.session_state.page2_turns
+        or st.session_state.page2_generated_media
+        or str(st.session_state.get("page2_story_brain_short", "") or "").strip()
+        or st.session_state.get("page2_story_brain_archive")
+    )
+    if not has_content:
+        return start_new_conversation()
+
+    try:
+        _upsert_record()
+        branch = chat_records.create_branch(
+            st.session_state.page2_record_id,
+            scope=_chat_scope(),
+        )
+    except Exception as exc:
+        st.session_state["page2_operation_error"] = (
+            "创建会话分支失败：" + user_facing_error_message(exc)
+        )
+        return False
+
+    st.session_state.page2_record_id = branch.id
+    st.session_state.page2_loaded_record_id = branch.id
+    st.session_state["page2_operation_scope_id"] = "record:" + str(branch.id)
+    st.session_state["page2_media_completions"] = []
+    st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
+    st.session_state["page2_operation_notice"] = f"已创建会话分支 {branch.branch_number}。"
+    st.session_state["page2_operation_error"] = ""
+    _close_chat_edit()
     return True
 
 
@@ -566,10 +654,15 @@ def _load_record_from_nav_if_needed():
     st.session_state.page2_record_id = record.id
     st.session_state.page2_loaded_record_id = record.id
     st.session_state["page2_operation_scope_id"] = "record:" + str(record.id)
+    st.session_state["page2_media_completions"] = []
+    st.session_state.pop("page2_video_source", None)
     st.session_state.page2_turns = list(record.turns or [])
+    # Direct/deep-linked record loads should also reveal the newest message.
+    st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
     st.session_state.page2_generated_media = list(record.generated_images or [])
     st.session_state.page2_image_prompt = ""
     st.session_state.page2_image_prompt_source = {}
+    st.session_state.page2_refiner_prompt = ""
     st.session_state.page2_video_prompt = ""
     st.session_state.page2_video_story_toast = None
     st.session_state.pop("page2_video_story_dialog", None)
@@ -695,10 +788,10 @@ def _render_editable_chat_message(
                 st.caption("Story Brain 更新中，暂时不能保存或删除消息。")
 
             editor_key = _chat_edit_widget_key(turn.id, role)
-            if editor_key not in st.session_state:
-                st.session_state[editor_key] = str(text or "")
+            # Include the original in every render, even if the first update is missed.
             next_text = st.text_area(
                 "编辑用户消息" if role == "user" else "编辑 Assistant 消息",
+                value=str(text or ""),
                 key=editor_key,
                 height=180,
                 disabled=story_brain_update_busy,
@@ -765,7 +858,7 @@ def _render_editable_chat_message(
                 type="tertiary",
                 disabled=story_brain_update_busy,
             )
-        if edit_clicked and _open_chat_edit(turn.id, role, text):
+        if edit_clicked and _open_chat_edit(turn.id, role):
             st.rerun()
 
 
@@ -976,8 +1069,11 @@ def _manual_story_brain_update_context(
 
 
 def _render_system_prompt_dialog(ctx, prompt_state, *, is_guest: bool) -> None:
-    @st.dialog("System Prompt", width="large")
+    @st.dialog("System Prompt", width="large", dismissible=False)
     def _dialog():
+        prompt_draft_guard.protect(
+            "page2_system_prompt_dialog_body", ctx.system_prompt, "System Prompt"
+        )
         edited_prompt = st.text_area(
             "System Prompt",
             height=520,
@@ -993,8 +1089,9 @@ def _render_system_prompt_dialog(ctx, prompt_state, *, is_guest: bool) -> None:
             return
 
         save_col, cancel_col = st.columns(2)
+        prompt_draft_guard.save_action("page2_system_prompt_save", "page2_system_prompt_dialog_body")
         with save_col:
-            if st.button("保存", type="primary", use_container_width=True):
+            if st.button("保存", type="primary", use_container_width=True, key="page2_system_prompt_save"):
                 ctx.system_prompt = edited_prompt
                 synced_record = system_prompts.update_selected_prompt(
                     prompt_state,
@@ -1009,13 +1106,70 @@ def _render_system_prompt_dialog(ctx, prompt_state, *, is_guest: bool) -> None:
                 )
                 if has_current_record or _conversation_started(st.session_state.page2_turns):
                     _upsert_record()
+                prompt_draft_guard.saved("page2_system_prompt_dialog_body")
                 st.session_state["page2_system_prompt_notice"] = "System Prompt 已保存。"
                 st.rerun()
         with cancel_col:
-            if st.button("取消", use_container_width=True):
+            if st.button("放弃改动并取消", use_container_width=True):
                 st.rerun()
 
     _dialog()
+
+
+def _apply_sidebar_context_values(
+    ctx,
+    *,
+    context_turn_count,
+    selected_chat_model,
+    chat_reasoning,
+    story_brain_update_model,
+    story_brain_reasoning,
+    story_brain_turns,
+    temperature,
+    unexpected_event_enabled,
+    unexpected_event_threshold,
+) -> bool:
+    """Copy sidebar widget values into ctx and report whether they changed."""
+    previous = (
+        ctx.context_turn_count,
+        ctx.selected_chat_model,
+        ctx.chat_reasoning_enabled,
+        ctx.story_brain_update_model,
+        ctx.story_brain_reasoning_enabled,
+        ctx.story_brain_turns,
+        ctx.temperature,
+        ctx.unexpected_event_enabled,
+        ctx.unexpected_event_threshold,
+    )
+
+    ctx.context_turn_count = int(context_turn_count)
+    ctx.selected_chat_model = selected_chat_model
+    ctx.chat_reasoning_enabled = (
+        chat_model_supports_reasoning(selected_chat_model)
+        and chat_reasoning == "开思考"
+    )
+    ctx.story_brain_update_model = story_brain_update_model
+    ctx.story_brain_reasoning_enabled = (
+        chat_model_supports_reasoning(story_brain_update_model)
+        and story_brain_reasoning == "开思考"
+    )
+    ctx.story_brain_turns = int(story_brain_turns)
+    ctx.temperature = float(temperature)
+    ctx.unexpected_event_enabled = bool(unexpected_event_enabled)
+    ctx.unexpected_event_threshold = int(unexpected_event_threshold)
+
+    current = (
+        ctx.context_turn_count,
+        ctx.selected_chat_model,
+        ctx.chat_reasoning_enabled,
+        ctx.story_brain_update_model,
+        ctx.story_brain_reasoning_enabled,
+        ctx.story_brain_turns,
+        ctx.temperature,
+        ctx.unexpected_event_enabled,
+        ctx.unexpected_event_threshold,
+    )
+    return current != previous
 
 
 def render_sidebar_context():
@@ -1028,22 +1182,18 @@ def render_sidebar_context():
             use_container_width=True,
             disabled=_story_brain_update_busy(),
         ):
-            start_new_conversation()
-            goto("main", push_history=False)
+            if branch_or_start_new_conversation():
+                goto("main", push_history=False)
 
         if page2_operation_queue_busy():
-            active = st.session_state.get("page2_active_operation")
+            active = _active_operations()
             waiting = len(list(st.session_state.get("page2_operation_queue") or []))
-            if active is not None:
-                st.info(f"正在执行：{active.label}\n\n等待中：{waiting} 项")
+            if active:
+                labels = "、".join(task.label for task in active)
+                st.info(f"正在执行：{labels}\n\n等待中：{waiting} 项")
             else:
                 st.info(f"队列等待启动：{waiting} 项")
 
-        record_id = str(st.session_state.get("page2_record_id", "") or "")
-        if record_id:
-            st.caption("记录 ID: " + record_id)
-
-        st.divider()
         st.subheader("上下文设置")
         ctx = page2_service.load_context_from_settings()
 
@@ -1094,7 +1244,6 @@ def render_sidebar_context():
 
         with st.container(border=True):
             is_guest = _chat_scope() == "guest"
-            system_prompt = ctx.system_prompt
             if st.button(
                 "查看 System Prompt" if is_guest else "查看 / 编辑 System Prompt",
                 use_container_width=True,
@@ -1124,13 +1273,25 @@ def render_sidebar_context():
                 format_func=lambda item: CHAT_MODEL_LABELS.get(item, item),
                 key="page2_sidebar_selected_chat_model",
             )
+            chat_reasoning_supported = chat_model_supports_reasoning(
+                selected_chat_model
+            )
+            if not chat_reasoning_supported:
+                st.session_state.pop("page2_sidebar_chat_reasoning", None)
             chat_reasoning = st.selectbox(
                 "聊天模型思考",
                 options=["开思考", "关思考"],
-                index=0 if ctx.chat_reasoning_enabled else 1,
+                index=(
+                    0
+                    if ctx.chat_reasoning_enabled and chat_reasoning_supported
+                    else 1
+                ),
                 key="page2_sidebar_chat_reasoning",
                 label_visibility="collapsed",
+                disabled=not chat_reasoning_supported,
             )
+            if not chat_reasoning_supported:
+                st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
             story_brain_update_models = list(page2_service.STORY_BRAIN_UPDATE_MODELS)
             if (
                 st.session_state.get("page2_sidebar_story_brain_update_model")
@@ -1149,13 +1310,26 @@ def render_sidebar_context():
                 ),
                 key="page2_sidebar_story_brain_update_model",
             )
+            story_brain_reasoning_supported = chat_model_supports_reasoning(
+                story_brain_update_model
+            )
+            if not story_brain_reasoning_supported:
+                st.session_state.pop("page2_sidebar_story_brain_reasoning", None)
             story_brain_reasoning = st.selectbox(
                 "Story Brain 思考",
                 options=["开思考", "关思考"],
-                index=0 if ctx.story_brain_reasoning_enabled else 1,
+                index=(
+                    0
+                    if ctx.story_brain_reasoning_enabled
+                    and story_brain_reasoning_supported
+                    else 1
+                ),
                 key="page2_sidebar_story_brain_reasoning",
                 label_visibility="collapsed",
+                disabled=not story_brain_reasoning_supported,
             )
+            if not story_brain_reasoning_supported:
+                st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
             story_brain_turns = st.number_input(
                 "Story Brain 更新间隔",
                 min_value=1,
@@ -1199,7 +1373,10 @@ def render_sidebar_context():
                 help=manual_update_help,
             ):
                 ctx.story_brain_update_model = story_brain_update_model
-                ctx.story_brain_reasoning_enabled = story_brain_reasoning == "开思考"
+                ctx.story_brain_reasoning_enabled = (
+                    story_brain_reasoning_supported
+                    and story_brain_reasoning == "开思考"
+                )
                 ctx.story_brain_turns = int(story_brain_turns)
                 page2_service.save_context_to_settings(ctx)
                 st.session_state["page2_story_brain_short_update_notice"] = ""
@@ -1238,40 +1415,27 @@ def render_sidebar_context():
             key="page2_sidebar_unexpected_event_threshold",
         )
 
-        if st.button(
-            "确认",
-            type="primary",
-            use_container_width=True,
-            key="page2_sidebar_confirm_btn",
-            disabled=_story_brain_update_busy(),
-        ):
-            if _chat_scope() != "guest":
-                ctx.system_prompt = system_prompt
-            ctx.context_turn_count = int(context_turn_count)
-            ctx.selected_chat_model = selected_chat_model
-            ctx.chat_reasoning_enabled = chat_reasoning == "开思考"
-            ctx.story_brain_update_model = story_brain_update_model
-            ctx.story_brain_reasoning_enabled = story_brain_reasoning == "开思考"
-            ctx.story_brain_turns = int(story_brain_turns)
-            ctx.unexpected_event_enabled = bool(unexpected_event_enabled)
-            ctx.unexpected_event_threshold = int(unexpected_event_threshold)
-            ctx.temperature = float(temperature)
-            page2_service.save_context_to_settings(ctx)
-            if _chat_scope() != "guest":
-                synced_record = system_prompts.update_selected_prompt(
-                    prompt_state,
-                    ctx.system_prompt,
-                )
-                if synced_record is not None:
-                    st.session_state[
-                        f"system_prompt_body_{synced_record.id}"
-                    ] = synced_record.prompt
-            if str(st.session_state.get("page2_record_id", "") or "") or _conversation_started(
-                st.session_state.page2_turns
-            ):
-                _upsert_record()
-            st.success("设置已保存")
-            st.rerun()
+        context_changed = _apply_sidebar_context_values(
+            ctx,
+            context_turn_count=context_turn_count,
+            selected_chat_model=selected_chat_model,
+            chat_reasoning=chat_reasoning,
+            story_brain_update_model=story_brain_update_model,
+            story_brain_reasoning=story_brain_reasoning,
+            story_brain_turns=story_brain_turns,
+            temperature=temperature,
+            unexpected_event_enabled=unexpected_event_enabled,
+            unexpected_event_threshold=unexpected_event_threshold,
+        )
+        if context_changed:
+            try:
+                page2_service.save_context_to_settings(ctx)
+            except Exception as exc:
+                st.error("设置自动保存失败：" + user_facing_error_message(exc))
+            else:
+                st.success("设置已自动保存")
+        else:
+            st.caption("修改后自动保存")
 
         if str(st.session_state.get("page2_record_id", "") or "") or _conversation_started(
             st.session_state.page2_turns
@@ -1375,25 +1539,34 @@ def _is_resend_command(text: str) -> bool:
 
 
 def _queue_resend(*, ctx, story_brain_enabled: bool) -> bool:
-    if page2_operation_queue_busy() or _chat_edit_active():
-        st.session_state["page2_operation_error"] = "后台任务执行或消息编辑中，请完成后再重发。"
+    if _chat_edit_active():
+        st.session_state["page2_operation_error"] = "消息编辑中，请完成后再重发。"
         return False
     turns = list(st.session_state.page2_turns)
-    if not turns or not str(turns[-1].user_message or "").strip():
+    waiting_for_message = _operation_kind_busy("chat")
+    if (
+        (not turns or not str(turns[-1].user_message or "").strip())
+        and not waiting_for_message
+    ):
         st.session_state["page2_operation_error"] = "没有可重发的上一轮用户消息。"
         return False
-    if turns[-1].is_loading:
+    if turns and turns[-1].is_loading and not waiting_for_message:
         st.session_state["page2_operation_error"] = "上一轮尚未结束，请等待完成后再重发。"
         return False
     _enqueue_operation("resend", "重发上一轮（成功后替换）", {
-        "ctx": ctx, "story_brain_enabled": story_brain_enabled, "target_turn_id": turns[-1].id,
-    })
+        "ctx": ctx,
+        "story_brain_enabled": story_brain_enabled,
+        # If an earlier chat/resend is queued, resolve the latest turn only when
+        # this task reaches the front so queue order remains authoritative.
+        "target_turn_id": "" if waiting_for_message else turns[-1].id,
+    }, allow_same_kind=True)
     return True
 
 
 def _prepare_resend_operation(task: _Page2OperationTask):
     turns = deepcopy(list(st.session_state.page2_turns))
-    if not turns or turns[-1].id != task.payload.get("target_turn_id"):
+    target_turn_id = str(task.payload.get("target_turn_id", "") or "")
+    if not turns or (target_turn_id and turns[-1].id != target_turn_id):
         raise ValueError("上一轮消息已变化，未执行重发。")
     original = turns[-1]
     if original.is_loading or not str(original.user_message or "").strip():
@@ -1502,6 +1675,22 @@ def _prepare_chat_operation(task: _Page2OperationTask):
     )
 
 
+def _queue_chat_message(
+    *, ctx, user_text: str, hide_user_message: bool, story_brain_enabled: bool
+) -> _Page2OperationTask:
+    return _enqueue_operation(
+        "chat",
+        "发送消息",
+        {
+            "ctx": ctx,
+            "user_text": str(user_text or ""),
+            "hide_user_message": bool(hide_user_message),
+            "story_brain_enabled": bool(story_brain_enabled),
+        },
+        allow_same_kind=True,
+    )
+
+
 def _prepare_story_brain_operation(task: _Page2OperationTask):
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     turns_snapshot = list(st.session_state.page2_turns)
@@ -1562,15 +1751,20 @@ def _prepare_story_brain_operation(task: _Page2OperationTask):
 
 def _prepare_image_prompt_operation(task: _Page2OperationTask):
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
-    task.meta["image_prompt_source"] = latest_image_prompt_source(list(st.session_state.page2_turns))
-    conversation_text = page2_service.build_recent_image_prompt_conversation(
-        st.session_state.page2_turns,
+    turns_snapshot = list(st.session_state.page2_turns)
+    task.meta["image_prompt_source"] = latest_image_prompt_source(turns_snapshot)
+    task.meta["previous_image_prompt"] = str(st.session_state.get("page2_image_prompt") or "")
+    story_brain_short = _current_short_story_brain()
+    story_brain_enabled = bool(
+        st.session_state.get("page2_story_brain_enabled", True)
     )
     mode = str(task.payload.get("mode", "normal") or "normal")
     subject = str(task.payload.get("subject", "") or "")
     return lambda: page2_service.generate_image_prompt(
-        conversation_text,
         ctx=ctx,
+        turns=turns_snapshot,
+        story_brain_short=story_brain_short,
+        story_brain_enabled=story_brain_enabled,
         mode=mode,
         subject=subject,
     )
@@ -1591,11 +1785,13 @@ def _prepare_image_operation(task: _Page2OperationTask):
     provider = str(task.payload.get("provider", "") or "")
     image_urls = list(task.payload.get("image_urls") or [])
     aspect_ratio = task.payload.get("aspect_ratio", page2_service.IMAGE_ASPECT_RATIO)
+    refiner_prompt = str(task.payload.get("refiner_prompt", "") or "")
     return lambda: page2_service.generate_image(
         provider=provider,
         prompt=prompt,
         image_urls=image_urls,
         aspect_ratio=aspect_ratio,
+        refiner_prompt=refiner_prompt,
     )
 
 
@@ -1634,17 +1830,18 @@ def _prepare_video_prompt_operation(task: _Page2OperationTask):
 
 
 def _prepare_video_operation(task: _Page2OperationTask):
-    source = _video_operation_source(task)
+    source = deepcopy(_video_operation_source(task))
 
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     prompt = str(task.payload.get("prompt", "") or "")
     seconds = task.payload.get("seconds", 5)
+    generate_audio = bool(task.payload.get("generate_audio", True))
     return lambda: page2_service.generate_video_from_image(
         ctx=ctx,
         source_record=source,
         prompt=prompt,
         seconds=seconds,
-        generate_audio=bool(task.payload.get("generate_audio", True)),
+        generate_audio=generate_audio,
     )
 
 
@@ -1747,11 +1944,17 @@ def _apply_operation(task: _Page2OperationTask) -> None:
     if task.error is not None:
         raise task.error
     if task.kind == "image_prompt":
-        st.session_state.page2_image_prompt = str(task.result or "")
+        prompt = str(task.result or "")
         source = dict(task.meta.get("image_prompt_source") or {})
-        st.session_state.page2_image_prompt_source = source
+        if str(st.session_state.get("page2_image_prompt") or "") == task.meta.get(
+            "previous_image_prompt", str(st.session_state.get("page2_image_prompt") or "")
+        ):
+            st.session_state.page2_image_prompt = prompt
+            st.session_state.page2_image_prompt_source = source
+        else:
+            task.meta["completion_notice"] = "；已保留你修改的图片 prompt，后续生图使用本次生成结果。"
         outputs = dict(st.session_state.get("page2_operation_outputs") or {})
-        outputs[task.id] = st.session_state.page2_image_prompt
+        outputs[task.id] = prompt
         outputs[task.id + ":source"] = source
         st.session_state["page2_operation_outputs"] = outputs
         return
@@ -1764,23 +1967,31 @@ def _apply_operation(task: _Page2OperationTask) -> None:
         _save_image_video_field(source.id, "video_prompt", str(task.result or ""))
         return
     if task.kind in {"image", "video"}:
+        if task.meta.get("media_applied"):
+            return
         record = task.result
         if task.kind == "image":
             source = dict(task.meta.get("image_prompt_source") or {})
             record.source_turn_id = str(source.get("source_turn_id") or "")
             record.previous_source_turn_id = str(source.get("previous_source_turn_id") or "")
             record.video_prompt = str(task.payload.get("pending_video_prompt") or "")
-            st.session_state["page2_pending_video_source"] = record.id
-        st.session_state.page2_generated_media = list(
-            st.session_state.page2_generated_media
-        ) + [record]
-        st.session_state.page2_selected_media_id = record.id
-        st.session_state.page2_pending_media_record_select = record.id
+        previous_media = list(st.session_state.page2_generated_media)
+        st.session_state.page2_generated_media = previous_media + [record]
+        try:
+            _upsert_record()
+        except Exception:
+            st.session_state.page2_generated_media = previous_media
+            raise
         outputs = dict(st.session_state.get("page2_operation_outputs") or {})
         outputs[task.id] = record.id
         st.session_state["page2_operation_outputs"] = outputs
-        url_favorites.clear_preview_url("page2")
-        _upsert_record()
+        if task.kind == "image":
+            _select_media_preview(record.id)
+        else:
+            st.session_state["page2_media_completions"] = list(
+                st.session_state.get("page2_media_completions") or []
+            ) + [{"task_id": task.id, "media_id": record.id, "kind": task.kind}]
+        task.meta["media_applied"] = True
         return
     raise ValueError("未知队列操作：" + task.kind)
 
@@ -1789,9 +2000,82 @@ def _dismiss_operation_error() -> None:
     st.session_state["page2_operation_error"] = ""
 
 
+def _operation_waiting_for_dependency(task: _Page2OperationTask) -> bool:
+    pending_ids = {item.id for item in _pending_operations()}
+    outputs = st.session_state.get("page2_operation_outputs") or {}
+    return any(
+        task.payload.get(key) in pending_ids and task.payload.get(key) not in outputs
+        for key in ("prompt_operation_id", "image_operation_id")
+    )
+
+
+def _clear_active_operation(task: _Page2OperationTask) -> None:
+    if st.session_state.get("page2_active_operation") is task:
+        st.session_state["page2_active_operation"] = None
+    media = dict(st.session_state.get("page2_active_media_operations") or {})
+    st.session_state["page2_active_media_operations"] = {
+        lane: item for lane, item in media.items() if item is not task
+    }
+
+
+def _advance_operation_queues() -> bool:
+    """Three independent request lanes; all state writes happen on the script thread."""
+    changed = False
+    for task in _active_operations():
+        if not task.is_done():
+            continue
+        try:
+            if task.scope_id != _operation_scope_id():
+                raise RuntimeError("当前记录已变更，未写入旧任务结果。")
+            _apply_operation(task)
+            if task.error is not None:
+                raise task.error
+            st.session_state["page2_operation_notice"] = f"已完成：{task.label}" + str(
+                task.meta.get("completion_notice") or task.meta.get("memory_notice") or ""
+            )
+        except Exception as exc:
+            message = f"{task.label}失败，其他任务将继续：" + user_facing_error_message(exc)
+            previous = str(st.session_state.get("page2_operation_error") or "")
+            st.session_state["page2_operation_error"] = "\n\n".join(filter(None, [previous, message]))
+        finally:
+            _clear_active_operation(task)
+        changed = True
+
+    occupied = {_operation_lane(task) for task in _active_operations()}
+    queue = list(st.session_state.get("page2_operation_queue") or [])
+    for task in list(queue):
+        lane = _operation_lane(task)
+        if lane in occupied or _operation_waiting_for_dependency(task):
+            continue
+        # Skip unresolved dependencies, preserving order among ready tasks in
+        # each lane. In particular, a video prompt awaiting an image must not
+        # block the chat or image prompt needed to finish that image.
+        queue.remove(task)
+        st.session_state["page2_operation_queue"] = list(queue)
+        if lane == "chat":
+            st.session_state["page2_active_operation"] = task
+        else:
+            media = dict(st.session_state.get("page2_active_media_operations") or {})
+            media[lane] = task
+            st.session_state["page2_active_media_operations"] = media
+        occupied.add(lane)
+        changed = True
+
+    for task in _active_operations():
+        if task.is_started():
+            continue
+        try:
+            task.start(_prepare_operation(task))
+        except Exception as exc:
+            task.fail_before_start(exc)
+        changed = True
+    return changed
+
+
 @st.fragment(run_every=1)
 def _render_operation_queue_status() -> None:
-    """串行启动队首任务，并在主线程完成结果写回。"""
+    if _advance_operation_queues():
+        st.rerun()
     error = str(st.session_state.get("page2_operation_error", "") or "")
     if error:
         st.error(error)
@@ -1800,54 +2084,24 @@ def _render_operation_queue_status() -> None:
             key="page2_dismiss_operation_error",
             on_click=_dismiss_operation_error,
         )
-    active = st.session_state.get("page2_active_operation")
+    active = _active_operations()
     queue = list(st.session_state.get("page2_operation_queue") or [])
-    if active is None and queue:
-        active = queue.pop(0)
-        st.session_state["page2_active_operation"] = active
-        st.session_state["page2_operation_queue"] = queue
-
-    if active is None:
+    if not active and not queue:
         notice = str(st.session_state.pop("page2_operation_notice", "") or "")
         if notice and not error:
             st.success(notice)
         return
 
-    if not active.is_started():
-        try:
-            fn = _prepare_operation(active)
-            active.start(fn)
-        except Exception as exc:
-            active.fail_before_start(exc)
-        st.rerun()
-
-    if not active.is_done():
-        waiting = len(list(st.session_state.get("page2_operation_queue") or []))
-        suffix = f"；后面还有 {waiting} 项等待" if waiting else ""
-        st.info(f"正在执行：{active.label}{suffix}")
-        if active.kind == "resend" and active.meta.get("memory_notice"):
-            st.warning(active.meta["memory_notice"])
-        return
-
-    try:
-        _apply_operation(active)
-        if active.error is None:
-            st.session_state["page2_operation_notice"] = f"已完成：{active.label}" + (
-                str(active.meta.get("memory_notice", "")) if active.kind == "resend" else ""
-            )
-        elif active.kind == "chat":
-            st.session_state["page2_operation_error"] = (
-                f"{active.label}失败，队列将继续："
-                + user_facing_error_message(active.error)
-            )
-    except Exception as exc:
-        st.session_state["page2_operation_error"] = (
-            f"{active.label}失败，队列将继续："
-            + user_facing_error_message(exc)
-        )
-    finally:
-        st.session_state["page2_active_operation"] = None
-    st.rerun()
+    names = {"chat": "聊天 / 提示词", "image": "图片", "video": "视频"}
+    for task in active:
+        waiting = sum(_operation_lane(item) == _operation_lane(task) for item in queue)
+        suffix = f"；还有 {waiting} 项等待" if waiting else ""
+        st.info(f"{names[_operation_lane(task)]}：正在执行{task.label}{suffix}")
+        if task.kind == "resend" and task.meta.get("memory_notice"):
+            st.warning(task.meta["memory_notice"])
+    for task in queue:
+        if _operation_waiting_for_dependency(task):
+            st.caption(f"{task.label}：等待前置任务完成")
 
 
 def _render_chat_column():
@@ -1899,7 +2153,7 @@ def _render_chat_column():
                     )
             if scroll_to_bottom_request:
                 with st.container(key="page2_chat_scroll_trigger"):
-                    components.html(
+                    st.iframe(
                         f"""
                         <script>
                           (() => {{
@@ -1921,7 +2175,7 @@ def _render_chat_column():
                           }})();
                         </script>
                         """,
-                        height=0,
+                        height=1,
                     )
 
         input_placeholder = (
@@ -1935,14 +2189,14 @@ def _render_chat_column():
                 key="page2_chat_input",
                 disabled=chat_edit_active,
             )
-            _render_empty_space_submit_bridge(send_disabled=chat_busy or chat_edit_active)
+            _render_empty_space_submit_bridge(send_disabled=chat_edit_active)
             dice_clicked = st.button(
                 "",
                 key="page2_chat_dice_btn",
                 help="掷一次 0–24 点骰子并直接发送",
                 icon=":material/casino:",
                 type="tertiary",
-                disabled=chat_edit_active or _operation_kind_busy("chat"),
+                disabled=chat_edit_active,
             )
 
     if dice_clicked:
@@ -1997,7 +2251,7 @@ def _render_chat_column():
         _queue_resend(ctx=ctx, story_brain_enabled=story_brain_enabled)
         st.rerun()
 
-    if user_text is None or chat_busy or chat_edit_active:
+    if user_text is None or chat_edit_active:
         return
 
     submitted_text = str(user_text)
@@ -2007,15 +2261,11 @@ def _render_chat_column():
     )
     if not current_text:
         return
-    _enqueue_operation(
-        "chat",
-        "发送消息",
-        {
-            "ctx": ctx,
-            "user_text": current_text,
-            "hide_user_message": hide_user_message,
-            "story_brain_enabled": story_brain_enabled,
-        },
+    _queue_chat_message(
+        ctx=ctx,
+        user_text=current_text,
+        hide_user_message=hide_user_message,
+        story_brain_enabled=story_brain_enabled,
     )
 
 
@@ -2033,18 +2283,115 @@ def _save_image_prompt_field(widget_key: str, state_key: str) -> None:
         st.session_state.page2_image_prompt_source = {}
 
 
+def _queue_image_generation(
+    *,
+    provider: str,
+    prompt: str,
+    image_urls: list[str],
+    aspect_ratio: str,
+    mode: str,
+    subject: str,
+    refiner_prompt: str = "",
+) -> _Page2OperationTask:
+    """Generate a missing prompt first, then make the image from that exact result."""
+    prompt_text = str(prompt or "")
+    prompt_dependency = None
+    if not prompt_text.strip():
+        prompt_dependency = _enqueue_operation(
+            "image_prompt",
+            "生成图片 prompt",
+            {"mode": mode, "subject": subject},
+            allow_same_kind=True,
+        )
+    return _enqueue_operation(
+        "image",
+        "生成图片",
+        {
+            "provider": provider,
+            "prompt": prompt_text,
+            "image_urls": list(image_urls or []),
+            "aspect_ratio": aspect_ratio,
+            "refiner_prompt": str(refiner_prompt or ""),
+            "prompt_operation_id": (
+                prompt_dependency.id if prompt_dependency is not None else ""
+            ),
+            "image_prompt_source": (
+                {}
+                if prompt_dependency is not None
+                else dict(
+                    st.session_state.get("page2_image_prompt_source")
+                    or latest_image_prompt_source(list(st.session_state.page2_turns))
+                )
+            ),
+        },
+        allow_same_kind=True,
+    )
+
+
 def _find_video_source(source_id: str):
     return next((item for item in st.session_state.page2_generated_media
                  if item.id == source_id and item.media_kind == GeneratedMediaKind.IMAGE), None)
 
 
-def _activate_media_selection() -> None:
+def _media_selectbox_key() -> str:
+    nonce = int(st.session_state.get("page2_media_selection_nonce", 0))
+    return "page2_media_record_select" + (f"_{nonce}" if nonce else "")
+
+
+def _activate_media_selection(selectbox_key: str = "page2_media_record_select") -> None:
+    if selectbox_key != _media_selectbox_key():
+        return  # Ignore delayed events from the selector replaced by View.
     url_favorites.activate_generated_media_selection(
-        "page2", "page2_selected_media_id", "page2_media_record_select",
+        "page2", "page2_selected_media_id", selectbox_key,
     )
-    source_id = st.session_state.get("page2_media_record_select", "")
+    source_id = st.session_state.get(selectbox_key, "")
     if _find_video_source(source_id) is not None:
         st.session_state["page2_pending_video_source"] = source_id
+
+
+def _dismiss_media_completion(task_id: str) -> None:
+    st.session_state["page2_media_completions"] = [
+        item for item in st.session_state.get("page2_media_completions", [])
+        if item["task_id"] != task_id
+    ]
+
+
+def _select_media_preview(media_id: str) -> bool:
+    if any(item.id == media_id for item in st.session_state.page2_generated_media):
+        st.session_state.page2_selected_media_id = media_id
+        st.session_state.page2_pending_media_record_select = media_id
+        # A fresh widget identity prevents an in-flight old selection event
+        # from undoing a preview change during a fragment rerun.
+        st.session_state["page2_media_selection_nonce"] = int(
+            st.session_state.get("page2_media_selection_nonce", 0)
+        ) + 1
+        url_favorites.clear_preview_url("page2")
+        return True
+    return False
+
+
+def _view_completed_media(task_id: str, media_id: str) -> None:
+    if _select_media_preview(media_id):
+        if _find_video_source(media_id) is not None:
+            st.session_state["page2_pending_video_source"] = media_id
+    _dismiss_media_completion(task_id)
+
+
+def _render_media_completions() -> None:
+    media_ids = {item.id for item in st.session_state.page2_generated_media}
+    for item in list(st.session_state.get("page2_media_completions") or []):
+        if item["media_id"] not in media_ids:
+            _dismiss_media_completion(item["task_id"])
+            continue
+        message, view, dismiss = st.columns([4, 1, 1])
+        with message:
+            st.success("图片生成完成" if item["kind"] == "image" else "视频生成完成")
+        with view:
+            st.button("查看", key="page2_view_completed_" + item["task_id"],
+                      on_click=_view_completed_media, args=(item["task_id"], item["media_id"]))
+        with dismiss:
+            st.button("关闭", key="page2_dismiss_completed_" + item["task_id"],
+                      on_click=_dismiss_media_completion, args=(item["task_id"],))
 
 
 def _save_image_video_field(source_id: str, field: str, text: str) -> None:
@@ -2068,8 +2415,9 @@ def _save_video_prompt_field(source_id: str, image_task_id: str) -> None:
         except Exception as exc:
             st.session_state.page2_operation_error = "视频 prompt 保存失败：" + user_facing_error_message(exc)
     elif image_task_id:
-        task = _latest_earlier_operation("image")
-        if task is not None and task.id == image_task_id:
+        task = next((item for item in _pending_operations()
+                     if item.kind == "image" and item.id == image_task_id), None)
+        if task is not None:
             task.payload["pending_video_prompt"] = text
 
 
@@ -2077,19 +2425,22 @@ def _close_video_story_dialog() -> None:
     st.session_state.pop("page2_video_story_dialog", None)
 
 
-@st.dialog("补录图片对应的故事", on_dismiss=_close_video_story_dialog)
+@st.dialog("补录图片对应的故事", on_dismiss=_close_video_story_dialog, dismissible=False)
 def _render_video_story_dialog(source_id: str) -> None:
     source = _find_video_source(source_id)
     if source is None:
         st.error("这张图片已不存在。")
         return
     st.caption("对应图片：" + (source.prompt[:80] or "未保存图片 prompt"))
+    story_key = f"page2_video_story_input_{source_id}"
+    prompt_draft_guard.protect(story_key, source.video_story_text, "视频来源故事")
     text = st.text_area(
         "粘贴对应那一轮的助手故事正文",
         value=source.video_story_text, height=220,
-        key=f"page2_video_story_input_{source_id}",
+        key=story_key,
     )
     st.caption("仅保存为这张图片的故事来源，不会添加或修改聊天记录。")
+    prompt_draft_guard.save_action("page2_save_video_story", story_key)
     if st.button("保存故事", key="page2_save_video_story", disabled=page2_operation_queue_busy()):
         if not str(text or "").strip():
             st.error("请先粘贴助手的故事正文。")
@@ -2099,6 +2450,7 @@ def _render_video_story_dialog(source_id: str) -> None:
         except Exception as exc:
             _show_error(exc)
             return
+        prompt_draft_guard.saved(story_key)
         st.session_state.page2_video_story_toast = None
         _close_video_story_dialog()
         st.session_state.page2_operation_error = ""
@@ -2127,37 +2479,45 @@ def _render_video_story_toast() -> None:
 def _render_video_prompt_controls(media: list, video_model: str) -> None:
     render_toast_style()
     images = [item for item in media if item.media_kind == GeneratedMediaKind.IMAGE]
-    image_dependency = _latest_earlier_operation("image")
+    image_tasks = {"pending:" + task.id: task for task in _pending_operations() if task.kind == "image"}
     by_id = {item.id: item for item in images}
-    options = list(by_id)
-    pending_id = "pending:" + image_dependency.id if image_dependency is not None else ""
-    if pending_id:
-        options.append(pending_id)
+    options = list(by_id) + list(image_tasks)
+    previous_source = st.session_state.get("page2_video_source")
+    # If the user explicitly chose a pending image, keep that same input after
+    # it finishes. Unrelated completions must never choose another reference.
+    if str(previous_source or "").startswith("pending:") and previous_source not in image_tasks:
+        resolved_id = (st.session_state.get("page2_operation_outputs") or {}).get(previous_source[8:])
+        st.session_state["page2_video_source"] = resolved_id if resolved_id in by_id else None
     preferred = st.session_state.pop("page2_pending_video_source", "")
     if preferred in options:
         st.session_state["page2_video_source"] = preferred
-    elif st.session_state.get("page2_video_source") not in options:
+    elif "page2_video_source" not in st.session_state:
         selected = st.session_state.get("page2_selected_media_id", "")
-        st.session_state["page2_video_source"] = selected if selected in options else (options[-1] if options else None)
+        st.session_state["page2_video_source"] = selected if selected in options else None
+    elif st.session_state.get("page2_video_source") not in options:
+        st.session_state["page2_video_source"] = None
     selected_id = st.selectbox(
-        "选择输入图片", options=options, key="page2_video_source",
-        format_func=lambda value: "待生成的新图片（等待前面的生图任务）" if value == pending_id else (
+        "选择输入图片", options=options, key="page2_video_source", index=None,
+        format_func=lambda value: f"待生成的新图片 {list(image_tasks).index(value) + 1}（等待生图任务）" if value in image_tasks else (
             f"{by_id[value].provider} • {by_id[value].created_at} • {by_id[value].prompt[:24]}"
         ),
-        placeholder="暂无可用图片", disabled=not options,
+        placeholder="请选择输入图片" if options else "暂无可用图片", disabled=not options,
     )
     source = by_id.get(selected_id)
-    use_pending = bool(pending_id and selected_id == pending_id)
+    image_dependency = image_tasks.get(selected_id)
     source_id = source.id if source is not None else ""
-    image_task_id = image_dependency.id if use_pending else ""
+    image_task_id = image_dependency.id if image_dependency is not None else ""
     draft = source.video_prompt if source is not None else (
-        str(image_dependency.payload.get("pending_video_prompt") or "") if use_pending else ""
+        str(image_dependency.payload.get("pending_video_prompt") or "") if image_dependency is not None else ""
     )
     seconds, generate_audio = _render_video_duration_controls(video_model)
     st.session_state["_page2_video_prompt"] = draft
+    prompt_draft_guard.protect(
+        "_page2_video_prompt", draft, "视频 prompt", requires_commit=False
+    )
     prompt = st.text_area(
         "视频 prompt", key="_page2_video_prompt", height=68,
-        disabled=not options or _operation_kind_busy("video_prompt"),
+        disabled=not selected_id,
         on_change=_save_video_prompt_field, args=(source_id, image_task_id),
     )
     render_editor_sizing()
@@ -2167,7 +2527,7 @@ def _render_video_prompt_controls(media: list, video_model: str) -> None:
     label = "生视频" if kind == "video" else "生视频prompt"
     if st.button(
         label, key="page2_generate_video", use_container_width=True,
-        disabled=not options or _operation_kind_busy("video") or _operation_kind_busy("video_prompt") or _chat_edit_active(),
+        disabled=not selected_id or _chat_edit_active(),
     ):
         try:
             if kind == "video_prompt" and source is not None:
@@ -2177,10 +2537,19 @@ def _render_video_prompt_controls(media: list, video_model: str) -> None:
         except ValueError as exc:
             st.error(str(exc))
         else:
-            _enqueue_operation(kind, label, {
-                "ctx": ctx, "source_id": source_id, "image_operation_id": image_task_id,
-                "prompt": prompt, "seconds": seconds, "generate_audio": generate_audio,
-            })
+            _enqueue_operation(
+                kind,
+                label,
+                {
+                    "ctx": ctx,
+                    "source_id": source_id,
+                    "image_operation_id": image_task_id,
+                    "prompt": prompt,
+                    "seconds": seconds,
+                    "generate_audio": generate_audio,
+                },
+                allow_same_kind=True,
+            )
     if source is not None and source.video_story_text:
         if st.button("编辑补录故事", key="page2_edit_video_story", disabled=page2_operation_queue_busy()):
             st.session_state["page2_video_story_dialog"] = source.id
@@ -2191,6 +2560,7 @@ def _render_video_prompt_controls(media: list, video_model: str) -> None:
 
 
 def _render_media_column():
+    _render_media_completions()
     media = st.session_state.page2_generated_media
     url_preview = url_favorites.get_preview_url("page2")
 
@@ -2216,10 +2586,10 @@ def _render_media_column():
         desired_media_id = (
             selected_media_id
             if selected_media_id in media_ids
-            else _latest_image_media_id(media)
+            else None
         )
 
-        media_selectbox_key = "page2_media_record_select"
+        media_selectbox_key = _media_selectbox_key()
         pending_media_id = str(
             st.session_state.pop("page2_pending_media_record_select", "") or ""
         )
@@ -2232,9 +2602,12 @@ def _render_media_column():
         selected_id = st.selectbox(
             "选择记录",
             options=media_ids,
+            index=None,
+            placeholder="选择素材，或点击生成完成提示中的“查看”",
             key=media_selectbox_key,
             format_func=lambda media_id: labels_by_id.get(media_id, media_id),
             on_change=_activate_media_selection,
+            args=(media_selectbox_key,),
             label_visibility="collapsed",
         )
         st.session_state.page2_selected_media_id = selected_id
@@ -2251,6 +2624,17 @@ def _render_media_column():
                 _render_url_preview_image(url_preview)
         elif selected is not None:
             kind = selected.media_kind.value if hasattr(selected.media_kind, "value") else str(selected.media_kind)
+            if (
+                kind == GeneratedMediaKind.IMAGE.value
+                and not selected.image_data_base64
+                and (
+                    not selected.image_url_string
+                    or _image_url_is_expired(selected.image_url_string)
+                )
+            ):
+                _delete_media_record(selected.id)
+                st.warning("图片链接已失效，已从媒体记录中移除。")
+                st.rerun()
             with preview_container:
                 if kind == GeneratedMediaKind.IMAGE.value:
                     if selected.image_data_base64:
@@ -2273,8 +2657,6 @@ def _render_media_column():
                     duration = selected.duration_seconds
                     suffix = f" · {duration:g} 秒" if isinstance(duration, (int, float)) else ""
                     st.caption(f"视频 · {label}{suffix}")
-                else:
-                    st.caption(f"{kind} • provider={selected.provider}")
                 st.caption("prompt")
                 st.code(
                     str(selected.prompt or ""),
@@ -2300,24 +2682,72 @@ def _render_media_column():
                         label="视频 URL（可复制）",
                     )
 
-            if st.button(
-                "删除当前记录",
-                use_container_width=True,
-                disabled=page2_operation_queue_busy(),
-            ):
-                request_delete(
-                    "page2_generated_media",
-                    selected_id,
-                    labels_by_id.get(selected_id, "当前媒体记录"),
-                )
+            if kind == GeneratedMediaKind.IMAGE.value:
+                delete_col, save_col, download_col = st.columns(3)
+                with delete_col:
+                    if st.button(
+                        "删除",
+                        key=f"page2_delete_image_{selected.id}",
+                        use_container_width=True,
+                        disabled=page2_operation_queue_busy(),
+                    ):
+                        request_delete(
+                            "page2_generated_media",
+                            selected_id,
+                            labels_by_id.get(selected_id, "当前图片记录"),
+                        )
+                with save_col:
+                    if st.button(
+                        "保存",
+                        key=f"page2_save_image_{selected.id}",
+                        use_container_width=True,
+                        disabled=(
+                            page2_operation_queue_busy()
+                            or bool(selected.image_data_base64)
+                            or not bool(selected.image_url_string)
+                        ),
+                        help="把图片转为 Base64 保存到当前聊天记录。",
+                    ):
+                        try:
+                            with st.spinner("正在保存图片…"):
+                                _save_image_record(selected)
+                            st.success("图片已保存到当前聊天记录。")
+                            st.rerun()
+                        except Exception as exc:
+                            _show_error(exc)
+                with download_col:
+                    image_bytes = (
+                        _decode_image_base64(selected.image_data_base64)
+                        if selected.image_data_base64
+                        else partial(download_image_bytes, selected.image_url_string)
+                    )
+                    suffix = _image_download_suffix(selected.image_url_string)
+                    st.download_button(
+                        "下载",
+                        data=image_bytes,
+                        file_name=f"image-{selected.id}{suffix}",
+                        mime={
+                            ".jpg": "image/jpeg",
+                            ".webp": "image/webp",
+                            ".gif": "image/gif",
+                        }.get(suffix, "image/png"),
+                        key=f"page2_download_image_{selected.id}",
+                        use_container_width=True,
+                        on_click="ignore",
+                    )
+            else:
+                if st.button(
+                    "删除当前记录",
+                    use_container_width=True,
+                    disabled=page2_operation_queue_busy(),
+                ):
+                    request_delete(
+                        "page2_generated_media",
+                        selected_id,
+                        labels_by_id.get(selected_id, "当前媒体记录"),
+                    )
 
-            def _delete_media(record_id: str) -> None:
-                st.session_state.page2_generated_media = [
-                    item for item in st.session_state.page2_generated_media if item.id != record_id
-                ]
-                _upsert_record()
-
-            render_delete_confirmation("page2_generated_media", _delete_media)
+            render_delete_confirmation("page2_generated_media", _delete_media_record)
 
     st.divider()
     st.subheader("生成图片")
@@ -2339,8 +2769,14 @@ def _render_media_column():
         args=("_page2_image_prompt_mode", "page2_image_prompt_mode"),
     )
     subject = ""
-    if mode in ["first_person", "closeup"]:
+    if mode == "closeup":
         st.session_state["_page2_image_prompt_subject"] = st.session_state.page2_image_prompt_subject
+        prompt_draft_guard.protect(
+            "_page2_image_prompt_subject",
+            st.session_state.page2_image_prompt_subject,
+            "图片 prompt 主体",
+            requires_commit=False,
+        )
         subject = st.text_input(
             "主体",
             key="_page2_image_prompt_subject",
@@ -2351,18 +2787,22 @@ def _render_media_column():
     if st.button(
         "生成图片prompt",
         use_container_width=True,
-        disabled=(
-            _operation_kind_busy("image_prompt")
-            or (not image_prompt_conversation and not _has_earlier_operation("chat"))
-        ),
+        disabled=(not image_prompt_conversation and not _has_earlier_operation("chat")),
     ):
         _enqueue_operation(
             "image_prompt",
             "生成图片 prompt",
             {"mode": mode, "subject": subject},
+            allow_same_kind=True,
         )
 
     st.session_state["_page2_image_prompt"] = st.session_state.page2_image_prompt
+    prompt_draft_guard.protect(
+        "_page2_image_prompt",
+        st.session_state.page2_image_prompt,
+        "图片 prompt",
+        requires_commit=False,
+    )
     prompt_text = st.text_area(
         "图片prompt（可编辑）",
         key="_page2_image_prompt",
@@ -2373,9 +2813,32 @@ def _render_media_column():
 
     provider = st.selectbox(
         "图片生成 provider",
-        options=["grok", "grokpro2k", "grokPro", "flux", "nanoPro", "nano"],
+        options=[
+            "grok", "grokpro2k", "grokPro", "flux", "nanoPro", "nano",
+            page2_service.ANILLUSTRIOUS_PROVIDER,
+            page2_service.WAI_ILLUSTRIOUS_PROVIDER,
+        ],
         index=0,
     )
+    refiner_prompt = ""
+    if provider == page2_service.ANILLUSTRIOUS_PROVIDER:
+        st.session_state["_page2_refiner_prompt"] = (
+            st.session_state.page2_refiner_prompt
+        )
+        prompt_draft_guard.protect(
+            "_page2_refiner_prompt",
+            st.session_state.page2_refiner_prompt,
+            "refiner prompt",
+            requires_commit=False,
+        )
+        refiner_prompt = st.text_area(
+            "refiner",
+            key="_page2_refiner_prompt",
+            height=100,
+            placeholder="留空则关闭 refiner；填写后作为 refiner_prompt 发送",
+            on_change=_save_image_prompt_field,
+            args=("_page2_refiner_prompt", "page2_refiner_prompt"),
+        )
     saved_ratios = settings.get(AppStorageKeys.PAGE2_IMAGE_ASPECT_RATIOS, {})
     saved_ratios = dict(saved_ratios) if isinstance(saved_ratios, dict) else {}
     saved_ratio = saved_ratios.get(provider, page2_service.IMAGE_ASPECT_RATIO)
@@ -2390,30 +2853,35 @@ def _render_media_column():
     if aspect_ratio != saved_ratio:
         saved_ratios[provider] = aspect_ratio
         settings.set(AppStorageKeys.PAGE2_IMAGE_ASPECT_RATIOS, saved_ratios)
-    image_urls_raw = st.text_area("参考图片 URL（每行一个，可选）", value="", height=90)
-    image_urls = [line.strip() for line in image_urls_raw.splitlines() if line.strip()]
+    if provider in {
+        page2_service.ANILLUSTRIOUS_PROVIDER,
+        page2_service.WAI_ILLUSTRIOUS_PROVIDER,
+    }:
+        st.caption(f"{provider} 仅支持文生图，不支持参考图片 URL。")
+        image_urls = []
+    else:
+        image_urls_raw = st.text_area("参考图片 URL（每行一个，可选）", value="", height=90)
+        image_urls = [line.strip() for line in image_urls_raw.splitlines() if line.strip()]
 
     if st.button(
         "生成图片",
         type="primary",
         use_container_width=True,
-        disabled=_operation_kind_busy("image"),
+        disabled=(
+            not str(prompt_text or "").strip()
+            and not image_prompt_conversation
+            and not _has_earlier_operation("chat")
+            and not _has_earlier_operation("image_prompt")
+        ),
     ):
-        prompt_dependency = _latest_earlier_operation("image_prompt")
-        _enqueue_operation(
-            "image",
-            "生成图片",
-            {
-                "provider": provider,
-                "prompt": prompt_text,
-                "image_urls": image_urls,
-                "aspect_ratio": aspect_ratio,
-                "prompt_operation_id": prompt_dependency.id if prompt_dependency else "",
-                "image_prompt_source": dict(
-                    st.session_state.get("page2_image_prompt_source")
-                    or latest_image_prompt_source(list(st.session_state.page2_turns))
-                ),
-            },
+        _queue_image_generation(
+            provider=provider,
+            prompt=prompt_text,
+            image_urls=image_urls,
+            aspect_ratio=aspect_ratio,
+            mode=mode,
+            subject=subject,
+            refiner_prompt=refiner_prompt,
         )
 
     st.divider()

@@ -23,7 +23,8 @@ CONTENT_URL = "https://openrouter.ai/api/v1/videos/job-1/content?index=0"
 
 def response(data=None, status=200, headers=None, content=b"video-with-audio"):
     return Mock(status_code=status, text=json.dumps(data), json=Mock(return_value=data),
-                headers=headers or {}, iter_content=Mock(return_value=[content]))
+                headers=headers or {}, content=content,
+                iter_content=Mock(return_value=[content]))
 
 
 class VideoGenerationTests(unittest.TestCase):
@@ -221,6 +222,123 @@ page2._render_video_preview(record)
             app.run()
             fetch.assert_called_once()
             self.assertEqual(len(app.exception), 0)
+
+
+class ImagePersistenceTests(unittest.TestCase):
+    def test_image_download_and_expiry_probe(self):
+        image = response(status=200, content=b"image-bytes")
+        with patch.object(media_clients.requests, "get", return_value=image):
+            self.assertEqual(
+                media_clients.download_image_bytes("https://example.com/image.png"),
+                b"image-bytes",
+            )
+
+        for status, expected in ((200, False), (403, True), (404, True), (410, True), (503, False)):
+            with self.subTest(status=status):
+                result = response(status=status)
+                with patch.object(media_clients.requests, "get", return_value=result):
+                    self.assertEqual(
+                        media_clients.image_url_is_expired("https://example.com/image.png"),
+                        expected,
+                    )
+                result.close.assert_called_once()
+
+    def test_save_and_delete_image_record(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        selected = GeneratedImageRecord(
+            id="image-1", provider="nanoPro", prompt="forest",
+            image_url_string="https://example.com/image.png",
+        )
+        other = GeneratedImageRecord(id="image-2", provider="nanoPro", prompt="other")
+        session = SessionState(
+            page2_generated_media=[selected, other],
+            page2_selected_media_id="image-1",
+        )
+        with patch.object(page2.st, "session_state", session), \
+             patch.object(page2, "download_url_as_base64", return_value="aW1hZ2U="), \
+             patch.object(page2, "_upsert_record") as upsert:
+            page2._save_image_record(selected)
+            self.assertEqual(selected.image_data_base64, "aW1hZ2U=")
+            upsert.assert_called_once()
+
+            upsert.reset_mock()
+            page2._delete_media_record(selected.id)
+            self.assertEqual(session.page2_generated_media, [other])
+            self.assertEqual(session.page2_selected_media_id, "")
+            upsert.assert_called_once()
+
+    def test_image_media_ui_has_three_actions_without_provider_caption(self):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_string('''
+import streamlit as st
+from unittest.mock import patch
+from app.models import GeneratedImageRecord
+from web.pages import page2
+
+page2._ensure_state()
+if not st.session_state.get("fixture_initialized"):
+    st.session_state.fixture_initialized = True
+    st.session_state.page2_generated_media = [GeneratedImageRecord(
+        id="image-1", provider="nanoPro", prompt="forest",
+        image_url_string="https://example.com/image.png",
+    )]
+    st.session_state.page2_selected_media_id = "image-1"
+with patch.object(page2, "_image_url_is_expired", return_value=False), \
+     patch.object(page2, "download_url_as_base64", return_value="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), \
+     patch.object(page2, "_upsert_record"), \
+     patch.object(page2.url_favorites, "get_preview_url", return_value=""):
+    page2._render_media_column()
+''').run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(button.label == "删除" for button in app.button))
+        self.assertTrue(any(button.label == "保存" for button in app.button))
+        self.assertEqual(len(app.get("download_button")), 1)
+        captions = [caption.value for caption in app.caption]
+        self.assertNotIn("image • provider=nanoPro", captions)
+
+        app.button(key="page2_save_image_image-1").click().run()
+        self.assertEqual(
+            app.session_state.page2_generated_media[0].image_data_base64,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        )
+        self.assertEqual(len(app.exception), 0)
+
+    def test_expired_unsaved_image_is_removed_from_selector(self):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_string('''
+import streamlit as st
+from unittest.mock import patch
+from app.models import GeneratedImageRecord
+from web.pages import page2
+
+page2._ensure_state()
+if not st.session_state.get("fixture_initialized"):
+    st.session_state.fixture_initialized = True
+    st.session_state.page2_generated_media = [GeneratedImageRecord(
+        id="expired-image", provider="nanoPro", prompt="forest",
+        image_url_string="https://example.com/expired.png",
+    )]
+    st.session_state.page2_selected_media_id = "expired-image"
+with patch.object(page2, "_image_url_is_expired", return_value=True), \
+     patch.object(page2, "_upsert_record"), \
+     patch.object(page2.url_favorites, "get_preview_url", return_value=""):
+    page2._render_media_column()
+''').run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state.page2_generated_media, [])
+        self.assertNotIn(
+            "page2_media_record_select",
+            [selectbox.key for selectbox in app.get("selectbox")],
+        )
 
 
 if __name__ == "__main__":

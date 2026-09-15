@@ -65,6 +65,7 @@ class AppStorageKeys:
     QUICK_INPUT_RECORDS = "quickInputRecords"
     HIDDEN_QUICK_INPUT_RECORDS = "hiddenQuickInputRecords"
     QUICK_INPUT_DEFAULT_SEEDED = "quickInputDefaultSeeded"
+    QUICK_INPUT_IMAGE_REMOVAL_MIGRATED = "quickInputImageRemovalMigrated"
     LONG_TERM_MEMORY_DEFAULT_SEEDED = "longTermMemoryDefaultSeeded"
     DEFAULT_LONG_TERM_MEMORY_RECORD_ID = "defaultLongTermMemoryRecordID"
     HIDDEN_DEFAULT_LONG_TERM_MEMORY_RECORD_ID = "hiddenDefaultLongTermMemoryRecordID"

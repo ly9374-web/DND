@@ -31,12 +31,12 @@ const assert = require("node:assert/strict");
     await input.press("ArrowRight");
     await input.press("/");
     await expect(menu).toBeVisible();
-    await page.keyboard.insertText("图");
+    await page.keyboard.insertText("场");
     await expect(menu.getByRole("option")).toHaveCount(1);
     await input.press("Enter");
     await expect(menu).toHaveCount(0);
     const expanded = await input.inputValue();
-    assert.ok(expanded.startsWith("前文以第三人称"));
+    assert.ok(expanded.startsWith("前文公开测试场景描述"));
     assert.ok(expanded.endsWith("后文"));
     await expect(sent()).toBeVisible();
     const caret = await input.evaluate(el => el.selectionStart);
@@ -51,11 +51,11 @@ const assert = require("node:assert/strict");
     await page.keyboard.insertText("／");
     await expect(menu).toBeVisible();
     await menu.getByRole("option").first().click();
-    assert.ok((await input.inputValue()).startsWith("原文以第三人称"));
+    assert.ok((await input.inputValue()).startsWith("原文公开测试场景描述"));
     await input.press("/");
     await expect(menu).toBeVisible();
     await input.press("Enter");
-    assert.equal((await input.inputValue()).split("以第三人称").length, 3);
+    assert.equal((await input.inputValue()).split("公开测试场景描述").length, 3);
     console.log("PASS full-width slash, mouse and repeated insertion");
 
     await input.fill("https://example.com/a/b");
@@ -69,12 +69,12 @@ const assert = require("node:assert/strict");
     await input.fill("");
     await input.press("/");
     await page.keyboard.insertText("无此名称");
-    await expect(menu.getByText("没有匹配的快捷输入")).toBeVisible();
-    await input.press("Enter");
-    await expect(sent()).toBeVisible();
-    await input.press("Backspace");
+    await expect(menu).toHaveCount(0);
+    for (let index = 0; index < 4; index += 1) await input.press("Backspace");
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("option")).toHaveCount(2);
     await input.press("Escape");
-    console.log("PASS pasted URL, Escape and empty results");
+    console.log("PASS pasted URL, Escape and hidden empty results with Backspace recovery");
 
     // During an IME composition Enter belongs to the IME, not shortcut selection.
     await input.fill("");
@@ -89,13 +89,46 @@ const assert = require("node:assert/strict");
     await input.press("Escape");
     console.log("PASS IME Enter does not select or submit");
 
+    // Space commits a Chinese IME candidate. A selectionchange can arrive after
+    // compositionend but before the final input event and must not close the menu.
+    await input.fill("");
+    await input.press("/");
+    await input.evaluate(el => {
+      el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent("keydown", {
+        key: " ", code: "Space", keyCode: 229, isComposing: true, bubbles: true,
+      }));
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+      setter.call(el, "/场");
+      el.setSelectionRange(2, 2);
+      el.dispatchEvent(new CompositionEvent("compositionend", { data: "场", bubbles: true }));
+      document.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+      el.dispatchEvent(new InputEvent("input", {
+        inputType: "insertText", data: "场", isComposing: false, bubbles: true,
+      }));
+    });
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("option")).toHaveCount(1);
+    await input.press("Enter");
+    assert.ok((await input.inputValue()).startsWith("公开测试场景描述"));
+
+    // A real space outside IME composition remains a token boundary.
+    await input.fill("");
+    await input.press("/");
+    await page.keyboard.insertText("场");
+    await expect(menu).toBeVisible();
+    await input.press("Space");
+    await expect(menu).toHaveCount(0);
+    await expect(input).toHaveValue("/场 ");
+    console.log("PASS IME Space keeps filtering and ordinary Space closes the menu");
+
     await page.getByText("等待回复", { exact: true }).click();
     await waitBridge("False", true);
     await input.fill("");
     await input.press("/");
     await expect(menu).toBeVisible();
     await input.press("Enter");
-    assert.ok((await input.inputValue()).startsWith("以第三人称"));
+    assert.ok((await input.inputValue()).startsWith("公开测试场景描述"));
     await input.press("Enter");
     await expect(sent()).toBeVisible();
     await page.getByText("等待回复", { exact: true }).click();
@@ -153,7 +186,7 @@ const assert = require("node:assert/strict");
     assert.ok(menuBox.y + menuBox.height <= 900);
     await page.screenshot({ path: "/tmp/dnd-quick-input-menu.png", fullPage: true });
     await input.press("Enter");
-    assert.ok((await input.inputValue()).startsWith("以第三人称"));
+    assert.ok((await input.inputValue()).startsWith("公开测试场景描述"));
     await expect(page.locator('[data-testid="stChatMessage"]')).toHaveCount(2);
     console.log("PASS actual chat layout, fully visible dropdown and no accidental send");
     assert.deepEqual(errors, []);

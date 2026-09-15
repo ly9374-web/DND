@@ -1,7 +1,6 @@
 """Small UI bridges for the native video prompt editor and actionable toast."""
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 def render_toast_style():
@@ -22,7 +21,7 @@ def render_toast_style():
 
 
 def render_editor_sizing():
-    components.html("""<script>
+    st.iframe("""<script>
     (() => {
       const host = window.parent, doc = host.document;
       host.__dndVideoPromptSizing?.disconnect();
@@ -46,4 +45,4 @@ def render_editor_sizing():
       host.__dndVideoPromptSizing = observer;
       sync();
     })();
-    </script>""", height=0)
+    </script>""", height=1)

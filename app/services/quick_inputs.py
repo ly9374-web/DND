@@ -8,6 +8,11 @@ from app.config import AppStorageKeys, settings
 from app.models import PromptTextRecord, now_iso
 
 
+_REMOVED_DEFAULT_IMAGE_CONTENTS = {
+    "以第三人称视角描述一下当前场景，包括人物站位，人物形象，人物姿势，人物特征，人物是否有伤，人物之间的互动，环境有什么，场景是什么。其中每个角色在描述完这个角色的外貌后在“（）”中写入这个角色的名字。",
+}
+
+
 def _decode(key: str) -> list[PromptTextRecord]:
     raw = settings.get(key, "[]")
     items = json.loads(raw) if isinstance(raw, str) else raw
@@ -20,6 +25,7 @@ def _encode(records: list[PromptTextRecord]) -> str:
 
 def _spaces() -> tuple[list[PromptTextRecord], list[PromptTextRecord]]:
     ordinary = _decode(AppStorageKeys.QUICK_INPUT_RECORDS)
+    updates = {}
     if not settings.bool(AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED, False):
         defaults_path = Path(__file__).resolve().parents[1] / "default_prompts" / "quick_inputs.json"
         defaults = json.loads(defaults_path.read_text(encoding="utf-8"))
@@ -28,10 +34,22 @@ def _spaces() -> tuple[list[PromptTextRecord], list[PromptTextRecord]]:
             PromptTextRecord(title=item["title"], content=item["content"])
             for item in defaults if item["title"] not in names
         ] + ordinary
-        settings.set_many_atomic({
-            AppStorageKeys.QUICK_INPUT_RECORDS: _encode(ordinary),
-            AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED: True,
-        })
+        updates[AppStorageKeys.QUICK_INPUT_RECORDS] = _encode(ordinary)
+        updates[AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED] = True
+    if not settings.bool(AppStorageKeys.QUICK_INPUT_IMAGE_REMOVAL_MIGRATED, False):
+        filtered = [
+            record for record in ordinary
+            if not (
+                record.title.strip() == "图片"
+                and record.content.strip() in _REMOVED_DEFAULT_IMAGE_CONTENTS
+            )
+        ]
+        if len(filtered) != len(ordinary):
+            ordinary = filtered
+            updates[AppStorageKeys.QUICK_INPUT_RECORDS] = _encode(ordinary)
+        updates[AppStorageKeys.QUICK_INPUT_IMAGE_REMOVAL_MIGRATED] = True
+    if updates:
+        settings.set_many_atomic(updates)
     return ordinary, _decode(AppStorageKeys.HIDDEN_QUICK_INPUT_RECORDS)
 
 
