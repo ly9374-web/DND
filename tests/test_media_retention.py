@@ -172,6 +172,46 @@ def test_startup_cleanup_without_opening_original_chat(sandbox):
     assert not path.exists()
 
 
+def test_cloud_only_manifest_is_deferred_without_reading_or_resurrecting_media(sandbox, monkeypatch):
+    _, image = sandbox
+    manifest = media_store.MEDIA_DIR / ".index" / "cloud-only.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("cloud placeholder", encoding="utf-8")
+    saved_image = media_store.MEDIA_DIR.parent / ".保存" / "unindexed.png"
+    saved_image.parent.mkdir(parents=True)
+    saved_image.write_bytes(image)
+
+    original_read_text = Path.read_text
+    reads = []
+
+    def track_read_text(path, *args, **kwargs):
+        if path == manifest:
+            reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_read_text)
+    monkeypatch.setattr(media_store, "_is_dataless", lambda path: path == manifest)
+
+    media_store.migrate_media_layout()
+    media_store.cleanup()
+    assert media_store.list_images() == []
+    assert reads == []
+    assert saved_image.exists()
+    assert manifest.exists()
+
+
+def test_cloud_only_manifest_lookup_fails_without_overwriting_it(sandbox, monkeypatch):
+    item = record()
+    manifest = media_store._manifest_path(item.id)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("cloud placeholder", encoding="utf-8")
+    monkeypatch.setattr(media_store, "_is_dataless", lambda path: path == manifest)
+
+    with pytest.raises(OSError, match="iCloud"):
+        media_store.info(item)
+    assert manifest.read_text(encoding="utf-8") == "cloud placeholder"
+
+
 @pytest.mark.parametrize("kind", ["image", "video"])
 def test_ui_save_action_without_storage_details(sandbox, kind):
     item = media_store.cache_generated(record(kind))

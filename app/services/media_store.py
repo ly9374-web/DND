@@ -48,6 +48,11 @@ _maintenance_started = False
 _revision = 0
 
 
+def _is_dataless(path: Path) -> bool:
+    """Do not block a Streamlit run while iCloud downloads an evicted file."""
+    return bool(getattr(path.stat(), "st_flags", 0) & 0x40000000)
+
+
 def migrate_media_directory():
     """Move bytes and lifetime manifests together; never reset their deadlines."""
     with _lock:
@@ -124,6 +129,8 @@ def migrate_media_layout():
         # Manifest-driven moves keep every record pointing at its bytes.
         for manifest in list((MEDIA_DIR / ".index").glob("*.json")):
             try:
+                if _is_dataless(manifest):
+                    continue
                 meta = json.loads(manifest.read_text(encoding="utf-8"))
                 relative = meta.get("path")
                 if not relative:
@@ -214,6 +221,8 @@ def _read(record_id):
     path = _manifest_path(record_id)
     if not path.exists():
         return {}
+    if _is_dataless(path):
+        raise OSError("媒体索引仍在 iCloud 中，等待下载完成后重试。")
     # Do not overwrite damaged manifests: that could reset a lifetime or lose
     # the permanent flag. Surface the failure for repair instead.
     return json.loads(path.read_text(encoding="utf-8"))
@@ -291,15 +300,21 @@ def list_images():
     """All live project images, including files placed directly in media folders."""
     with _lock:
         manifests, known_paths = [], set()
+        deferred_manifests = False
         for path in (MEDIA_DIR / ".index").glob("*.json"):
             try:
+                if _is_dataless(path):
+                    deferred_manifests = True
+                    continue
                 meta = json.loads(path.read_text(encoding="utf-8"))
                 if meta.get("path"):
                     known_paths.add(_path(meta))  # Include tombstones; never resurrect them.
                 manifests.append(meta)
             except (OSError, ValueError, TypeError):
                 continue
-        for category in (_TEMPORARY_CATEGORY, _SAVED_CATEGORY):
+        # A deferred manifest may be a deletion tombstone. Do not rediscover
+        # loose files until its contents are available again.
+        for category in (() if deferred_manifests else (_TEMPORARY_CATEGORY, _SAVED_CATEGORY)):
             for path in (_files_root() / category).glob("*"):
                 if (path.is_symlink() or not path.is_file() or path.resolve() in known_paths
                         or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}):
@@ -458,6 +473,8 @@ def cleanup():
     with _lock:
         for manifest in (MEDIA_DIR / ".index").glob("*.json"):
             try:
+                if _is_dataless(manifest):
+                    continue
                 meta = json.loads(manifest.read_text(encoding="utf-8"))
                 expired = (meta.get("status") == "ready" and not meta.get("saved")
                            and time.time() >= meta["expires_at"])
@@ -506,7 +523,7 @@ def migrate_existing():
         try:
             # macOS may evict iCloud-backed chats. Opening a dataless file can
             # block indefinitely offline; retry once it is downloaded locally.
-            if getattr(path.stat(), "st_flags", 0) & 0x40000000:
+            if _is_dataless(path):
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
             request_cache([GeneratedImageRecord.from_dict(item) for item in
