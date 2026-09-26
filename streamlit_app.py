@@ -2,12 +2,16 @@ import time
 
 import streamlit as st
 
-from app.config import APP_TITLE
+from app.config import APP_TITLE, DATA_DIR
+from app import log_store
 from app.ui.theme import apply_dark_mode
+from app.services import media_store
 from web.nav import back, goto, nav_init, nav_state
 from web import prompt_draft_guard
+from web.streamlit_log_filters import install_stale_fragment_filter
 from web.pages.home import render as render_home
 from web.pages.model_settings import render as render_model_settings
+from web.pages.speech import render as render_speech
 from web.pages.page2 import (
     page2_operation_queue_busy,
     render as render_page2,
@@ -21,6 +25,9 @@ from web.pages.signin_page import (
 from web.pages.signin_page import render as render_signin
 
 
+install_stale_fragment_filter()
+
+
 PAGES = {
     "signin": ("登录", render_signin),
     "home": ("首页", render_home),
@@ -28,6 +35,7 @@ PAGES = {
     "settings": ("设置", render_settings),
     "records": ("记录", render_records),
     "modelSettings": ("APIkey", render_model_settings),
+    "speech": ("生成语音", render_speech),
 }
 
 _GUEST_COUNTDOWN_CSS = """
@@ -115,6 +123,8 @@ def main():
         initial_sidebar_state="collapsed",
     )
     nav_init(default_page="signin")
+    log_store.start_maintenance(DATA_DIR / "logs")
+    media_store.start_maintenance()
 
     if "auth_ok" not in st.session_state:
         st.session_state.auth_ok = False
@@ -138,8 +148,8 @@ def main():
     ):
         _render_guest_countdown()
 
-    if nav_state().page == "modelSettings" and str(st.session_state.auth_mode or "").strip().lower() == "guest":
-        st.warning("游客模式无法访问「APIkey」。")
+    if nav_state().page in {"modelSettings", "speech"} and str(st.session_state.auth_mode or "").strip().lower() == "guest":
+        st.warning("游客模式无法访问此页面。")
         goto("home", push_history=False)
 
     page = nav_state().page

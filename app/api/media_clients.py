@@ -16,11 +16,14 @@ from app.config import (
     mask_authorization_header,
 )
 from app.video_models import VIDEO_MODELS, WAN_DURATION_FRAMES, WAN_FPS, WAN_MODEL, validate_video_duration
+from app.image_inputs import validate_image_reference
+from app.image_models import (
+    IMAGE2_PROVIDER, IMAGE2_DEFAULT_QUALITY,
+    ANILLUSTRIOUS_PROVIDER, WAI_ILLUSTRIOUS_PROVIDER, IMAGE_ASPECT_RATIO, IMAGE_ASPECT_RATIOS,
+    normalize_image_provider, validate_image_options,
+)
 
 
-IMAGE_ASPECT_RATIO = "1:1"
-IMAGE_ASPECT_RATIOS = ("3:4", "4:3", "1:1")
-ANILLUSTRIOUS_PROVIDER = "anillustrious-v4"
 ANILLUSTRIOUS_VERSION = (
     "aisha-ai-official/anillustrious-v4:"
     "80441e2c32a55f2fcf9b77fa0a74c6c86ad7deac51eed722b9faedb253265cb4"
@@ -30,13 +33,17 @@ ANILLUSTRIOUS_DIMENSIONS = {
     "4:3": (1024, 768),
     "1:1": (1024, 1024),
 }
-WAI_ILLUSTRIOUS_PROVIDER = "wai-nsfw-illustrious-v12"
 WAI_ILLUSTRIOUS_VERSION = (
     "aisha-ai-official/wai-nsfw-illustrious-v12:"
     "0fc0fa9885b284901a6f9c0b4d67701fd7647d157b88371427d63f8089ce140e"
 )
 IMAGE_GENERATION_MAX_ATTEMPTS = 3
 IMAGE_GENERATION_RETRY_INTERVAL_SECONDS = 3
+# requests/urllib3 uses the connection timeout while writing the request body.
+# Replicate 的 Prefer: wait 会让服务端保持连接直到生图完成（最多约 60s），
+# 读超时必须大于该窗口，否则慢模型会被误判为“连接中断”；未在窗口内完成的
+# 任务会返回 202，由 _wait_for_image 继续轮询。
+IMAGE_SUBMISSION_TIMEOUT = (20, 120)
 
 
 @dataclass
@@ -103,13 +110,34 @@ def parse_image_response(data):
     raise RuntimeError("未识别图片生成响应：" + str(data))
 
 
+class MediaExpiredError(RuntimeError):
+    """The provider explicitly reports missing/deleted media (not auth/network failure)."""
+
+
+def _response_media_expired(response):
+    if response.status_code in (404, 410):
+        return True
+    if response.status_code in (401, 403):
+        message = str(response.text or "")[:8192].lower()
+        return any(marker in message for marker in (
+            "request has expired", "expiredtoken", "requestexpired",
+            "url has expired", "signature has expired", "token has expired",
+        ))
+    return False
+
+
 def download_image_bytes(url):
     response = requests.get(url, timeout=120)
-    validate_http_response(response)
-    content = response.content
-    if not content:
-        raise RuntimeError("服务商返回的图片文件为空。")
-    return content
+    try:
+        if _response_media_expired(response):
+            raise MediaExpiredError("图片链接已失效或已被服务商清理。")
+        validate_http_response(response)
+        content = response.content
+        if not content:
+            raise RuntimeError("服务商返回的图片文件为空。")
+        return content
+    finally:
+        response.close()
 
 
 def download_url_as_base64(url):
@@ -129,7 +157,7 @@ def image_url_is_expired(url):
         # A temporary network failure must not delete a user's media record.
         return False
     try:
-        return response.status_code in (401, 403, 404, 410)
+        return _response_media_expired(response)
     finally:
         response.close()
 
@@ -211,17 +239,26 @@ class GrokImageAPIClient:
         debug_log("Body:", body)
 
         for attempt in range(1, IMAGE_GENERATION_MAX_ATTEMPTS + 1):
+            request_start = time.monotonic()
             response = requests.post(
                 url,
                 headers=headers,
                 json=body,
-                timeout=3600,
+                timeout=150,
             )
+            response_received = time.monotonic()
+            body_text = response.text
+            body_decoded = time.monotonic()
 
+            debug_log(
+                f"[Grok Image] 请求发送+接口响应耗时 "
+                f"{response_received - request_start:.2f}s，"
+                f"响应体读取耗时 {body_decoded - response_received:.2f}s",
+            )
             debug_log("====== Grok Image HTTP Status ======")
             debug_log(response.status_code)
             debug_log("====== Grok Image Raw Response ======")
-            debug_log(response.text)
+            debug_log(body_text)
 
             try:
                 validate_http_response(response)
@@ -249,9 +286,16 @@ class ReplicateImageAPIClient:
     POLL_INTERVAL_SECONDS = 3
     POLL_TIMEOUT_SECONDS = 1200
     MAX_POLL_ERRORS = 5
+    # 预测已创建但 worker 迟迟未开始（started_at 仍为空）超过该时长，
+    # 视为排队卡死，取消后由外层重试。
+    MAX_QUEUE_SECONDS = 240
+    # 预测已开始但长时间未完成，视为 worker 卡死，取消后由外层重试。
+    MAX_PROCESSING_SECONDS = 600
 
     MODELS = {
-        "flux": "black-forest-labs/flux-2-pro",
+        IMAGE2_PROVIDER: "openai/gpt-image-2",
+        "flux2-dev": "black-forest-labs/flux-2-dev",
+        "seedream-4.5": "bytedance/seedream-4.5",
         "nanoPro": "google/nano-banana-pro",
         "nano": "google/nano-banana",
     }
@@ -264,9 +308,11 @@ class ReplicateImageAPIClient:
         image_urls=None,
         aspect_ratio=IMAGE_ASPECT_RATIO,
         refiner_prompt="",
+        quality=IMAGE2_DEFAULT_QUALITY,
     ):
+        provider = normalize_image_provider(provider)
         image_urls = image_urls or []
-        image_urls = [url.strip() for url in image_urls if str(url).strip()]
+        image_urls = [str(url).strip() for url in image_urls if str(url).strip()]
         refiner_prompt = str(refiner_prompt or "").strip()
 
         versioned_providers = {
@@ -275,11 +321,7 @@ class ReplicateImageAPIClient:
         }
         if provider not in cls.MODELS and provider not in versioned_providers:
             raise ValueError("未知 Replicate provider: " + str(provider))
-        if provider in versioned_providers:
-            if image_urls:
-                raise ValueError(f"{provider} 仅支持文生图，不能使用参考图片 URL。")
-            if aspect_ratio not in ANILLUSTRIOUS_DIMENSIONS:
-                raise ValueError(f"{provider} 图片尺寸请选择 3:4、4:3 或 1:1。")
+        validate_image_options(provider, aspect_ratio, image_urls, quality)
 
         if provider in versioned_providers:
             url = "https://api.replicate.com/v1/predictions"
@@ -299,15 +341,34 @@ class ReplicateImageAPIClient:
             "Prefer": "wait",
         }
 
-        if provider == "flux":
+        if provider == IMAGE2_PROVIDER:
             input_body = {
                 "prompt": prompt,
-                "resolution": "1 MP",
+                "aspect_ratio": aspect_ratio,
+                "input_images": image_urls,
+                "quality": quality,
+                "number_of_images": 1,
+                "output_format": "webp",
+            }
+        elif provider == "flux2-dev":
+            input_body = {
+                "prompt": prompt,
+                "go_fast": True,
+                "disable_safety_checker": True,
                 "aspect_ratio": aspect_ratio,
                 "input_images": image_urls,
                 "output_format": "jpg",
                 "output_quality": 80,
-                "safety_tolerance": 5,
+            }
+        elif provider == "seedream-4.5":
+            input_body = {
+                "prompt": prompt,
+                "size": "4K",
+                "disable_safety_checker": True,
+                "aspect_ratio": aspect_ratio,
+                "image_input": image_urls,
+                "sequential_image_generation": "disabled",
+                "max_images": 1,
             }
         elif provider == "nanoPro":
             input_body = {
@@ -373,22 +434,31 @@ class ReplicateImageAPIClient:
         max_attempts = IMAGE_GENERATION_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
             try:
+                request_start = time.monotonic()
                 response = requests.post(
                     url,
                     headers=headers,
                     json=body,
-                    timeout=(15, 90),
+                    timeout=IMAGE_SUBMISSION_TIMEOUT,
                 )
+                response_received = time.monotonic()
+                body_text = response.text
+                body_decoded = time.monotonic()
             except requests.RequestException as exc:
                 raise RuntimeError(
                     "Replicate 生图请求连接中断，无法确认任务是否已创建。"
                     "请先到 Replicate 查看任务记录，避免重复提交。"
                 ) from exc
 
+            debug_log(
+                f"[Replicate Image] 请求发送+接口响应耗时 "
+                f"{response_received - request_start:.2f}s，"
+                f"响应体读取耗时 {body_decoded - response_received:.2f}s",
+            )
             debug_log("====== Replicate Image HTTP Status ======")
             debug_log(response.status_code)
             debug_log("====== Replicate Image Raw Response ======")
-            debug_log(response.text)
+            debug_log(body_text)
 
             try:
                 validate_http_response(response)
@@ -432,6 +502,18 @@ class ReplicateImageAPIClient:
         raise RuntimeError(f"{provider} 未返回图片。")
 
     @classmethod
+    def _cancel_prediction(cls, prediction_id, api_token):
+        """Best-effort cancel of a stuck prediction; never raises."""
+        encoded_id = quote(prediction_id, safe="")
+        url = "https://api.replicate.com/v1/predictions/" + encoded_id
+        headers = {"Authorization": "Bearer " + api_token}
+        try:
+            requests.delete(url, headers=headers, timeout=(10, 30), allow_redirects=False)
+            debug_log("[Replicate Image] cancelled stuck prediction", prediction_id)
+        except requests.RequestException as exc:
+            debug_log("[Replicate Image] cancel failed for", prediction_id, repr(exc))
+
+    @classmethod
     def _wait_for_image(cls, data, api_token):
         """Resolve both synchronous outputs and accepted asynchronous predictions."""
         if not isinstance(data, dict):
@@ -448,15 +530,26 @@ class ReplicateImageAPIClient:
         consecutive_errors = 0
         delay = cls.POLL_INTERVAL_SECONDS
         last_status = "unknown"
+        first_seen = time.monotonic()
+        seen_started_at = False
 
         while True:
             if not isinstance(data, dict):
                 raise RuntimeError("Replicate 查询响应不是 JSON 对象。" + task_hint)
             status = str(data.get("status") or "").lower()
             last_status = status or last_status
+
+            started_at = data.get("started_at")
+            if started_at:
+                seen_started_at = True
+            metrics = data.get("metrics") or {}
+            elapsed = time.monotonic() - first_seen
             debug_log(
                 "[Replicate Image]", prediction_id, "status:", last_status,
                 "has_output:", bool(data.get("output")),
+                "started:", bool(started_at),
+                "predict_time:", metrics.get("predict_time"),
+                "elapsed_s:", round(elapsed, 1),
             )
             if status in {"failed", "error", "canceled", "cancelled", "aborted"}:
                 reason = str(data.get("error") or status)
@@ -477,6 +570,21 @@ class ReplicateImageAPIClient:
                 raise RuntimeError(f"Replicate 生图任务状态无法识别：{status or '空'}。{task_hint}")
             if not prediction_id:
                 raise RuntimeError("Replicate 生图任务尚未完成，但缺少任务 ID，无法继续查询。")
+
+            # Stuck detection: bail out early instead of burning the full 20-min
+            # deadline on a prediction that is queued forever or wedged on a worker.
+            if not seen_started_at and elapsed > cls.MAX_QUEUE_SECONDS:
+                cls._cancel_prediction(prediction_id, api_token)
+                raise ReplicateTerminalPredictionError(
+                    f"Replicate 生图任务排队超过 {cls.MAX_QUEUE_SECONDS}s 仍未开始，已取消并重试。"
+                    + task_hint
+                )
+            if seen_started_at and elapsed > cls.MAX_PROCESSING_SECONDS:
+                cls._cancel_prediction(prediction_id, api_token)
+                raise ReplicateTerminalPredictionError(
+                    f"Replicate 生图任务执行超过 {cls.MAX_PROCESSING_SECONDS}s 仍未完成，已取消并重试。"
+                    + task_hint
+                )
 
             # Retry only GETs for this prediction, never the billable POST.
             while True:
@@ -560,8 +668,7 @@ class ReplicateVideoAPIClient:
         image_url = str(image_url or "").strip()
         prompt = str(prompt or "").strip()
 
-        if not image_url:
-            raise ValueError("Wan 2.2 I2V Fast 需要可公开访问的输入图片 URL。")
+        image_url = validate_image_reference(image_url)
 
         effective_replicate_api_token = ReplicateConfig.api_token()
         if not effective_replicate_api_token:
@@ -679,8 +786,7 @@ class OpenRouterVideoAPIClient:
             raise ValueError("Wan 视频请使用 Replicate API。")
         if aspect_ratio not in VIDEO_MODELS[model].aspect_ratios:
             raise ValueError("当前视频模型不支持此画面比例。")
-        if urlsplit(str(image_url)).scheme not in ("http", "https"):
-            raise ValueError("Seedance 图生视频需要可访问的图片 URL。")
+        image_url = validate_image_reference(image_url)
         api_key = OpenRouterConfig.api_key()
         if not api_key:
             raise RuntimeError("缺少 OpenRouter API Key，请在 APIkey 页面填写或配置 OPENROUTER_API_KEY。")
@@ -750,7 +856,7 @@ def is_openrouter_video_url(url):
 
 
 def download_video_bytes(url, *, api_key=""):
-    """Fetch only for an explicit preview/download, in memory; never persist a video."""
+    """Retrieve video bytes for local caching, preview or download."""
     headers = {}
     if is_openrouter_video_url(url):
         if not api_key:
@@ -774,8 +880,8 @@ def download_video_bytes(url, *, api_key=""):
                 # Redirects target signed delivery URLs; do not forward the API key.
                 headers = {}
                 continue
-            if response.status_code in (404, 410):
-                raise RuntimeError("视频链接已失效或视频已被服务商清理。")
+            if _response_media_expired(response):
+                raise MediaExpiredError("视频链接已失效或视频已被服务商清理。")
             validate_http_response(response)
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/" in content_type or "json" in content_type:

@@ -224,6 +224,31 @@ def get_record(state: PromptState, record_id: str) -> Optional[SystemPromptRecor
     return None
 
 
+def refresh_selected_prompt(
+    hidden_space: bool = False,
+    record_id: str = "",
+) -> Optional[SystemPromptRecord]:
+    """Activate a prompt record and restore its body to the global chat context."""
+    state = load_state(hidden_space=hidden_space)
+    records = visible_records(state)
+    desired_id = str(record_id or state.selected_record_id or "")
+    selected = next(
+        (record for record in records if record.id == desired_id),
+        records[0] if records else None,
+    )
+    if selected is None:
+        return None
+
+    state.selected_record_id = selected.id
+    settings.set_many_atomic(
+        {
+            AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID: selected.id,
+            AppStorageKeys.SYSTEM_PROMPT: selected.prompt,
+        }
+    )
+    return selected
+
+
 def update_selected_prompt(state: PromptState, prompt: str) -> Optional[SystemPromptRecord]:
     """Keep the active Page2 prompt and its selected prompt record in sync."""
     prompt = str(prompt or "").strip()

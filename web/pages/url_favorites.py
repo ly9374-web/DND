@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import re
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -11,6 +10,7 @@ from app.api.media_clients import CloudinaryUploader
 from app.config import user_facing_error_message
 from app.services import stored_urls
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
+from web.components.media_button_guard import render_media_button_guard
 
 
 _CSS = """
@@ -136,6 +136,8 @@ def render_url_display_with_copy(url: str, key: str, label: str = "图片 URL（
   var btn = document.getElementById("{btn_id}");
   var original = btn.textContent;
   btn.addEventListener("click", async function() {{
+    if (btn.disabled) return;
+    btn.disabled = true;
     var text = btn.getAttribute("data-text");
     var ok = false;
     try {{
@@ -157,7 +159,7 @@ def render_url_display_with_copy(url: str, key: str, label: str = "图片 URL（
       }}
     }}
     btn.textContent = ok ? "已复制" : "复制失败";
-    setTimeout(function() {{ btn.textContent = original; }}, 1500);
+    setTimeout(function() {{ btn.textContent = original; btn.disabled = false; }}, 1500);
   }});
 }})();
 </script>
@@ -193,6 +195,8 @@ def render_header_with_copy(url: str, key: str, label: str = "收藏列表") -> 
   var btn = document.getElementById("{btn_id}");
   var original = btn.textContent;
   btn.addEventListener("click", async function() {{
+    if (btn.disabled) return;
+    btn.disabled = true;
     var text = btn.getAttribute("data-text");
     var ok = false;
     try {{
@@ -214,7 +218,7 @@ def render_header_with_copy(url: str, key: str, label: str = "收藏列表") -> 
       }}
     }}
     btn.textContent = ok ? "已复制" : "复制失败";
-    setTimeout(function() {{ btn.textContent = original; }}, 1500);
+    setTimeout(function() {{ btn.textContent = original; btn.disabled = false; }}, 1500);
   }});
 }})();
 </script>
@@ -266,11 +270,7 @@ def _render_uploader(prefix: str, url_state) -> None:
 
     with st.spinner("上传中..."):
         try:
-            suffix = Path(uploaded.name).suffix or ".png"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(uploaded.getvalue())
-                tmp_path = tmp.name
-            secure_url = CloudinaryUploader.upload_image(tmp_path)
+            secure_url = CloudinaryUploader.upload_image_bytes(uploaded.getvalue(), filename=uploaded.name)
         except Exception as exc:
             _show_error(exc)
             return
@@ -292,18 +292,20 @@ def _render_rename_dialog(prefix: str, record) -> None:
         @st.dialog("重命名")
         def _dialog():
             new_title = st.text_input("新名称", value=str(record.title or ""), key=f"{prefix}_url_rename_input")
-            if st.button("保存", type="primary", use_container_width=True):
+            if st.button("保存", type="primary", use_container_width=True, key=f"{prefix}_url_rename_save"):
                 if str(new_title or "").strip():
                     state = stored_urls.load_state(hidden_space=_hidden_unlocked())
                     stored_urls.rename_url(state, record.id, new_title)
                     st.rerun()
+            if prefix == "page2":
+                render_media_button_guard()
 
         _dialog()
         return
 
     # 旧版 Streamlit 没有 st.dialog：退化为行内输入
     new_title = st.text_input("新名称", value=str(record.title or ""), key=f"{prefix}_url_rename_input")
-    if st.button("保存名称", use_container_width=True):
+    if st.button("保存名称", use_container_width=True, key=f"{prefix}_url_rename_save"):
         if str(new_title or "").strip():
             state = stored_urls.load_state(hidden_space=_hidden_unlocked())
             stored_urls.rename_url(state, record.id, new_title)
@@ -384,14 +386,19 @@ def render_url_favorites(prefix: str) -> None:
 
     action_cols = st.columns([1, 1, 1])
     with action_cols[0]:
-        if st.button("删除", use_container_width=True):
+        if st.button("删除", use_container_width=True, key=f"{prefix}_url_delete"):
             request_delete(f"{prefix}_stored_url", record.id, record.title or record.url)
     with action_cols[1]:
-        if st.button("重命名", use_container_width=True):
+        if st.button("重命名", use_container_width=True, key=f"{prefix}_url_rename"):
             _render_rename_dialog(prefix, record)
     with action_cols[2]:
-        if st.button("显示图片", use_container_width=True):
-            if get_preview_url(prefix) == record.url:
+        is_previewing = get_preview_url(prefix) == record.url
+        if st.button(
+            "隐藏图片" if is_previewing else "显示图片",
+            use_container_width=True,
+            key=f"{prefix}_url_toggle_preview",
+        ):
+            if is_previewing:
                 clear_preview_url(prefix)
             else:
                 st.session_state[f"{prefix}_url_preview"] = record.url

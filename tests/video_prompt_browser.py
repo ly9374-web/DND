@@ -94,7 +94,7 @@ def run():
             page.goto(base + "?fail=1")
             page.wait_for_load_state("networkidle")
             page.get_by_role("button", name="生视频prompt", exact=True).click()
-            expect(page.get_by_text("生视频prompt失败，队列将继续：模拟网络失败", exact=True)).to_be_visible(timeout=15000)
+            expect(page.get_by_text("生视频prompt失败，其他任务将继续：模拟网络失败", exact=True)).to_be_visible(timeout=15000)
             expect(editor).to_have_value("")
             expect(page.get_by_role("button", name="生视频prompt", exact=True)).to_be_enabled()
             expect(page.locator('[data-testid="stException"]')).to_have_count(0)

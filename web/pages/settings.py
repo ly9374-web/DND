@@ -939,6 +939,8 @@ def _render_text_asset(
             disabled=is_guest,
             key=content_key,
         )
+        if kind == "world_book":
+            st.caption("正文中的 {用户角色名} 会在新建最终设定时替换为所选用户角色的名称。")
         save_col, new_col, delete_col = st.columns(3)
         prompt_draft_guard.save_action(f"{kind}_save", title_key, content_key)
         if save_col.button("保存", type="primary", use_container_width=True, disabled=is_guest, key=f"{kind}_save"):

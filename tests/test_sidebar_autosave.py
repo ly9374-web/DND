@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import AppStorageKeys, SettingsStore
+from app.models import ChatRecord, SystemPromptRecord
 from app.services import page2_service, system_prompts
 from web.pages import page2
 
@@ -26,6 +27,7 @@ class SidebarAutosaveTests(unittest.TestCase):
             story_brain_update_model="grok",
             story_brain_reasoning="开思考",
             story_brain_turns=9,
+            selected_tts_voice=ctx.selected_tts_voice,
             temperature=0.55,
             unexpected_event_enabled=True,
             unexpected_event_threshold=73,
@@ -51,6 +53,7 @@ class SidebarAutosaveTests(unittest.TestCase):
             story_brain_update_model="grok",
             story_brain_reasoning="开思考",
             story_brain_turns=9,
+            selected_tts_voice=ctx.selected_tts_voice,
             temperature=0.55,
             unexpected_event_enabled=True,
             unexpected_event_threshold=73,
@@ -86,6 +89,92 @@ class SidebarAutosaveTests(unittest.TestCase):
             1.25,
         )
 
+    def test_new_conversation_refreshes_global_prompt_from_selected_record(self):
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        selected = SystemPromptRecord(
+            id="selected-final-setting",
+            title="当前最终设定",
+            prompt="Prompt 页面中的最新正文",
+        )
+        state = system_prompts.PromptState(
+            hidden_space=True,
+            records=[],
+            hidden_records=[selected],
+            next_index=1,
+            hidden_next_index=2,
+            selected_record_id=selected.id,
+        )
+        self.store.set(AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID, selected.id)
+        self.store.set(AppStorageKeys.SYSTEM_PROMPT, "历史聊天残留的旧正文")
+        session = SessionState(hidden_unlocked=True)
+
+        with (
+            patch.object(page2.st, "session_state", session),
+            patch.object(system_prompts, "settings", self.store),
+            patch.object(system_prompts, "load_state", return_value=state),
+            patch.object(page2.url_favorites, "clear_preview_url"),
+        ):
+            self.assertTrue(page2.start_new_conversation(reset_settings=True))
+
+        self.assertEqual(session.page2_final_setting_id, selected.id)
+        self.assertEqual(
+            self.store.get(AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID),
+            selected.id,
+        )
+        self.assertEqual(
+            self.store.get(AppStorageKeys.SYSTEM_PROMPT),
+            selected.prompt,
+        )
+
+    def test_opening_history_refreshes_its_prompt_record_instead_of_old_snapshot(self):
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        selected = SystemPromptRecord(
+            id="selected-final-setting",
+            title="当前最终设定",
+            prompt="Prompt 页面中的最新正文",
+        )
+        state = system_prompts.PromptState(
+            hidden_space=True,
+            records=[],
+            hidden_records=[selected],
+            next_index=1,
+            hidden_next_index=2,
+            selected_record_id=selected.id,
+        )
+        history = ChatRecord(
+            id="history-record",
+            title="历史聊天",
+            turns=[],
+            system_prompt="历史聊天保存的旧正文",
+            final_setting_id=selected.id,
+        )
+        self.store.set(AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID, selected.id)
+        self.store.set(AppStorageKeys.SYSTEM_PROMPT, history.system_prompt)
+        session = SessionState(hidden_unlocked=True)
+
+        with (
+            patch.object(page2.st, "session_state", session),
+            patch.object(system_prompts, "settings", self.store),
+            patch.object(system_prompts, "load_state", return_value=state),
+            patch.object(page2, "get_arg", return_value=history.id),
+            patch.object(page2.chat_records, "load_record_by_id", return_value=history),
+            patch.object(page2.url_favorites, "clear_preview_url"),
+        ):
+            page2._ensure_state()
+            page2._load_record_from_nav_if_needed()
+
+        self.assertEqual(session.page2_final_setting_id, selected.id)
+        self.assertEqual(
+            self.store.get(AppStorageKeys.SYSTEM_PROMPT),
+            selected.prompt,
+        )
+
     def test_mistral_forces_reasoning_off_for_chat_and_story_brain(self):
         ctx = page2_service.default_context()
         page2._apply_sidebar_context_values(
@@ -96,6 +185,7 @@ class SidebarAutosaveTests(unittest.TestCase):
             story_brain_update_model="mistralLarge2512",
             story_brain_reasoning="开思考",
             story_brain_turns=6,
+            selected_tts_voice=ctx.selected_tts_voice,
             temperature=0.8,
             unexpected_event_enabled=False,
             unexpected_event_threshold=98,

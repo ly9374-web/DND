@@ -12,7 +12,7 @@ from PIL import Image
 from app.api import media_clients
 from app.config import AppStorageKeys, SettingsStore
 from app.models import GeneratedImageRecord
-from app.services import page2_service
+from app.services import page2_service, media_store
 from app.video_models import VIDEO_MODELS, WAN_MODEL, WAN_DURATION_FRAMES, validate_video_duration
 
 
@@ -29,6 +29,14 @@ def response(data=None, status=200, headers=None, content=b"video-with-audio"):
 
 class VideoGenerationTests(unittest.TestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for patcher in (
+            patch.object(media_store, "MEDIA_DIR", Path(directory.name)),
+            patch.object(media_store, "cache_generated", side_effect=lambda record: record),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # All HTTP calls are mocked. No credentials, paid generations or real downloads.
         for name in ("post", "get"):
             patcher = patch.object(media_clients.requests, name,
@@ -225,6 +233,20 @@ page2._render_video_preview(record)
 
 
 class ImagePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        image = io.BytesIO()
+        Image.new("RGB", (1, 1), "red").save(image, format="PNG")
+        self.image_bytes = image.getvalue()
+        for patcher in (
+            patch.object(media_store, "MEDIA_DIR", Path(directory.name)),
+            patch.object(media_store, "request_cache"),
+            patch.object(media_store, "download_image_bytes", return_value=self.image_bytes),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_image_download_and_expiry_probe(self):
         image = response(status=200, content=b"image-bytes")
         with patch.object(media_clients.requests, "get", return_value=image):
@@ -233,7 +255,7 @@ class ImagePersistenceTests(unittest.TestCase):
                 b"image-bytes",
             )
 
-        for status, expected in ((200, False), (403, True), (404, True), (410, True), (503, False)):
+        for status, expected in ((200, False), (403, False), (404, True), (410, True), (503, False)):
             with self.subTest(status=status):
                 result = response(status=status)
                 with patch.object(media_clients.requests, "get", return_value=result):
@@ -260,10 +282,10 @@ class ImagePersistenceTests(unittest.TestCase):
             page2_selected_media_id="image-1",
         )
         with patch.object(page2.st, "session_state", session), \
-             patch.object(page2, "download_url_as_base64", return_value="aW1hZ2U="), \
              patch.object(page2, "_upsert_record") as upsert:
             page2._save_image_record(selected)
-            self.assertEqual(selected.image_data_base64, "aW1hZ2U=")
+            self.assertTrue(media_store.info(selected)["saved"])
+            self.assertEqual(media_store.read_bytes(selected), self.image_bytes)
             upsert.assert_called_once()
 
             upsert.reset_mock()
@@ -289,9 +311,7 @@ if not st.session_state.get("fixture_initialized"):
         image_url_string="https://example.com/image.png",
     )]
     st.session_state.page2_selected_media_id = "image-1"
-with patch.object(page2, "_image_url_is_expired", return_value=False), \
-     patch.object(page2, "download_url_as_base64", return_value="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), \
-     patch.object(page2, "_upsert_record"), \
+with patch.object(page2, "_upsert_record"), \
      patch.object(page2.url_favorites, "get_preview_url", return_value=""):
     page2._render_media_column()
 ''').run()
@@ -304,10 +324,7 @@ with patch.object(page2, "_image_url_is_expired", return_value=False), \
         self.assertNotIn("image • provider=nanoPro", captions)
 
         app.button(key="page2_save_image_image-1").click().run()
-        self.assertEqual(
-            app.session_state.page2_generated_media[0].image_data_base64,
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-        )
+        self.assertTrue(media_store.info(app.session_state.page2_generated_media[0])["saved"])
         self.assertEqual(len(app.exception), 0)
 
     def test_expired_unsaved_image_is_removed_from_selector(self):
@@ -327,14 +344,17 @@ if not st.session_state.get("fixture_initialized"):
         image_url_string="https://example.com/expired.png",
     )]
     st.session_state.page2_selected_media_id = "expired-image"
-with patch.object(page2, "_image_url_is_expired", return_value=True), \
-     patch.object(page2, "_upsert_record"), \
+    from app.api.media_clients import MediaExpiredError
+    with patch.object(page2.media_store, "download_image_bytes", side_effect=MediaExpiredError("gone")):
+        page2.media_store.cache_generated(st.session_state.page2_generated_media[0])
+with patch.object(page2, "_upsert_record"), \
      patch.object(page2.url_favorites, "get_preview_url", return_value=""):
     page2._render_media_column()
 ''').run()
 
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.session_state.page2_generated_media, [])
+        self.assertEqual(len(app.session_state.page2_generated_media), 1)
+        self.assertFalse(media_store.available(app.session_state.page2_generated_media[0]))
         self.assertNotIn(
             "page2_media_record_select",
             [selectbox.key for selectbox in app.get("selectbox")],

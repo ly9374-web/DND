@@ -374,6 +374,24 @@ div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
   display: none !important;
 }
 
+/* ===== Audio player (pure black to blend with chat background) ===== */
+[data-testid="stAudio"] {
+  background: #000 !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+[data-testid="stAudio"] audio {
+  background: #000 !important;
+  width: 100% !important;
+}
+audio::-webkit-media-controls-enclosure {
+  background: #000 !important;
+  border-radius: 0 !important;
+}
+audio::-webkit-media-controls-panel {
+  background: #000 !important;
+}
+
 /* ===== Page2 chat canvas (custom layout) ===== */
 div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas,
 .st-key-page2_chat_canvas {

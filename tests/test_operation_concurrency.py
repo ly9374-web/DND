@@ -2,9 +2,12 @@
 import threading
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from textwrap import indent
 from unittest.mock import patch
 
+from app import storage
+from app.config import SettingsStore
 from app.models import GeneratedImageRecord, GeneratedMediaKind, Page2ConversationTurn
 from app.services import page2_service
 from web.pages import page2
@@ -33,6 +36,7 @@ class OperationConcurrencyTests(unittest.TestCase):
         for patcher in (
             patch.object(page2.st, "session_state", self.state),
             patch.object(page2, "_upsert_record"),
+            patch.object(page2.media_store, "cache_generated", side_effect=lambda record: record),
             patch.object(page2_service, "load_context_from_settings", side_effect=page2_service.default_context),
         ):
             patcher.start()
@@ -155,7 +159,7 @@ class OperationConcurrencyTests(unittest.TestCase):
         self.assertTrue(other.is_started())
         self.assertIn("failed image", self.state.page2_operation_error)
 
-    def test_media_completion_shows_image_and_preserves_chat_video_input_and_drafts(self):
+    def test_media_completion_merges_latest_chat_and_preserves_selection_and_drafts(self):
         image = self.enqueue("image", pending_video_prompt="new image draft")
         video = self.enqueue("video")
         self.state.page2_operation_queue = []
@@ -171,17 +175,17 @@ class OperationConcurrencyTests(unittest.TestCase):
             page2._advance_operation_queues()
             page2._advance_operation_queues()
             page2._apply_operation(image)
-            clear.assert_called_once_with("page2")
+            clear.assert_not_called()
             self.assertEqual(save.call_count, 2)
         self.assertEqual(self.state.page2_turns, expected_turns)
         self.assertEqual(self.state.page2_story_brain_short, "latest memory")
         self.assertEqual(self.state.page2_image_prompt, "user draft")
-        self.assertEqual(self.state.page2_selected_media_id, "new-image")
+        self.assertEqual(self.state.page2_selected_media_id, "source")
         self.assertEqual(self.state.page2_video_source, "source")
-        self.assertEqual(self.state.page2_pending_media_record_select, "new-image")
-        self.assertNotIn("page2_pending_video_source", self.state)
+        self.assertEqual(self.state.page2_pending_media_record_select, "")
+        self.assertEqual(self.state.page2_pending_video_source, "new-image")
         self.assertEqual([item.id for item in self.state.page2_generated_media], ["source", "new-image", "new-video"])
-        self.assertEqual([item["media_id"] for item in self.state.page2_media_completions], ["new-video"])
+        self.assertEqual([item["media_id"] for item in self.state.page2_media_completions], ["new-image", "new-video"])
 
     def test_save_failure_rolls_back_only_media_and_does_not_publish_success(self):
         task = self.enqueue("image")
@@ -272,6 +276,25 @@ class OperationConcurrencyTests(unittest.TestCase):
 
 
 class MediaSelectionTests(unittest.TestCase):
+    def setUp(self):
+        # Without this sandbox the background workers write real manifests for
+        # fixture ids like "existing", polluting the actual media folder, and
+        # the video-prompt editor autosaves empty chat records to the real store.
+        import tempfile
+        self._sandbox = tempfile.TemporaryDirectory()
+        sandbox = Path(self._sandbox.name)
+        for patcher in (
+            patch.object(page2.media_store, "MEDIA_DIR", sandbox / "Media"),
+            patch.object(storage, "CHAT_RECORDS_DIR", sandbox / "Chats"),
+            patch.object(storage, "settings", SettingsStore(sandbox / "settings.json")),
+        ):
+            patcher.start()
+            # LIFO: drain queued cache jobs while the patches are still active,
+            # then remove the sandbox, then restore the real directories.
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self._sandbox.cleanup)
+        self.addCleanup(page2.media_store._jobs.join)
+
     def app(self, *, with_existing=False):
         from streamlit.testing.v1 import AppTest
         script = '''
@@ -292,6 +315,7 @@ if "fixture_seeded" not in st.session_state:
     if WITH_EXISTING:
         st.session_state.page2_generated_media = [GeneratedImageRecord(id="existing", provider="grok", prompt="old")]
         st.session_state.page2_video_source = "existing"
+        page2._set_reference_selection(["existing"], preview=False)
 if st.button("完成第一张"):
     first = st.session_state.fixture_first
     first.result = GeneratedImageRecord(id="first-result", provider="grok", prompt="first")
@@ -309,13 +333,13 @@ page2._render_video_prompt_controls(st.session_state.page2_generated_media, WAN_
         self.assertEqual(len(app.exception), 0)
         first = app.session_state.fixture_first
         second = app.session_state.fixture_second
-        self.assertEqual(app.selectbox(key="page2_video_source").value, "pending:" + first.id)
+        self.assertEqual(app.session_state.page2_video_source, "pending:" + first.id)
         app.text_area(key="_page2_video_prompt").input("first image draft").run()
         self.assertEqual(first.payload["pending_video_prompt"], "first image draft")
         self.assertNotIn("pending_video_prompt", second.payload)
         app.button[0].click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.selectbox(key="page2_video_source").value, "first-result")
+        self.assertEqual(app.session_state.page2_video_source, "first-result")
         self.assertEqual(app.text_area(key="_page2_video_prompt").value, "first image draft")
 
     def test_unrelated_image_completion_does_not_change_existing_video_input(self):
@@ -323,12 +347,17 @@ page2._render_video_prompt_controls(st.session_state.page2_generated_media, WAN_
         app.text_area(key="_page2_video_prompt").input("existing draft").run()
         app.button[0].click().run()
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.selectbox(key="page2_video_source").value, "existing")
+        self.assertEqual(app.session_state.page2_video_source, "existing")
         self.assertEqual(app.text_area(key="_page2_video_prompt").value, "existing draft")
 
-    def test_first_completed_image_displays_automatically_and_survives_rerun(self):
+    def test_first_completed_image_waits_for_view_across_reruns(self):
+        import tempfile
         from streamlit.testing.v1 import AppTest
-        app = AppTest.from_string('''
+        # The record embeds legacy base64, so background workers would otherwise
+        # permanently save it into the real media folder.
+        with tempfile.TemporaryDirectory() as sandbox, \
+                patch.object(page2.media_store, "MEDIA_DIR", Path(sandbox) / "Media"):
+            app = AppTest.from_string('''
 import streamlit as st
 from unittest.mock import patch
 from app.models import GeneratedImageRecord
@@ -345,12 +374,15 @@ with patch.object(page2, "_upsert_record"), patch.object(page2.url_favorites, "g
         page2._apply_operation(task)
     page2._render_media_column()
 ''').run()
-        self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new")
-        self.assertFalse(any(button.label == "查看" for button in app.button))
-        app.run()
-        self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new")
+            self.assertEqual(len(app.exception), 0)
+            self.assertIsNone(app.selectbox(key="page2_media_record_select").value)
+            self.assertEqual(app.session_state.page2_video_source, "new")
+            app.run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertIsNone(app.selectbox(key="page2_media_record_select").value)
+            next(button for button in app.button if button.label == "查看").click().run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new")
 
 
 if __name__ == "__main__":

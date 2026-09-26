@@ -45,9 +45,13 @@ class AppStorageKeys:
     PAGE2_UNEXPECTED_EVENT_THRESHOLD = "page2UnexpectedEventThreshold"
     PAGE2_TEMPERATURE = "page2Temperature"
     PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER = "page2SelectedVideoGenerationProvider"
+    PAGE2_SELECTED_TTS_VOICE = "page2SelectedTtsVoice"
     PAGE2_IMAGE_ASPECT_RATIOS = "page2ImageAspectRatios"
+    PAGE2_LAST_IMAGE_PROVIDER = "page2LastImageProvider"
+    PAGE2_IMAGE2_QUALITY = "page2Image2Quality"
 
     OPENROUTER_API_KEY = "openrouterApiKey"
+    DASHSCOPE_API_KEY = "dashscopeApiKey"
     DEEPSEEK_API_KEY = "deepseekApiKey"
     KEYLINK_DEEPSEEK_V4_PRO_API_KEY = "keylinkDeepseekV4ProApiKey"
     KEYLINK_DEEPSEEK_V4_PRO_ENABLED = "keylinkDeepseekV4ProEnabled"
@@ -389,13 +393,14 @@ def user_facing_error_message(exc: Exception) -> str:
 
 
 def debug_log(*items):
-    """
-    对应 Swift 里的 DebugLog.log(...)
-    只有 DEBUG_LOG_ENABLED 打开时才打印。
-    """
+    """Opt-in redacted debug output is printed and retained locally for 48 hours."""
     settings.load()
     if settings.bool(AppStorageKeys.DEBUG_LOG_ENABLED, False):
-        print(*items, flush=True)
+        from app import log_store
+        message = log_store.format_message(*items)
+        print(message, flush=True)
+        log_store.start_maintenance(DATA_DIR / "logs")
+        log_store.write(DATA_DIR / "logs", message=message)
 
 
 def mask_authorization_header(value):

@@ -25,9 +25,9 @@ DEFAULT_LONG_TERM_MEMORY_TITLE = "默认记忆"
 DEFAULT_LONG_TERM_MEMORY = DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
 DEFAULT_LONG_TERM_MEMORY_TITLES = {"默认", DEFAULT_LONG_TERM_MEMORY_TITLE}
 
-WORLD_BOOK_SYSTEM_PROMPT = """我会给你一个对于这个世界背景的大致介绍和关于这个世界背景知识的基本问答。根据大致介绍和基本问答，你将会细化这个世界背景至最多800字，包括但不限于：这个世界的背景、常识、特殊之处。输出使用markdown格式"""
+WORLD_BOOK_SYSTEM_PROMPT = """我会给你一个对于这个世界背景的大致介绍和关于这个世界背景知识的基本问答。根据大致介绍和基本问答，你将会细化这个世界背景至最多800字，包括但不限于：这个世界的背景、常识、特殊之处、用户角色在这个世界的身份其中提到用户角色的名字时，其中提到用户角色的名字时，使用“{用户角色名}”作为占位符。输出使用markdown格式。世界书的内容用结构化的机械化的方式介绍世界背景，不要有任何文学性修饰，仅刻板追求高效的输出信息"""
 
-CHARACTER_CARD_SYSTEM_PROMPT = """我会给你一个大致的角色介绍，你将帮我把这个扩写为大概800字的详细角色卡。其中提到用户角色的名字时，使用“{用户角色名}”作为占位符。语言精练简洁。其中不用“他/她”指代角色本身，使用角色自己的名字为主语如当角色名为“xx”时，用“xx是一个某某的人”而不是用"她/他"指代。
+CHARACTER_CARD_SYSTEM_PROMPT = """我会给你一个大致的角色介绍，你将帮我把这个扩写为大概800字的详细角色卡。其中提到用户角色角色时，使用“{用户角色名}”作为占位符。语言精练简洁。其中不用“他/她”指代角色本身，使用角色自己的名字为主语如当角色名为“xx”时，用“xx是一个某某的人”而不是用"她/他"指代。
 角色卡包含5个部分：
 
 1. 角色身份：包含角色的身材、样貌、穿搭、年龄等背景信息，以及角色的背景故事。
@@ -43,9 +43,9 @@ CHARACTER_CARD_SYSTEM_PROMPT = """我会给你一个大致的角色介绍，你�
 
 使用Markdown格式输出，直接输出可放入角色卡的正文，不要附加解释。"""
 
-WORLD_BOOK_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中世界书的细化助手，我将会给你一个对于这个世界背景的大致介绍，你需要根据这个世界背景的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC选项。需要足够关键，每个问题之间用换行隔开保证易读性，足够影响这个世界的运行逻辑。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
+WORLD_BOOK_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中世界书的细化助手，我将会给你一个对于这个世界背景的大致介绍，你需要根据这个世界背景的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC选项。需要足够关键，每个问题之间用换行隔开保证易读性，足够影响这个世界的运行逻辑。你的输出格式仅为问题，以：数字来编号问题，问题后面输出三个可能的选项（问题和选项之后需要换行来保证可读性），不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
 
-CHARACTER_CARD_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中的角色卡细化助手，我将会给你一个对于这个角色的大致介绍，你需要根据这个角色的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC三个选项。需要足够关键，每个问题之间用换行隔开保证易读性，足够影响这个角色的日常决策，和其他角色的互动，说话的口吻，其他角色对待她的方式和态度。你的输出格式仅为问题，以“1....2....”来编号，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
+CHARACTER_CARD_QUESTIONS_SYSTEM_PROMPT = """你是一个DND中的角色卡细化助手，我将会给你一个对于这个角色的大致介绍，你需要根据这个角色的大致介绍询问我15个这个世界的相关问题，这15个问题和可能的ABC三个选项。需要足够关键，（问题和选项之后需要换行来保证可读性，足够影响这个角色的日常决策，和其他角色的互动，说话的口吻，其他角色对待她的方式和态度。你的输出格式仅为问题，以数字来编号问题，问题后面输出三个可能的选项，不要输出任何问题和可能选项以外的内容。输出格式案例：1.{第一个问题}A.{可能的选项A}B.{可能的选项B}C.{可能的选项C}"""
 
 DEFAULT_TEMPLATE_BACKGROUND = """1. 背景介绍
    -你是一名负责主持沉浸式文字角色扮演游戏的 Dungeon Master（DM）。你不是配合用户续写故事的助手，而是一个持续模拟世界运行的主持者。
@@ -885,7 +885,7 @@ def build_final_prompt(
 
     sections = [
         ("1. 背景介绍", background),
-        ("2. 世界书", str(world_book.content or "").strip()),
+        ("2. 世界书", str(world_book.content or "").replace("{用户角色名}", user_name).strip()),
         (
             "3. 用户角色",
             _without_character_personality_section(user_character.content),
@@ -1288,9 +1288,11 @@ def sync_final_setting(
             updated_labels.append(label)
 
     if world_book is not None and "2. 世界书" in sections:
+        content = sections["2. 世界书"][0]
+        restored_content = content.replace(user_name, "{用户角色名}") if user_name else content
         update_text_record(
             world_book,
-            sections["2. 世界书"][0],
+            restored_content,
             f'世界书“{world_book.title or "未命名"}”',
         )
     if long_term_memory_record is not None:

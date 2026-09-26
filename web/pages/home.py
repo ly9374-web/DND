@@ -122,3 +122,10 @@ def render(
                 use_container_width=True,
             ):
                 goto("modelSettings")
+            if st.button(
+                "生成语音",
+                key="home_speech_button",
+                icon=":material/record_voice_over:",
+                use_container_width=True,
+            ):
+                goto("speech")

@@ -20,6 +20,9 @@ class SessionState(dict):
 
 class VideoPromptTests(unittest.TestCase):
     def setUp(self):
+        cache = patch.object(page2.media_store, "cache_generated", side_effect=lambda record: record)
+        cache.start()
+        self.addCleanup(cache.stop)
         self.turns = [Page2ConversationTurn(id=f"t{i}", user_message=f"输入{i}",
                       assistant_message=f"故事{i}") for i in range(1, 9)]
         self.image = GeneratedImageRecord(provider="grok", prompt="蓝衣女子站在画面左侧",

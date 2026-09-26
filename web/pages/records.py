@@ -5,13 +5,38 @@ import streamlit as st
 
 from app.services import chat_records
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
+from web.components.records_list import records_list
 from web.nav import goto
 
 
-def _label(item):
-    title = item.title or "未命名聊天"
-    updated_at = item.updated_at or ""
-    return f"{title}    {updated_at}"
+_RECORDS_CSS = """
+<style>
+section[data-testid="stMain"] .block-container {
+  padding-top: 60px !important;
+}
+
+.st-key-records_actions {
+  margin-bottom: 16px;
+}
+</style>
+"""
+
+
+def _open_record(page: str, record_id: str):
+    st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
+    goto(page, record_id=record_id)
+
+
+def _rename_record_dialog(item, store, scope):
+    @st.dialog("重命名")
+    def editor():
+        with st.form("records_rename_form", enter_to_submit=True):
+            new_title = st.text_input("记录名称", key="records_rename_title")
+            if st.form_submit_button("确认", type="primary", use_container_width=True):
+                store.rename_record(item.id, new_title, scope=scope)
+                st.rerun()
+
+    editor()
 
 
 def render(
@@ -25,7 +50,7 @@ def render(
     extra_renderer: Callable | None = None,
     confirm_delete: bool = True,
 ):
-    st.title(page_title)
+    st.html(_RECORDS_CSS)
 
     if "records_debug_record_id" not in st.session_state:
         st.session_state.records_debug_record_id = ""
@@ -50,32 +75,36 @@ def render(
         st.info(empty_message)
         return
 
-    labels = [_label(item) for item in items]
-    label_to_item = {labels[i]: items[i] for i in range(len(items))}
+    items_by_id = {item.id: item for item in items}
+    selected_id = st.session_state.get("records_selected_id")
+    if selected_id not in items_by_id:
+        selected_id = items[0].id
+    st.session_state.records_selected_id = selected_id
 
-    selected = st.radio(
-        "选择记录",
-        options=labels,
-        label_visibility="collapsed",
-    )
-    item = label_to_item.get(selected)
-    if item is None:
-        return
+    # Reserve the toolbar above the list while resolving its selected record first.
+    actions = st.container(key="records_actions")
+    event = records_list(items, selected_id)
+    if event and event.get("event_id") != st.session_state.get("records_last_event_id"):
+        st.session_state.records_last_event_id = event.get("event_id")
+        if event.get("record_id") in items_by_id:
+            selected_id = event["record_id"]
+            st.session_state.records_selected_id = selected_id
+            if event.get("action") == "open":
+                _open_record(open_page, selected_id)
+            # Send the acknowledged selection back to the component immediately.
+            st.rerun()
+    item = items_by_id[selected_id]
 
     has_extra_action = bool(extra_action_label and extra_renderer)
-    action_columns = st.columns([1, 1, 1, 1] if has_extra_action else [1, 1, 1])
+    with actions:
+        action_columns = st.columns([1, 1, 1, 1] if has_extra_action else [1, 1, 1])
     with action_columns[0]:
         if st.button("打开", type="primary", use_container_width=True):
-            # Opening a record should start at its latest message, including when
-            # the same record is reopened and is already present in session state.
-            st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
-            goto(open_page, record_id=item.id)
+            _open_record(open_page, item.id)
     with action_columns[1]:
-        new_title = st.text_input("重命名", value=item.title or "", key="records_rename_title")
-        if st.button("保存名称", use_container_width=True):
-            store.rename_record(item.id, new_title, scope=scope)
-            st.success("已重命名")
-            st.rerun()
+        if st.button("重命名", use_container_width=True):
+            st.session_state.records_rename_title = item.title or ""
+            _rename_record_dialog(item, store, scope)
     with action_columns[2]:
         if st.button("删除", use_container_width=True):
             if confirm_delete:

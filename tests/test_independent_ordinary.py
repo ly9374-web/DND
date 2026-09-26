@@ -527,7 +527,7 @@ if st.button("模拟生成完成"):
             }
         )
 
-        self.assertEqual(len(record.first_inputs), 1)
+        self.assertEqual(len(record.first_inputs), 2)
         self.assertEqual(record.first_inputs[0].title, "默认首轮输入")
         self.assertEqual(record.first_inputs[0].content, "旧开场")
         self.assertEqual(record.selected_first_input_id, record.first_inputs[0].id)
@@ -571,7 +571,7 @@ if st.button("模拟生成完成"):
                     record.id,
                     created.id,
                 )
-                self.assertEqual(len(record.first_inputs), 1)
+                self.assertEqual(len(record.first_inputs), 2)
                 self.assertEqual(record.selected_first_input_id, remaining_id)
                 self.assertEqual(
                     system_prompts.first_input_for_record(state, record.id),
@@ -1214,6 +1214,27 @@ if st.button("模拟生成完成"):
             page2._assistant_message_for_display("正文提到本轮不掷骰子。"),
             "正文提到本轮不掷骰子。",
         )
+
+    def test_formatted_dice_decision_marker_is_hidden(self):
+        from web.pages import page2
+
+        for opening in (
+            "**本轮不掷骰子**",
+            "**本轮不掷骰子。**",
+            "__本轮不掷骰子__：",
+            "*本轮掷骰子*",
+            "`本轮掷骰子`",
+            "\n  本轮不掷骰子。",
+            "\ufeff\u200b**本轮不掷骰子**。",
+        ):
+            with self.subTest(opening=opening):
+                self.assertEqual(
+                    page2._assistant_message_for_display(opening + "\n\n**雨还在下。**"),
+                    "**雨还在下。**",
+                )
+
+        narrative = "\n**雨还在下。**正文提到本轮不掷骰子。"
+        self.assertEqual(page2._assistant_message_for_display(narrative), narrative)
 
     def test_completed_chat_queues_visible_auto_dice_followup(self):
         from web.pages import page2

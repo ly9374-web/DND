@@ -49,7 +49,8 @@ def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_e
             debug_log(f"{label} 网络瞬断，{delay}s 后第 {attempt + 1} 次重试：{last_exc}")
             time.sleep(delay)
         try:
-            return requests.post(
+            request_start = time.monotonic()
+            response = requests.post(
                 url,
                 headers=headers,
                 json=json_body,
@@ -57,6 +58,9 @@ def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_e
                 stream=stream,
                 **extra_kwargs,
             )
+            elapsed = time.monotonic() - request_start
+            debug_log(f"[{label}] 请求发送+接口响应耗时 {elapsed:.2f}s")
+            return response
         except TRANSIENT_NETWORK_ERRORS as exc:
             last_exc = exc
     raise last_exc
@@ -256,7 +260,7 @@ class GrokAPIClient:
             cls.RESPONSES_URL,
             headers=headers,
             json_body=body,
-            timeout=3600,
+            timeout=150,
             label=label,
         )
 

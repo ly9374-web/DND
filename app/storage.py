@@ -1,5 +1,9 @@
 import json
+import os
+import threading
+import uuid
 from dataclasses import asdict
+from functools import wraps
 
 from app.config import AppStorageKeys, CHAT_RECORDS_DIR, debug_log, settings
 from app.models import (
@@ -7,6 +11,17 @@ from app.models import (
     ChatRecordIndexItem,
     now_iso,
 )
+
+
+_record_lock = threading.RLock()
+
+
+def _serialized(method):
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with _record_lock:
+            return method(*args, **kwargs)
+    return wrapped
 
 
 class ChatRecordStore:
@@ -121,6 +136,7 @@ class ChatRecordStore:
         return cls.load_record_by_file_name(item.file_name, scope=scope)
 
     @classmethod
+    @_serialized
     def save_or_update_record(cls, record, scope: str | None = None):
         """
         对应 Swift:
@@ -145,6 +161,7 @@ class ChatRecordStore:
         )
 
     @classmethod
+    @_serialized
     def rename_record(cls, record_id, new_title, scope: str | None = None):
         """
         对应 Swift:
@@ -185,6 +202,7 @@ class ChatRecordStore:
             debug_log("[ChatRecordStore] Rename failed:", exc)
 
     @classmethod
+    @_serialized
     def delete_record(cls, record_id, scope: str | None = None):
         """
         对应 Swift:
@@ -199,15 +217,19 @@ class ChatRecordStore:
                 try:
                     path = cls.record_file_path(item.file_name, scope=scope)
                     if path.exists():
+                        from app.services.media_store import preserve_legacy_saved
+                        preserve_legacy_saved(cls.load_record_by_file_name(item.file_name, scope=scope))
                         path.unlink()
                 except Exception as exc:
                     debug_log("[ChatRecordStore] Delete file failed:", exc)
+                    raise
             else:
                 kept.append(item)
 
         cls.persist_index(kept, scope=scope)
 
     @classmethod
+    @_serialized
     def clear_scope(cls, scope: str):
         scope = str(scope or "").strip()
         if not scope:
@@ -216,13 +238,18 @@ class ChatRecordStore:
         try:
             scope_dir = cls._scope_dir(scope)
             if scope_dir.exists():
-                for path in scope_dir.glob(f"{cls.RECORD_FILE_NAME_PREFIX}*{cls.RECORD_FILE_NAME_SUFFIX}"):
+                paths = list(scope_dir.glob(f"{cls.RECORD_FILE_NAME_PREFIX}*{cls.RECORD_FILE_NAME_SUFFIX}"))
+                from app.services.media_store import preserve_legacy_saved
+                for path in paths:
+                    preserve_legacy_saved(cls.load_record_by_file_name(path.name, scope=scope))
+                for path in paths:
                     try:
                         path.unlink()
                     except Exception as exc:
                         debug_log("[ChatRecordStore] Clear scope unlink failed:", exc)
         except Exception as exc:
             debug_log("[ChatRecordStore] Clear scope failed:", exc)
+            return
 
         try:
             cls.persist_index([], scope=scope)
@@ -234,6 +261,7 @@ class ChatRecordStore:
     # =========================
 
     @classmethod
+    @_serialized
     def load_index(cls, scope: str | None = None):
         """
         对应 Swift private:
@@ -241,16 +269,15 @@ class ChatRecordStore:
         """
         raw = settings.get(cls._scope_index_key(scope), "")
 
-        if not raw:
-            return []
-
         if isinstance(raw, list):
             items = raw
         else:
             try:
-                items = json.loads(raw)
+                items = json.loads(raw or "[]")
             except Exception:
-                return []
+                items = []
+        if not isinstance(items, list):
+            items = []
 
         result = []
 
@@ -263,9 +290,46 @@ class ChatRecordStore:
             except Exception as exc:
                 debug_log("[ChatRecordStore] Bad index item:", exc)
 
+        return cls._reconcile_index(result, scope=scope)
+
+    @classmethod
+    def _reconcile_index(cls, items, scope=None):
+        """Recover orphan files without opening existing/cloud-only chat bodies."""
+        directory = cls._scope_dir(scope)
+        result = []
+        ids, names = set(), set()
+        for item in items:
+            name = item.file_name
+            if (not item.id or name != cls.record_file_name(item.id)
+                    or item.id in ids or name in names or not (directory / name).is_file()):
+                continue
+            result.append(item)
+            ids.add(item.id)
+            names.add(name)
+        for path in sorted(directory.glob(f"{cls.RECORD_FILE_NAME_PREFIX}*{cls.RECORD_FILE_NAME_SUFFIX}")):
+            if path.name in names:
+                continue
+            try:
+                # Offline iCloud placeholders can block reads indefinitely.
+                if getattr(path.stat(), "st_flags", 0) & 0x40000000:
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                record_id = str(data.get("id") or "")
+                if not record_id or path.name != cls.record_file_name(record_id) or record_id in ids:
+                    continue
+                # Retain visibility and branch ownership when rebuilding the list.
+                item = ChatRecordIndexItem.from_dict({**data, "file_name": path.name})
+                result.append(item)
+                ids.add(item.id)
+                names.add(path.name)
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
+                debug_log("[ChatRecordStore] Index recovery skipped:", path.name, type(exc).__name__)
+        if [item.to_dict() for item in result] != [item.to_dict() for item in items]:
+            cls.persist_index(result, scope=scope)
         return result
 
     @classmethod
+    @_serialized
     def persist_index(cls, items, scope: str | None = None):
         """
         对应 Swift private:
@@ -285,6 +349,7 @@ class ChatRecordStore:
         )
 
     @classmethod
+    @_serialized
     def upsert_index_item(cls, item, scope: str | None = None):
         """
         对应 Swift private:
@@ -348,10 +413,15 @@ class ChatRecordStore:
         else:
             payload = asdict(record)
 
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @classmethod
     def _scope_dir(cls, scope: str | None):

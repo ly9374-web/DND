@@ -58,4 +58,5 @@ with st.container(horizontal=True):
             for item in json.loads(st.session_state.video_fixture_saved)]
 
 page2._render_video_prompt_controls(st.session_state.page2_generated_media, WAN_MODEL)
+page2._render_media_operation_status()
 page2._render_operation_queue_status()

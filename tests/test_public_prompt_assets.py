@@ -100,7 +100,8 @@ class PublicPromptAssetTests(unittest.TestCase):
             for field, key in (("final_template_id", "fixedTemplateRecords"), ("final_world_book_id", "worldBookRecords"), ("final_long_term_memory_id", "longTermMemoryRecords"), ("final_user_character_id", "characterCardRecords")):
                 self.assertEqual(final[field], decode_records(store.values, key)[0]["id"])
             self.assertEqual(final["first_input"], "二")
-            self.assertEqual(len(final["first_inputs"]), 2)
+            self.assertEqual(len(final["first_inputs"]), 3)
+            self.assertEqual(final["first_inputs"][-1]["title"], "老玩家")
             self.assertEqual(final["long_term_memory"], "单独规则")
             self.assertTrue(store.bool(AppStorageKeys.QUICK_INPUT_DEFAULT_SEEDED))
             self.assertFalse(any(k.startswith("hidden") for k in store.values))

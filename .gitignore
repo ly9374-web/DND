@@ -1,6 +1,10 @@
 # Private runtime data: API keys, chat records, user prompts, backups, and media.
 .python_app_data/
+.media/
+.临时/
+.保存/
 .prompt_migration_backups/
+故事/*.wav
 
 # Local secrets and environment overrides.
 .env

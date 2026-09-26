@@ -4,6 +4,12 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
+from app.default_prompts.first_inputs import (
+    FIRST_INPUT_DEFAULTS_VERSION,
+    OLD_PLAYER_FIRST_INPUT,
+    OLD_PLAYER_FIRST_INPUT_TITLE,
+)
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -127,6 +133,7 @@ class SystemPromptRecord:
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     first_inputs_need_migration: bool = field(default=False, repr=False, compare=False)
+    first_input_defaults_version: int = 0
 
     def __post_init__(self):
         normalized_inputs: list[FirstInputRecord] = []
@@ -143,6 +150,20 @@ class SystemPromptRecord:
                 )
             ]
         self.first_inputs = normalized_inputs
+        # Seed each record once. Preserve the selected input and any customized
+        # preset; subsequent edits/deletions must not resurrect the default.
+        if self.first_input_defaults_version < FIRST_INPUT_DEFAULTS_VERSION:
+            if not any(
+                item.title.strip() == OLD_PLAYER_FIRST_INPUT_TITLE
+                or item.content.strip() == OLD_PLAYER_FIRST_INPUT
+                for item in self.first_inputs
+            ):
+                self.first_inputs.append(FirstInputRecord(
+                    title=OLD_PLAYER_FIRST_INPUT_TITLE,
+                    content=OLD_PLAYER_FIRST_INPUT,
+                ))
+            self.first_input_defaults_version = FIRST_INPUT_DEFAULTS_VERSION
+            self.first_inputs_need_migration = True
         if not any(item.id == self.selected_first_input_id for item in self.first_inputs):
             self.selected_first_input_id = self.first_inputs[0].id
         selected = next(
@@ -211,6 +232,9 @@ class SystemPromptRecord:
             first_inputs_need_migration=not bool(
                 data.get("first_inputs") or data.get("firstInputs")
             ),
+            first_input_defaults_version=(
+                optional_positive_int(data.get("first_input_defaults_version")) or 0
+            ),
         )
         return record
 
@@ -224,6 +248,7 @@ class SystemPromptRecord:
             "first_input": self.first_input,
             "first_inputs": [item.to_dict() for item in self.first_inputs],
             "selected_first_input_id": self.selected_first_input_id,
+            "first_input_defaults_version": self.first_input_defaults_version,
             "long_term_memory": self.long_term_memory,
             "final_template_id": self.final_template_id,
             "final_world_book_id": self.final_world_book_id,
@@ -306,6 +331,7 @@ class Page2ConversationTurn:
     is_loading: bool = False
     is_user_message_hidden: bool = False
     is_context_excluded: bool = False
+    assistant_audio_filename: str = ""
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
 
@@ -326,6 +352,11 @@ class Page2ConversationTurn:
                 if "is_context_excluded" in data
                 else data.get("isContextExcluded", False)
             ),
+            assistant_audio_filename=str(
+                data.get("assistant_audio_filename")
+                if "assistant_audio_filename" in data
+                else data.get("assistantAudioFilename", "") or ""
+            ),
             date=data.get("date") or now_iso(),
         )
 
@@ -337,6 +368,7 @@ class Page2ConversationTurn:
             "is_loading": self.is_loading,
             "is_user_message_hidden": self.is_user_message_hidden,
             "is_context_excluded": self.is_context_excluded,
+            "assistant_audio_filename": str(self.assistant_audio_filename or ""),
             "date": self.date,
         }
 
@@ -352,6 +384,7 @@ class GeneratedImageRecord:
     video_url_string: str = None
     source_image_url_string: str = None
     source_image_data_base64: str = None
+    source_image_id: str = ""
     duration_seconds: float = None
     video_generation_provider: str = None
     id: str = field(default_factory=new_id)
@@ -360,6 +393,8 @@ class GeneratedImageRecord:
     previous_source_turn_id: str = ""
     video_prompt: str = ""
     video_story_text: str = ""
+    # Distinguish new temporary base64 outputs from legacy explicitly saved images.
+    media_managed: bool = False
 
     @staticmethod
     def from_dict(data):
@@ -381,12 +416,14 @@ class GeneratedImageRecord:
             video_url_string=data.get("video_url_string") or data.get("videoURLString"),
             source_image_url_string=data.get("source_image_url_string") or data.get("sourceImageURLString"),
             source_image_data_base64=data.get("source_image_data_base64") or data.get("sourceImageDataBase64"),
+            source_image_id=str(data.get("source_image_id") or ""),
             duration_seconds=data.get("duration_seconds") or data.get("durationSeconds"),
             video_generation_provider=data.get("video_generation_provider") or data.get("videoGenerationProvider"),
             source_turn_id=str(data.get("source_turn_id") or ""),
             previous_source_turn_id=str(data.get("previous_source_turn_id") or ""),
             video_prompt=str(data.get("video_prompt") or ""),
             video_story_text=str(data.get("video_story_text") or ""),
+            media_managed=bool(data.get("media_managed", False)),
         )
 
     def to_dict(self):
@@ -403,12 +440,14 @@ class GeneratedImageRecord:
             "video_url_string": self.video_url_string,
             "source_image_url_string": self.source_image_url_string,
             "source_image_data_base64": self.source_image_data_base64,
+            "source_image_id": self.source_image_id,
             "duration_seconds": self.duration_seconds,
             "video_generation_provider": self.video_generation_provider,
             "source_turn_id": self.source_turn_id,
             "previous_source_turn_id": self.previous_source_turn_id,
             "video_prompt": self.video_prompt,
             "video_story_text": self.video_story_text,
+            "media_managed": self.media_managed,
         }
 
 

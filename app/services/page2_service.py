@@ -17,14 +17,18 @@ from app.api.media_clients import (
     WAI_ILLUSTRIOUS_PROVIDER,
     IMAGE_ASPECT_RATIO,
     IMAGE_ASPECT_RATIOS,
-    CloudinaryUploader,
     OpenRouterVideoAPIClient,
     GrokImageAPIClient,
     ReplicateImageAPIClient,
     ReplicateVideoAPIClient,
-    download_url_as_base64,
+    download_image_bytes,
 )
+from app.api.speech_client import VOICES
 from app.config import AppStorageKeys, settings
+from app.image_models import (
+    IMAGE2_PROVIDER, IMAGE2_DEFAULT_QUALITY,
+    normalize_image_provider, validate_image_options,
+)
 from app.models import (
     CHAT_MODEL_LABELS,
     CHAT_MODEL_OPTIONS,
@@ -39,6 +43,7 @@ from app.models import (
     openrouter_api_model_for_chat_model,
 )
 from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
+from app.services import media_store, image_references
 from app.services.image_prompts import build_image_prompt_system_prompt
 from app.services.video_prompts import VIDEO_PROMPT_SYSTEM_PROMPT
 from app.storage import ChatRecordStore
@@ -61,6 +66,13 @@ def normalize_story_brain_update_model(value) -> str:
     if model in STORY_BRAIN_UPDATE_MODELS:
         return model
     return "deepseekFlash"
+
+
+def _normalize_tts_voice(value) -> str:
+    voice = str(value or "").strip()
+    if voice in VOICES:
+        return voice
+    return next(iter(VOICES))
 
 UNEXPECTED_EVENT_PROMPT = """
 本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况可以是场景中的角色主动了什么话，或做了什么行为，也可能是什么突发事件。
@@ -154,6 +166,7 @@ class Page2Context:
     unexpected_event_threshold: int
     temperature: float
     selected_video_generation_provider: str
+    selected_tts_voice: str
 
 
 def load_context_from_settings() -> Page2Context:
@@ -188,6 +201,9 @@ def load_context_from_settings() -> Page2Context:
         selected_video_generation_provider=normalize_video_model(
             settings.get(AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER, WAN_MODEL)
         ),
+        selected_tts_voice=_normalize_tts_voice(
+            settings.get(AppStorageKeys.PAGE2_SELECTED_TTS_VOICE, "")
+        ),
     )
 
 
@@ -204,6 +220,7 @@ def default_context() -> Page2Context:
         unexpected_event_threshold=98,
         temperature=0.8,
         selected_video_generation_provider=WAN_MODEL,
+        selected_tts_voice=next(iter(VOICES)),
     )
 
 
@@ -241,6 +258,7 @@ def save_context_to_settings(ctx: Page2Context) -> bool:
         AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER: normalize_video_model(
             ctx.selected_video_generation_provider
         ),
+        AppStorageKeys.PAGE2_SELECTED_TTS_VOICE: _normalize_tts_voice(ctx.selected_tts_voice),
     }
     if all(settings.get(key) == value for key, value in updates.items()):
         return False
@@ -453,10 +471,10 @@ def generate_image(
     image_urls: Optional[list[str]] = None,
     aspect_ratio: str = IMAGE_ASPECT_RATIO,
     refiner_prompt: str = "",
+    quality: str = IMAGE2_DEFAULT_QUALITY,
+    allow_temporary_upload: bool = False,
 ) -> GeneratedImageRecord:
-    provider = str(provider or "").strip()
-    if provider == "grokQuality":
-        provider = "grokpro2k"
+    provider = normalize_image_provider(provider)
     prompt = str(prompt or "").strip()
     refiner_prompt = str(refiner_prompt or "").strip()
     image_urls = image_urls or []
@@ -465,8 +483,12 @@ def generate_image(
     if not prompt:
         raise ValueError("你得先点“生成图片prompt”生成prompt才能点这个生图")
 
-    if aspect_ratio not in IMAGE_ASPECT_RATIOS:
-        raise ValueError("图片尺寸请选择 3:4、4:3 或 1:1。")
+    validate_image_options(provider, aspect_ratio, image_urls, quality)
+    image_urls, durable_references = image_references.resolve_inputs(
+        image_urls,
+        provider=provider,
+        allow_temporary_upload=allow_temporary_upload,
+    )
 
     if provider in ["grok", "grokpro2k", "grokPro"]:
         model = {
@@ -490,6 +512,7 @@ def generate_image(
             image_urls=image_urls,
             aspect_ratio=aspect_ratio,
             refiner_prompt=refiner_prompt,
+            **({"quality": quality} if provider == IMAGE2_PROVIDER else {}),
         )
 
     image_url = getattr(result, "image_url", None)
@@ -501,7 +524,7 @@ def generate_image(
         media_kind=GeneratedMediaKind.IMAGE,
         image_url_string=image_url,
         image_data_base64=image_base64,
-        image_input_urls=image_urls,
+        image_input_urls=durable_references,
         video_url_string=None,
         source_image_url_string=None,
         source_image_data_base64=None,
@@ -528,18 +551,21 @@ def _decode_image_base64(image_base64: str) -> bytes:
 
 
 def _video_input_image_bytes(source_record: GeneratedImageRecord) -> bytes:
-    if source_record.image_data_base64:
+    if not media_store.available(source_record):
+        raise ValueError("输入图片已过期或已删除，请重新选择图片。")
+    if media_store.local_path(source_record):
+        image_bytes = media_store.read_bytes(source_record)
+    elif source_record.image_data_base64:
         try:
             image_bytes = _decode_image_base64(source_record.image_data_base64)
         except Exception as exc:
-            raise RuntimeError("解析输入图片 base64 失败，无法上传到 Cloudinary。原始错误：" + str(exc))
+            raise RuntimeError("解析输入图片 base64 失败。原始错误：" + str(exc))
     elif source_record.image_url_string:
         try:
-            image_base64 = download_url_as_base64(source_record.image_url_string)
-            image_bytes = _decode_image_base64(image_base64)
+            image_bytes = download_image_bytes(source_record.image_url_string)
         except Exception as exc:
             raise RuntimeError(
-                "输入图片 URL 已无法访问或无法下载，无法上传到 Cloudinary。"
+                "输入图片 URL 已无法访问或无法下载，且没有可用本地副本。"
                 "请重新生成图片，或使用仍可访问的图片作为输入。原始错误："
                 + str(exc)
             )
@@ -559,23 +585,6 @@ def _video_aspect_ratio(image_bytes: bytes, supported_ratios: tuple[str, ...]) -
     )
 
 
-def _prepare_video_cloudinary_image_url(
-    source_record: GeneratedImageRecord, *, image_bytes: bytes | None = None,
-) -> str:
-    if image_bytes is None:
-        image_bytes = _video_input_image_bytes(source_record)
-
-    try:
-        return CloudinaryUploader.upload_image_bytes(image_bytes)
-    except Exception as exc:
-        raise RuntimeError(
-            "上传图片到 Cloudinary 失败，无法生成视频。"
-            "请确认 Cloudinary API Key 已在 APIkey 页面或 Streamlit Secrets 配置，"
-            "并确认 Cloudinary API Secret 已在 APIkey 页面或 Streamlit Secrets 配置。原始错误："
-            + str(exc)
-        )
-
-
 def generate_video_from_image(
     *,
     ctx: Page2Context,
@@ -583,6 +592,7 @@ def generate_video_from_image(
     prompt: str,
     seconds: int | float,
     generate_audio: bool = True,
+    allow_temporary_upload: bool = False,
 ) -> GeneratedImageRecord:
     prompt = str(prompt or "").strip()
     if not prompt:
@@ -591,7 +601,10 @@ def generate_video_from_image(
     provider = str(ctx.selected_video_generation_provider or WAN_MODEL).strip()
     validate_video_duration(provider, seconds)
     image_bytes = _video_input_image_bytes(source_record)
-    image_reference = _prepare_video_cloudinary_image_url(source_record, image_bytes=image_bytes)
+    image_reference = image_references.resolve_record(
+        source_record, provider=provider, purpose="video", image_bytes=image_bytes,
+        allow_temporary_upload=allow_temporary_upload,
+    )
 
     if provider == WAN_MODEL:
         video_url = ReplicateVideoAPIClient.generate_wan_2_2_i2v_fast(
@@ -619,7 +632,8 @@ def generate_video_from_image(
         image_input_urls=[],
         video_url_string=video_url,
         source_image_url_string=source_record.image_url_string,
-        source_image_data_base64=source_record.image_data_base64,
+        source_image_data_base64=None,
+        source_image_id=source_record.id,
         duration_seconds=effective_seconds,
         video_generation_provider=provider,
     )
@@ -660,8 +674,7 @@ def upsert_chat_record(
     scope: str | None = None,
     hidden: bool = False,
 ) -> str:
-    has_short_story_brain = bool(str(story_brain_short or "").strip())
-    if not record_id and not turns and not generated_media and not has_short_story_brain:
+    if not record_id and not turns and not generated_media:
         return str(record_id or "").strip()
 
     now = now_iso()

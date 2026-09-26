@@ -20,11 +20,15 @@ class ReplicateImagePollingTests(unittest.TestCase):
         self.starting = {"id": "test-task", "status": "starting", "output": None}
         self.ready = {"id": "test-task", "status": "succeeded",
                       "output": ["https://example.com/image.png"]}
+        # Keep the fake polling clock local to the client. Patching time.sleep
+        # globally also changes Streamlit's AppTest thread/event-loop timing.
+        client_time = Mock(wraps=media_clients.time)
+        client_time.monotonic.side_effect = lambda: self.clock
+        client_time.sleep.side_effect = self.advance
         for target, kwargs in (
             ("debug_log", {}),
             ("ReplicateConfig.api_token", {"return_value": "test-token"}),
-            ("time.monotonic", {"side_effect": lambda: self.clock}),
-            ("time.sleep", {"side_effect": self.advance}),
+            ("time", {"new": client_time}),
         ):
             patcher = patch("app.api.media_clients." + target, **kwargs)
             patcher.start()
@@ -38,6 +42,8 @@ class ReplicateImagePollingTests(unittest.TestCase):
             "nano",
             "nanoPro",
             "flux",
+            "flux2-dev",
+            "seedream-4.5",
             media_clients.ANILLUSTRIOUS_PROVIDER,
             media_clients.WAI_ILLUSTRIOUS_PROVIDER,
         ):
@@ -99,7 +105,7 @@ class ReplicateImagePollingTests(unittest.TestCase):
                             "prompt_conjunction": True,
                         },
                     },
-                    timeout=(15, 90),
+                    timeout=(20, 120),
                 )
 
     def test_anillustrious_rejects_reference_images_before_submitting(self):
@@ -158,7 +164,7 @@ class ReplicateImagePollingTests(unittest.TestCase):
                             "width": width,
                         },
                     },
-                    timeout=(15, 90),
+                    timeout=(20, 120),
                 )
 
     def test_wai_illustrious_rejects_reference_images_before_submitting(self):
@@ -209,6 +215,8 @@ class ReplicateImagePollingTests(unittest.TestCase):
             "nano",
             "nanoPro",
             "flux",
+            "flux2-dev",
+            "seedream-4.5",
             media_clients.ANILLUSTRIOUS_PROVIDER,
             media_clients.WAI_ILLUSTRIOUS_PROVIDER,
         ):
@@ -456,14 +464,18 @@ class ReplicateImagePollingTests(unittest.TestCase):
             get.assert_not_called()
 
     def test_create_timeout_is_not_retried(self):
-        with (
-            patch.object(media_clients.requests, "post", side_effect=requests.Timeout()) as post,
-            patch.object(media_clients.requests, "get") as get,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "无法确认任务是否已创建"):
-                self.client.generate_image("nano", "风景")
-            post.assert_called_once()
-            get.assert_not_called()
+        for error in (requests.Timeout(), requests.ConnectionError(
+                "Connection aborted.", TimeoutError("The write operation timed out"))):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(media_clients.requests, "post", side_effect=error) as post,
+                patch.object(media_clients.requests, "get") as get,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "无法确认任务是否已创建"):
+                    self.client.generate_image("nano", "风景")
+                post.assert_called_once()
+                self.assertEqual(post.call_args.kwargs["timeout"], (20, 120))
+                get.assert_not_called()
 
     def test_frontend_error_survives_refresh_until_dismissed(self):
         from streamlit.testing.v1 import AppTest
@@ -472,6 +484,7 @@ class ReplicateImagePollingTests(unittest.TestCase):
 import streamlit as st
 from web.pages import page2
 st.session_state.setdefault("page2_operation_error", "生图查询失败：test-task")
+page2._render_media_operation_status()
 page2._render_operation_queue_status()
 ''').run()
         for _ in range(3):

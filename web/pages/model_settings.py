@@ -16,6 +16,13 @@ from web.components.delete_confirmation import render_delete_confirmation, reque
 
 FIELDS = [
     (
+        "输入 DashScope API Key（语音生成，会本地持久化保存）",
+        AppStorageKeys.DASHSCOPE_API_KEY,
+        "DASHSCOPE_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "https://bailian.console.aliyun.com/",
+    ),
+    (
         "输入 Grok 聊天 API Key（会本地持久化保存）",
         AppStorageKeys.XAI_CHAT_API_KEY,
         "GROK_CHAT_API_KEY",
@@ -215,13 +222,12 @@ def render():
     st.caption("已保存的 Key 会在本页始终以明文显示；可直接修改、复制或删除。")
 
     st.checkbox(
-        "打印调试日志",
+        "打印并保存调试日志（48 小时）",
         value=settings.bool(AppStorageKeys.DEBUG_LOG_ENABLED, False),
-        help="关闭后不会在控制台打印请求体、响应体和调试信息，可减少卡顿。",
+        help="调试信息会实时打印到启动终端，同时存入 .python_app_data/logs；图片编码、密钥和 URL 签名会被省略。文件日志保留 48 小时。",
         key="model_settings_debug_log_enabled",
         on_change=_save_debug_enabled,
     )
-
     st.subheader("API Keys")
     st.caption("在输入框里按回车会立即保存该 Key。")
 
