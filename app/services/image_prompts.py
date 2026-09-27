@@ -1,8 +1,8 @@
 """作为普通聊天用户消息发送的图片 prompt 模式指令。"""
 
 
-def build_image_prompt_system_prompt(mode: str = "normal", subject: str = "") -> str:
-    mode = str(mode or "normal").strip()
+def build_image_prompt_system_prompt(mode: str = "first_person", subject: str = "") -> str:
+    mode = str(mode or "first_person").strip()
     subject = str(subject or "").strip()
     if mode == "closeup" and not subject:
         raise ValueError("主体不能为空。")

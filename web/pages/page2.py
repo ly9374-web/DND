@@ -363,7 +363,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_pending_media_record_select", "")
     st.session_state.setdefault("page2_media_selection_nonce", 0)
     st.session_state.setdefault("page2_image_prompt", "")
-    st.session_state.setdefault("page2_image_prompt_mode", "normal")
+    st.session_state.setdefault("page2_image_prompt_mode", "first_person")
     st.session_state.setdefault("page2_image_prompt_subject", "")
     st.session_state.setdefault("page2_image_prompt_source", {})
     st.session_state.setdefault("page2_refiner_prompt", "")
@@ -377,6 +377,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_story_brain_retry_pending", False)
     st.session_state.setdefault("page2_story_brain_next_update_turn", None)
     st.session_state.setdefault("page2_story_brain_last_update_turn_id", "")
+    st.session_state.setdefault("page2_auto_image_next_turn", None)
     st.session_state.setdefault("page2_story_brain_checkpoints", [])
     st.session_state.setdefault("page2_operation_queue", [])
     st.session_state.setdefault("page2_active_operation", None)
@@ -801,7 +802,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state.page2_pending_media_record_select = ""
     url_favorites.clear_preview_url("page2")
     st.session_state.page2_image_prompt = ""
-    st.session_state.page2_image_prompt_mode = "normal"
+    st.session_state.page2_image_prompt_mode = "first_person"
     st.session_state.page2_image_prompt_subject = ""
     st.session_state.page2_image_prompt_source = {}
     st.session_state.page2_refiner_prompt = ""
@@ -816,6 +817,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state["page2_story_brain_retry_pending"] = False
     st.session_state["page2_story_brain_next_update_turn"] = None
     st.session_state["page2_story_brain_last_update_turn_id"] = ""
+    st.session_state["page2_auto_image_next_turn"] = None
     st.session_state["page2_story_brain_checkpoints"] = []
     st.session_state["page2_operation_queue"] = []
     st.session_state["page2_active_operation"] = None
@@ -940,6 +942,15 @@ def _load_record_from_nav_if_needed():
     st.session_state["page2_story_brain_last_update_turn_id"] = str(
         getattr(record, "story_brain_last_update_turn_id", "") or ""
     )
+    auto_image_next_turn = getattr(record, "auto_image_next_turn", None)
+    if auto_image_next_turn is None:
+        auto_image_ctx = page2_service.load_context_from_settings()
+        if auto_image_ctx.auto_image_enabled:
+            auto_image_next_turn = (
+                _completed_auto_image_turn_count(list(st.session_state.page2_turns))
+                + auto_image_ctx.auto_image_interval
+            )
+    st.session_state["page2_auto_image_next_turn"] = auto_image_next_turn
     _refresh_short_story_brain_editor()
     latest_media_id = _latest_image_media_id(st.session_state.page2_generated_media)
     st.session_state.page2_selected_media_id = latest_media_id
@@ -1145,6 +1156,7 @@ def _upsert_record():
             st.session_state.get("page2_story_brain_last_update_turn_id", "")
             or ""
         ),
+        auto_image_next_turn=st.session_state.get("page2_auto_image_next_turn"),
         final_setting_id=str(
             st.session_state.get("page2_final_setting_id", "") or ""
         ),
@@ -1258,6 +1270,18 @@ def _completed_turn_count(turns: list[Page2ConversationTurn]) -> int:
         if not bool(getattr(turn, "is_context_excluded", False))
         if str(turn.user_message or "").strip()
         and str(turn.assistant_message or "").strip()
+    )
+
+
+def _completed_auto_image_turn_count(turns: list[Page2ConversationTurn]) -> int:
+    return sum(
+        1 for turn in turns
+        if not turn.is_context_excluded
+        and not turn.is_auto_dice_followup
+        and str(turn.user_message or "").strip()
+        and str(turn.assistant_message or "").strip()
+        and not turn.is_loading
+        and not str(turn.assistant_message).startswith("请求失败，请稍后重试。")
     )
 
 
@@ -1396,6 +1420,8 @@ def _apply_sidebar_context_values(
     temperature,
     unexpected_event_enabled,
     unexpected_event_threshold,
+    auto_image_enabled=None,
+    auto_image_interval=None,
 ) -> bool:
     """Copy sidebar widget values into ctx and report whether they changed."""
     previous = (
@@ -1409,6 +1435,8 @@ def _apply_sidebar_context_values(
         ctx.temperature,
         ctx.unexpected_event_enabled,
         ctx.unexpected_event_threshold,
+        ctx.auto_image_enabled,
+        ctx.auto_image_interval,
     )
 
     ctx.context_turn_count = int(context_turn_count)
@@ -1427,6 +1455,10 @@ def _apply_sidebar_context_values(
     ctx.temperature = float(temperature)
     ctx.unexpected_event_enabled = bool(unexpected_event_enabled)
     ctx.unexpected_event_threshold = int(unexpected_event_threshold)
+    if auto_image_enabled is not None:
+        ctx.auto_image_enabled = bool(auto_image_enabled)
+    if auto_image_interval is not None:
+        ctx.auto_image_interval = int(auto_image_interval)
 
     current = (
         ctx.context_turn_count,
@@ -1439,6 +1471,8 @@ def _apply_sidebar_context_values(
         ctx.temperature,
         ctx.unexpected_event_enabled,
         ctx.unexpected_event_threshold,
+        ctx.auto_image_enabled,
+        ctx.auto_image_interval,
     )
     return current != previous
 
@@ -1467,6 +1501,7 @@ def render_sidebar_context():
 
         st.subheader("上下文设置")
         ctx = page2_service.load_context_from_settings()
+        previous_auto_image = (ctx.auto_image_enabled, ctx.auto_image_interval)
 
         # 提供从 Prompt 页面选择最终设定的入口
         prompt_state = system_prompts.load_state(
@@ -1699,6 +1734,23 @@ def render_sidebar_context():
             key="page2_sidebar_unexpected_event_threshold",
         )
 
+        st.divider()
+        with st.expander("自动生图", expanded=False):
+            auto_image_enabled = st.toggle(
+                "开启自动生图",
+                value=bool(ctx.auto_image_enabled),
+                key="page2_sidebar_auto_image_enabled",
+            )
+            auto_image_interval = st.slider(
+                "每隔几轮生成一张图片",
+                min_value=1,
+                max_value=12,
+                value=int(ctx.auto_image_interval),
+                step=1,
+                key="page2_sidebar_auto_image_interval",
+            )
+            st.caption("只统计用户发起的完整问答；自动掷骰不计入。失败后下一轮重试。")
+
         context_changed = _apply_sidebar_context_values(
             ctx,
             context_turn_count=context_turn_count,
@@ -1711,7 +1763,15 @@ def render_sidebar_context():
             temperature=temperature,
             unexpected_event_enabled=unexpected_event_enabled,
             unexpected_event_threshold=unexpected_event_threshold,
+            auto_image_enabled=auto_image_enabled,
+            auto_image_interval=auto_image_interval,
         )
+        if previous_auto_image != (ctx.auto_image_enabled, ctx.auto_image_interval):
+            st.session_state["page2_auto_image_next_turn"] = (
+                _completed_auto_image_turn_count(list(st.session_state.page2_turns))
+                + ctx.auto_image_interval
+                if ctx.auto_image_enabled else None
+            )
         if context_changed:
             try:
                 page2_service.save_context_to_settings(ctx)
@@ -1862,12 +1922,14 @@ def _prepare_resend_operation(task: _Page2OperationTask):
     replacement = Page2ConversationTurn(
         user_message=original.user_message,
         is_user_message_hidden=original.is_user_message_hidden,
+        is_auto_dice_followup=original.is_auto_dice_followup,
     )
     task.meta.update({
         "ctx": ctx, "turn_id": replacement.id, "replacement": replacement,
         "original_turns": [turn.to_dict() for turn in turns], "remaining_turns": remaining,
         "rewound_memory": memory, "rewound_checkpoints": checkpoints, "memory_notice": notice,
         "story_brain_enabled": bool(task.payload.get("story_brain_enabled", True)),
+        "is_auto_dice_followup": original.is_auto_dice_followup,
         "memory_source_text": "\n\n".join(filter(None, [
             _latest_assistant_message(remaining).strip(), original.user_message,
         ])),
@@ -1936,6 +1998,7 @@ def _prepare_chat_operation(task: _Page2OperationTask):
         assistant_message=None,
         is_loading=True,
         is_user_message_hidden=bool(task.payload.get("hide_user_message", False)),
+        is_auto_dice_followup=bool(task.payload.get("is_auto_dice_followup", False)),
     )
     st.session_state.page2_turns = turns + [new_turn]
     _upsert_record()
@@ -2037,13 +2100,22 @@ def _prepare_story_brain_operation(task: _Page2OperationTask):
 def _prepare_image_prompt_operation(task: _Page2OperationTask):
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     turns_snapshot = deepcopy(list(st.session_state.page2_turns))
+    source_turn_id = str(task.payload.get("source_turn_id", "") or "")
+    if source_turn_id:
+        source_index = next(
+            (index for index, turn in enumerate(turns_snapshot) if turn.id == source_turn_id),
+            None,
+        )
+        if source_index is None:
+            raise ValueError("自动生图对应的故事轮次已不存在。")
+        turns_snapshot = turns_snapshot[:source_index + 1]
     task.meta["image_prompt_source"] = latest_image_prompt_source(turns_snapshot)
     task.meta["previous_image_prompt"] = str(st.session_state.get("page2_image_prompt") or "")
     story_brain_short = _current_short_story_brain()
     story_brain_enabled = bool(
         st.session_state.get("page2_story_brain_enabled", True)
     )
-    mode = str(task.payload.get("mode", "normal") or "normal")
+    mode = str(task.payload.get("mode", "first_person") or "first_person")
     subject = str(task.payload.get("subject", "") or "")
     return lambda: page2_service.generate_image_prompt(
         ctx=ctx,
@@ -2203,12 +2275,13 @@ def _schedule_chat_followups(task: _Page2OperationTask, reply: str) -> None:
                 turn_id=turn_id,
                 first=True,
             )
-    if (
+    auto_roll_queued = (
         task.error is None
         and not is_context_excluded
         and not bool(task.meta.get("is_auto_dice_followup", False))
         and page2_service.should_auto_roll_dice(reply)
-    ):
+    )
+    if auto_roll_queued:
         _enqueue_operation(
             "chat",
             "自动掷骰并发送",
@@ -2221,6 +2294,10 @@ def _schedule_chat_followups(task: _Page2OperationTask, reply: str) -> None:
             },
             first=True,
             allow_same_kind=True,
+        )
+    if task.error is None and not is_context_excluded and not auto_roll_queued:
+        _schedule_auto_image(
+            ctx=page2_service.load_context_from_settings(), source_turn_id=turn_id,
         )
     st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
 
@@ -2353,12 +2430,30 @@ def _advance_operation_queues() -> bool:
             _apply_operation(task)
             if task.error is not None:
                 raise task.error
+            if task.payload.get("auto_image") and task.kind == "image":
+                st.session_state["page2_auto_image_next_turn"] = (
+                    int(task.payload["auto_image_turn_count"])
+                    + page2_service.load_context_from_settings().auto_image_interval
+                )
+                _upsert_record()
             st.session_state["page2_operation_notice"] = f"已完成：{task.label}" + str(
                 task.meta.get("completion_notice") or task.meta.get("memory_notice") or ""
             )
         except Exception as exc:
             _cancel_workflow_followups(task)
-            suffix = "失败，已停止本次一键生成：" if task.payload.get("workflow_id") else "失败，其他任务将继续："
+            if task.payload.get("auto_image"):
+                st.session_state["page2_auto_image_next_turn"] = (
+                    int(task.payload["auto_image_turn_count"]) + 1
+                )
+                try:
+                    _upsert_record()
+                except Exception:
+                    pass
+            suffix = (
+                "失败，下轮重试：" if task.payload.get("auto_image")
+                else "失败，已停止本次一键生成：" if task.payload.get("workflow_id")
+                else "失败，其他任务将继续："
+            )
             message = f"{task.label}{suffix}" + user_facing_error_message(exc)
             previous = str(st.session_state.get("page2_operation_error") or "")
             st.session_state["page2_operation_error"] = "\n\n".join(filter(None, [previous, message]))
@@ -2816,6 +2911,108 @@ def _render_image_references(provider: str, media: list) -> list[str]:
         if reference not in references:
             references.append(reference)
     return references
+
+
+def _current_auto_image_options() -> dict:
+    """Read the same image controls used by the right-hand media panel."""
+    provider = normalize_image_provider(
+        st.session_state.get("_page2_image_provider") or _last_image_provider()
+    )
+    saved_ratios = settings.get(AppStorageKeys.PAGE2_IMAGE_ASPECT_RATIOS, {})
+    saved_ratios = saved_ratios if isinstance(saved_ratios, dict) else {}
+    ratio = st.session_state.get(f"page2_image_aspect_ratio_{provider}")
+    if ratio not in image_aspect_ratios(provider):
+        ratio = saved_ratios.get(provider, page2_service.IMAGE_ASPECT_RATIO)
+    if ratio not in image_aspect_ratios(provider):
+        ratio = page2_service.IMAGE_ASPECT_RATIO
+    quality = st.session_state.get("page2_image2_quality") or settings.get(
+        AppStorageKeys.PAGE2_IMAGE2_QUALITY, IMAGE2_DEFAULT_QUALITY
+    )
+    if quality not in IMAGE2_QUALITIES:
+        quality = IMAGE2_DEFAULT_QUALITY
+    image_urls = []
+    if provider not in {
+        page2_service.ANILLUSTRIOUS_PROVIDER, page2_service.WAI_ILLUSTRIOUS_PROVIDER,
+    }:
+        images = _reference_images()
+        selected = [item for item in _manual_reference_ids() if item in images]
+        image_urls = [image_references.media_reference(images[item]) for item in selected]
+        by_url = {
+            item.image_url_string: item for item in images.values() if item.image_url_string
+        }
+        raw = str(st.session_state.get(_reference_key() + "_urls", "") or "")
+        for value in (line.strip() for line in raw.splitlines() if line.strip()):
+            reference = (
+                image_references.media_reference(by_url[value]) if value in by_url else value
+            )
+            if reference not in image_urls:
+                image_urls.append(reference)
+    validate_image_options(provider, ratio, image_urls, quality)
+    mode = str(st.session_state.get("page2_image_prompt_mode") or "first_person")
+    subject = str(st.session_state.get("page2_image_prompt_subject") or "").strip()
+    if mode == "closeup" and not subject:
+        mode = "first_person"
+    if mode not in {"normal", "first_person", "closeup"}:
+        mode = "first_person"
+    return {
+        "mode": mode,
+        "subject": subject if mode == "closeup" else "",
+        "provider": provider,
+        "image_urls": image_urls,
+        "aspect_ratio": ratio,
+        "refiner_prompt": (
+            str(st.session_state.get("page2_refiner_prompt") or "")
+            if provider == page2_service.ANILLUSTRIOUS_PROVIDER else ""
+        ),
+        "quality": quality,
+    }
+
+
+def _schedule_auto_image(*, ctx, source_turn_id: str) -> None:
+    if not ctx.auto_image_enabled or not source_turn_id:
+        return
+    completed = _completed_auto_image_turn_count(list(st.session_state.page2_turns))
+    next_turn = st.session_state.get("page2_auto_image_next_turn")
+    if next_turn is None:
+        next_turn = ctx.auto_image_interval
+    if completed < int(next_turn) or any(
+        task.payload.get("auto_image") for task in _pending_operations()
+    ):
+        return
+    try:
+        options = _current_auto_image_options()
+    except Exception as exc:
+        st.session_state["page2_auto_image_next_turn"] = completed + 1
+        _upsert_record()
+        st.session_state["page2_operation_error"] = (
+            "自动生图设置无效，下轮重试：" + user_facing_error_message(exc)
+        )
+        return
+    workflow_id = uuid.uuid4().hex
+    scope_id = _operation_scope_id()
+    prompt_task = _Page2OperationTask(
+        kind="image_prompt", label="自动生图 · 图片 prompt", scope_id=scope_id,
+        payload={
+            "ctx": deepcopy(ctx), "mode": options["mode"], "subject": options["subject"],
+            "source_turn_id": source_turn_id, "auto_image": True,
+            "auto_image_turn_count": completed, "workflow_id": workflow_id,
+        },
+    )
+    image_task = _Page2OperationTask(
+        kind="image", label="自动生图 · 图片", scope_id=scope_id,
+        payload={
+            "provider": options["provider"], "image_urls": options["image_urls"],
+            "aspect_ratio": options["aspect_ratio"],
+            "refiner_prompt": options["refiner_prompt"], "quality": options["quality"],
+            "allow_temporary_upload": True,
+            "prompt_operation_id": prompt_task.id, "auto_image": True,
+            "auto_image_turn_count": completed, "workflow_id": workflow_id,
+        },
+    )
+    st.session_state["page2_operation_queue"] = (
+        list(st.session_state.get("page2_operation_queue") or []) + [prompt_task, image_task]
+    )
+    st.session_state["page2_operation_notice"] = "已加入队列：自动生图"
 
 
 def _queue_image_generation(

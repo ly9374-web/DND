@@ -23,6 +23,7 @@ def _reset_chat_session_state():
         "page2_image_prompt",
         "page2_image_prompt_mode",
         "page2_image_prompt_subject",
+        "page2_auto_image_next_turn",
         "page2_story_brain_short",
         "page2_story_brain_archive",
         "page2_story_brain_checkpoints",

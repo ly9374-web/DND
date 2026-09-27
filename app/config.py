@@ -43,6 +43,8 @@ class AppStorageKeys:
     PAGE2_STORY_BRAIN_TURNS = "page2StoryBrainTurns"
     PAGE2_UNEXPECTED_EVENT_ENABLED = "page2UnexpectedEventEnabled"
     PAGE2_UNEXPECTED_EVENT_THRESHOLD = "page2UnexpectedEventThreshold"
+    PAGE2_AUTO_IMAGE_ENABLED = "page2AutoImageEnabled"
+    PAGE2_AUTO_IMAGE_INTERVAL = "page2AutoImageInterval"
     PAGE2_TEMPERATURE = "page2Temperature"
     PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER = "page2SelectedVideoGenerationProvider"
     PAGE2_SELECTED_TTS_VOICE = "page2SelectedTtsVoice"

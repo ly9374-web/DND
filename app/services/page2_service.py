@@ -164,6 +164,8 @@ class Page2Context:
     story_brain_turns: int
     unexpected_event_enabled: bool
     unexpected_event_threshold: int
+    auto_image_enabled: bool
+    auto_image_interval: int
     temperature: float
     selected_video_generation_provider: str
     selected_tts_voice: str
@@ -197,6 +199,8 @@ def load_context_from_settings() -> Page2Context:
             100,
             max(0, settings.int(AppStorageKeys.PAGE2_UNEXPECTED_EVENT_THRESHOLD, 98)),
         ),
+        auto_image_enabled=settings.bool(AppStorageKeys.PAGE2_AUTO_IMAGE_ENABLED, False),
+        auto_image_interval=min(12, max(1, settings.int(AppStorageKeys.PAGE2_AUTO_IMAGE_INTERVAL, 5))),
         temperature=float(settings.float(AppStorageKeys.PAGE2_TEMPERATURE, 0.8)),
         selected_video_generation_provider=normalize_video_model(
             settings.get(AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER, WAN_MODEL)
@@ -218,6 +222,8 @@ def default_context() -> Page2Context:
         story_brain_turns=6,
         unexpected_event_enabled=False,
         unexpected_event_threshold=98,
+        auto_image_enabled=False,
+        auto_image_interval=5,
         temperature=0.8,
         selected_video_generation_provider=WAN_MODEL,
         selected_tts_voice=next(iter(VOICES)),
@@ -254,6 +260,8 @@ def save_context_to_settings(ctx: Page2Context) -> bool:
             100,
             max(0, int(ctx.unexpected_event_threshold)),
         ),
+        AppStorageKeys.PAGE2_AUTO_IMAGE_ENABLED: bool(ctx.auto_image_enabled),
+        AppStorageKeys.PAGE2_AUTO_IMAGE_INTERVAL: min(12, max(1, int(ctx.auto_image_interval))),
         AppStorageKeys.PAGE2_TEMPERATURE: float(ctx.temperature),
         AppStorageKeys.PAGE2_SELECTED_VIDEO_GENERATION_PROVIDER: normalize_video_model(
             ctx.selected_video_generation_provider
@@ -425,7 +433,7 @@ def generate_image_prompt(
     turns: list[Page2ConversationTurn],
     story_brain_short: str = "",
     story_brain_enabled: bool = True,
-    mode: str = "normal",
+    mode: str = "first_person",
     subject: str = "",
 ) -> str:
     if not build_recent_image_prompt_conversation(turns):
@@ -671,6 +679,7 @@ def upsert_chat_record(
     story_brain_last_update_turn_id: str = "",
     story_brain_checkpoints: list | None = None,
     final_setting_id: str = "",
+    auto_image_next_turn: int | None = None,
     scope: str | None = None,
     hidden: bool = False,
 ) -> str:
@@ -713,6 +722,9 @@ def upsert_chat_record(
             story_brain_last_update_turn_id or ""
         ),
         final_setting_id=str(final_setting_id or ""),
+        auto_image_next_turn=(
+            max(1, int(auto_image_next_turn)) if auto_image_next_turn is not None else None
+        ),
         story_brain_checkpoints=list(story_brain_checkpoints or [])[-2:],
         branch_group_id=existing_branch_group_id,
         branch_number=existing_branch_number,

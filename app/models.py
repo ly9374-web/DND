@@ -331,6 +331,7 @@ class Page2ConversationTurn:
     is_loading: bool = False
     is_user_message_hidden: bool = False
     is_context_excluded: bool = False
+    is_auto_dice_followup: bool = False
     assistant_audio_filename: str = ""
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
@@ -352,6 +353,7 @@ class Page2ConversationTurn:
                 if "is_context_excluded" in data
                 else data.get("isContextExcluded", False)
             ),
+            is_auto_dice_followup=bool(data.get("is_auto_dice_followup", False)),
             assistant_audio_filename=str(
                 data.get("assistant_audio_filename")
                 if "assistant_audio_filename" in data
@@ -368,6 +370,7 @@ class Page2ConversationTurn:
             "is_loading": self.is_loading,
             "is_user_message_hidden": self.is_user_message_hidden,
             "is_context_excluded": self.is_context_excluded,
+            "is_auto_dice_followup": self.is_auto_dice_followup,
             "assistant_audio_filename": str(self.assistant_audio_filename or ""),
             "date": self.date,
         }
@@ -492,6 +495,7 @@ class ChatRecord:
     story_brain_short: str = ""
     story_brain_next_update_turn: int | None = None
     story_brain_last_update_turn_id: str = ""
+    auto_image_next_turn: int | None = None
     # At most two versions: current and previous, never a per-turn memory archive.
     story_brain_checkpoints: list = field(default_factory=list)
     final_setting_id: str = ""
@@ -542,6 +546,7 @@ class ChatRecord:
                 or data.get("storyBrainLastUpdateTurnID")
                 or ""
             ),
+            auto_image_next_turn=optional_positive_int(data.get("auto_image_next_turn")),
             final_setting_id=(
                 data.get("final_setting_id")
                 or data.get("finalSettingID")
@@ -585,6 +590,7 @@ class ChatRecord:
             "story_brain_last_update_turn_id": str(
                 self.story_brain_last_update_turn_id or ""
             ),
+            "auto_image_next_turn": optional_positive_int(self.auto_image_next_turn),
             "final_setting_id": str(self.final_setting_id or ""),
             "branch_group_id": str(self.branch_group_id or ""),
             "branch_number": optional_positive_int(self.branch_number),
