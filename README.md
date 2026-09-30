@@ -169,20 +169,20 @@ APIkey 页的“打印并保存调试日志（48 小时）”开启后，应用�
 
 时长与音频能力依据 [OpenRouter 模型列表](https://openrouter.ai/api/v1/videos/models) 和 [Replicate 参数](https://replicate.com/wan-video/wan-2.2-i2v-fast/api/schema)，集中配置于 `app/video_models.py`。Wan 3.0 的能力于 2026-09-27 核对：它使用 OpenRouter 的 `alibaba/wan-3.0`，支持纯文字和图片首帧输入、2–30 秒、五档画面比例、可选声音；分辨率可选 `480p`、`720p`、`1080p`，默认 `480p`。当前未进行真实生成验证。
 
-### 发布普通区 Prompt
+### 发布 Prompt 资产
 
-提交 GitHub 前，先保存应用中的编辑，再运行：
+提交 GitHub 前，先保存应用中的编辑，再指定应用实际使用的数据文件运行（Mac 默认路径如下）：
 
 ```bash
-python tools/export_public_prompt_assets.py
-python tools/export_public_prompt_assets.py --check
+python tools/export_public_prompt_assets.py --source ~/.local/share/DND-data/user_defaults.json
+python tools/export_public_prompt_assets.py --source ~/.local/share/DND-data/user_defaults.json --check
 ```
 
-导出文件为 `public_prompt_assets/ordinary.json`，包含普通区全部世界书、角色卡、固定模板、最终设定、长期记忆和快捷输入。导出不按名称筛选，保留本地当前正文、多个首次输入和普通区内的来源关联；新增、改名后重新导出即可。`--check` 会在导出过期时返回失败。支持 `--source` 指定设置文件，默认遵循 `VS_IMAGE_NOVEL_DATA_DIR`。
+导出文件为 `public_prompt_assets/ordinary.json`，包含普通区全部世界书、角色卡、固定模板、最终设定、长期记忆和快捷输入，以及私密区的固定模板、长期记忆和快捷输入。这些内容提交到 GitHub 后可公开查看；应用在新安装时仍将私密区的三类资产导入私密区。导出不按名称筛选，保留本地当前正文、多个首次输入和普通区内的来源关联；新增、改名后重新导出即可。`--check` 会在导出过期时返回失败。Windows 或自定义数据目录请用 `--source` 指向实际的 `user_defaults.json`；不指定时遵循 `VS_IMAGE_NOVEL_DATA_DIR`，未设置该变量则回退到项目内 `.python_app_data`。
 
-隐藏区、聊天记录及索引、密钥、媒体、URL 收藏不会进入导出文件。数据目录已移出项目目录；仍留在项目内的 `.python_app_data/`（手动运行时的回退位置）和 `.prompt_migration_backups/` 都被 Git 忽略，不要强制添加这些目录。最终设定若引用隐藏区或已不存在的来源，导出会提示并省略该关联，保留普通区最终正文，不修改本地关联。
+私密区的世界书、角色卡和最终设定，以及聊天记录及索引、密钥、媒体、URL 收藏不会进入导出文件。数据目录已移出项目目录；仍留在项目内的 `.python_app_data/`（手动运行时的回退位置）和 `.prompt_migration_backups/` 都被 Git 忽略，不要强制添加这些目录。普通区最终设定若引用私密区或已不存在的来源，导出会提示并省略该关联，保留普通区最终正文，不修改本地关联。
 
-新安装只在没有既有 Prompt 数据或历史初始化标记时导入公开资产；已有安装不覆盖、不自动合并、不复活已删除的条目。旧版 `naruto_public.json` 和按标题写死的初始化逻辑已移除。普通区内容修改后需要重新导出，单独 `git push` 不会读取本地运行数据。
+新安装只在没有既有 Prompt 数据或历史初始化标记时导入导出的资产；已有安装不覆盖、不自动合并、不复活已删除的条目。旧版 `naruto_public.json` 和按标题写死的初始化逻辑已移除。上述 Prompt 内容修改后需要重新导出，单独 `git push` 不会读取本地运行数据。
 
 `tools/migrate_prompt_spaces.py` 是本机这次分区调整的一次性工具，不参与应用启动或发布导出。默认只预览；`--apply` 才会备份整个数据目录并移动完整原记录。运行前必须停止本项目所有应用实例。它保留普通区的火影世界书、三张指定角色卡和火影最终设定，其余这三类记录追加到隐藏区；固定模板、长期记忆、快捷输入、聊天文件、索引和计数器不改。独立备份和迁移校验报告位于 `.prompt_migration_backups/`。
 

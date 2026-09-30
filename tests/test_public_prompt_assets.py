@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from app.config import AppStorageKeys, SettingsStore
 from app.services import public_prompt_seed
-from app.services.public_prompt_bundle import build_public_bundle, CATEGORIES, decode_records
+from app.services.public_prompt_bundle import (
+    build_public_bundle, CATEGORIES, HIDDEN_CATEGORIES, decode_records,
+)
 from tools.migrate_prompt_spaces import apply_migration, file_manifest, plan_migration
 
 
@@ -76,6 +78,37 @@ class PublicPromptAssetTests(unittest.TestCase):
         self.assertEqual(payload["final_settings"][0]["sources"]["template"], "")
         self.assertNotIn("private-template", json.dumps(payload))
         self.assertEqual(json.dumps(values), before)
+
+    def test_allowed_hidden_prompts_export_and_import_without_other_hidden_data(self):
+        values = sample_values()
+        values.update({
+            "hiddenFixedTemplateRecords": [{"id": "ht", "title": "私密模板",
+                                            "background_intro": "背景", "dm_core_tasks": "任务",
+                                            "response_format": "格式"}],
+            "hiddenLongTermMemoryRecords": [{"id": "hm", "title": "私密记忆", "content": "记忆正文"}],
+            "hiddenQuickInputRecords": [{"id": "hq", "title": "私密快捷", "content": "快捷正文"}],
+            "hiddenDefaultLongTermMemoryRecordID": "hm",
+            "hiddenCharacterCardRecords": [{"id": "hc", "title": "禁止上传角色", "content": "PRIVATE_CARD"}],
+            "chatRecordIndex": "PRIVATE_CHAT",
+        })
+        payload, _ = build_public_bundle(values)
+        self.assertEqual(payload["schema_version"], 3)
+        self.assertTrue(all(len(payload[cat]) == 1 for cat in HIDDEN_CATEGORIES))
+        exported = json.dumps(payload, ensure_ascii=False)
+        for forbidden in ("PRIVATE_SENTINEL", "PRIVATE_CARD", "PRIVATE_CHAT", "禁止上传角色"):
+            self.assertNotIn(forbidden, exported)
+        with tempfile.TemporaryDirectory() as temp:
+            store = SettingsStore(Path(temp) / "settings.json")
+            path = Path(temp) / "bundle.json"
+            path.write_text(exported)
+            with patch.object(public_prompt_seed, "settings", store), patch.object(public_prompt_seed, "PUBLIC_ASSETS_PATH", path):
+                self.assertTrue(public_prompt_seed.seed_public_prompt_assets_if_needed())
+            for cat, key in HIDDEN_CATEGORIES.items():
+                self.assertEqual(len(decode_records(store.values, key)), 1, cat)
+            self.assertEqual(store.values["hiddenDefaultLongTermMemoryRecordID"],
+                             decode_records(store.values, "hiddenLongTermMemoryRecords")[0]["id"])
+            for key in ("hiddenWorldBookRecords", "hiddenCharacterCardRecords", "hiddenSystemPromptRecords", "chatRecordIndex"):
+                self.assertNotIn(key, store.values)
 
     def test_bad_data_fails_instead_of_skipping_records(self):
         for raw in ("broken", "{}", [None], [{"id": "x"}, {"id": "x"}]):

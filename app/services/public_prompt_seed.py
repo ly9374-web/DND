@@ -6,10 +6,13 @@ from pathlib import Path
 
 from app.config import AppStorageKeys, settings
 from app.models import FixedTemplateRecord, FirstInputRecord, PromptTextRecord, SystemPromptRecord
-from app.services.public_prompt_bundle import CATEGORIES, DEFAULT_FIELDS, SOURCE_FIELDS, TEXT_FIELDS, TEMPLATE_FIELDS
+from app.services.public_prompt_bundle import (
+    CATEGORIES, DEFAULT_FIELDS, HIDDEN_CATEGORIES, SOURCE_FIELDS, TEXT_FIELDS,
+    TEMPLATE_FIELDS,
+)
 
 PUBLIC_ASSETS_PATH = Path(__file__).resolve().parents[2] / "public_prompt_assets" / "ordinary.json"
-PUBLIC_ASSET_SEED_VERSION = 2
+PUBLIC_ASSET_SEED_VERSION = 3
 
 
 def seed_public_prompt_assets_if_needed() -> bool:
@@ -24,10 +27,10 @@ def seed_public_prompt_assets_if_needed() -> bool:
         return False
 
     payload = json.loads(PUBLIC_ASSETS_PATH.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 2:
+    if payload.get("schema_version") != 3:
         raise ValueError("不支持的公开 Prompt 资产版本")
     records, mapping = {}, {}
-    for cat in CATEGORIES:
+    for cat in CATEGORIES | HIDDEN_CATEGORIES:
         items = payload.get(cat)
         if not isinstance(items, list):
             raise ValueError(f"公开资产缺少 {cat}")
@@ -45,7 +48,7 @@ def seed_public_prompt_assets_if_needed() -> bool:
                     title=source["title"], prompt=source["prompt"], long_term_memory=source["long_term_memory"],
                     first_inputs=inputs, selected_first_input_id=inputs[selected].id,
                 )
-            elif cat == "fixed_templates":
+            elif cat in ("fixed_templates", "hidden_fixed_templates"):
                 record = FixedTemplateRecord(**{key: source[key] for key in TEMPLATE_FIELDS})
             else:
                 record = PromptTextRecord(**{key: source[key] for key in TEXT_FIELDS})
@@ -62,10 +65,15 @@ def seed_public_prompt_assets_if_needed() -> bool:
         record.final_user_character_name = mapping["character_cards"][ref].title if ref else ""
         record.final_other_character_names = [mapping["character_cards"][ref].title for ref in sources.get("other_characters", [])]
 
-    updates = {key: json.dumps([r.to_dict() for r in records[cat]], ensure_ascii=False) for cat, key in CATEGORIES.items()}
+    updates = {key: json.dumps([r.to_dict() for r in records[cat]], ensure_ascii=False)
+               for cat, key in CATEGORIES.items()}
+    updates.update({key: json.dumps([r.to_dict() for r in records[cat]], ensure_ascii=False)
+                    for cat, key in HIDDEN_CATEGORIES.items() if records[cat]})
     for name, (key, cat) in DEFAULT_FIELDS.items():
         ref = payload.get("defaults", {}).get(name, "")
         chosen = mapping[cat][ref] if ref else next(iter(records[cat]), None)
+        if cat in HIDDEN_CATEGORIES and not records[cat]:
+            continue
         updates[key] = chosen.id if chosen else ""
         if name == "final_setting":
             updates[AppStorageKeys.SYSTEM_PROMPT] = chosen.prompt if chosen else ""

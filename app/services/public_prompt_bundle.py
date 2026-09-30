@@ -1,4 +1,4 @@
-"""Pure, strict serialization of ordinary prompt assets; no runtime store imports."""
+"""Pure serialization of approved prompt categories; no runtime store imports."""
 from __future__ import annotations
 
 from uuid import NAMESPACE_URL, uuid5
@@ -12,6 +12,11 @@ CATEGORIES = {
     "long_term_memories": "longTermMemoryRecords",
     "quick_inputs": "quickInputRecords",
 }
+HIDDEN_CATEGORIES = {
+    "hidden_fixed_templates": "hiddenFixedTemplateRecords",
+    "hidden_long_term_memories": "hiddenLongTermMemoryRecords",
+    "hidden_quick_inputs": "hiddenQuickInputRecords",
+}
 TEXT_FIELDS = ("title", "content")
 TEMPLATE_FIELDS = ("title", "background_intro", "dm_core_tasks", "response_format")
 SOURCE_FIELDS = {
@@ -24,6 +29,7 @@ DEFAULT_FIELDS = {
     "final_setting": ("selectedSystemPromptRecordID", "final_settings"),
     "template": ("selectedFixedTemplateRecordID", "fixed_templates"),
     "long_term_memory": ("defaultLongTermMemoryRecordID", "long_term_memories"),
+    "hidden_long_term_memory": ("hiddenDefaultLongTermMemoryRecordID", "hidden_long_term_memories"),
 }
 
 
@@ -49,8 +55,9 @@ def _text(record: dict, fields) -> dict:
 
 
 def build_public_bundle(values: dict) -> tuple[dict, list[str]]:
-    """Only the six ordinary lists and explicitly supported fields can be published."""
-    rows = {cat: decode_records(values, key) for cat, key in CATEGORIES.items()}
+    """Export ordinary prompts and three explicitly allowed hidden categories."""
+    rows = {cat: decode_records(values, key)
+            for cat, key in (CATEGORIES | HIDDEN_CATEGORIES).items()}
     maps = {}
     for cat, items in rows.items():
         ids = [item.get("id") for item in items]
@@ -58,13 +65,13 @@ def build_public_bundle(values: dict) -> tuple[dict, list[str]]:
             raise ValueError(f"{cat} 有缺失或重复 ID，已停止导出")
         maps[cat] = {i: str(uuid5(NAMESPACE_URL, f"dnd-public/{cat}/{i}")) for i in ids}
     warnings = []
-    payload = {"schema_version": 2}
+    payload = {"schema_version": 3}
     for cat, items in rows.items():
         exported = []
         for item in items:
             result = {"asset_id": maps[cat][item["id"]]}
             if cat != "final_settings":
-                result.update(_text(item, TEMPLATE_FIELDS if cat == "fixed_templates" else TEXT_FIELDS))
+                result.update(_text(item, TEMPLATE_FIELDS if cat in ("fixed_templates", "hidden_fixed_templates") else TEXT_FIELDS))
             else:
                 result.update(_text(item, ("title", "prompt", "long_term_memory")))
                 inputs = item.get("first_inputs")
