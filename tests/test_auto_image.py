@@ -59,7 +59,6 @@ class AutoImageTests(unittest.TestCase):
         self.assertEqual(self.state.page2_image_prompt_mode, "first_person")
         self.state["_page2_image_provider"] = "grok"
         self.state["page2_image_aspect_ratio_grok"] = "3:4"
-        self.state["page2_image2_quality"] = "low"
 
     def drain(self):
         for _ in range(10):
@@ -147,6 +146,41 @@ class AutoImageTests(unittest.TestCase):
         loaded = ChatRecord.from_dict(saved.to_dict())
         self.assertEqual(loaded.auto_image_next_turn, 11)
         self.assertTrue(loaded.turns[-1].is_auto_dice_followup)
+
+    def test_manual_image_generation_restarts_auto_image_countdown(self):
+        self.state["page2_auto_image_next_turn"] = 5
+        for number in range(1, 4):
+            self.append_turn(number)
+        self.assertEqual(page2._completed_auto_image_turn_count(self.state.page2_turns), 3)
+
+        page2._queue_image_generation(
+            provider="grok",
+            prompt="manual prompt",
+            image_urls=[],
+            aspect_ratio="3:4",
+            mode="first_person",
+            subject="",
+        )
+        self.drain()
+
+        self.assertEqual(len(self.image_calls), 1)
+        self.assertEqual(self.state.page2_auto_image_next_turn, 8)
+
+    def test_manual_image_generation_never_moves_auto_image_earlier(self):
+        self.state["page2_auto_image_next_turn"] = 10
+        self.append_turn(1)
+
+        page2._queue_image_generation(
+            provider="grok",
+            prompt="manual prompt",
+            image_urls=[],
+            aspect_ratio="3:4",
+            mode="first_person",
+            subject="",
+        )
+        self.drain()
+
+        self.assertEqual(self.state.page2_auto_image_next_turn, 10)
 
     def test_current_reference_urls_and_refiner_follow_right_panel(self):
         reference = GeneratedImageRecord(

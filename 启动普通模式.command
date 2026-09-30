@@ -39,7 +39,9 @@ if [[ ! -f "$APP_FILE" ]]; then
   exit 1
 fi
 
-export VS_IMAGE_NOVEL_DATA_DIR="$PROJECT_DIR/.python_app_data"
+# 数据目录同样放在 iCloud 之外：桌面/文档被 iCloud 同步时，本地文件会被驱逐成
+# dataless 占位符，媒体索引和聊天记录随即读不出来（页面报 OSError）。
+export VS_IMAGE_NOVEL_DATA_DIR="${VS_IMAGE_NOVEL_DATA_DIR:-$HOME/.local/share/DND-data}"
 
 # 虚拟环境不可用（不存在/损坏/Python 版本过旧）时自动重建；venv 内没有用户数据
 VENV_PYTHON="$VENV_DIR/bin/python"

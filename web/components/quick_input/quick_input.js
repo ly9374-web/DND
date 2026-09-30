@@ -35,8 +35,18 @@
   let compositionBefore = null;
   let inserting = false;
   let pendingInput = null;
+  let composerCaret = saved?.composerCaret || null;
   const listen = (name, fn) => doc.addEventListener(name, fn, true);
   const inputTarget = (event) => event.target?.matches?.(selector);
+
+  function rememberComposerCaret(input) {
+    if (!input?.matches?.(selector)) return;
+    composerCaret = {
+      value: input.value,
+      start: input.selectionStart,
+      end: input.selectionEnd,
+    };
+  }
 
   function hideMenu() {
     const canvas = active?.input.closest(".st-key-page2_chat_canvas");
@@ -179,6 +189,7 @@
     setter.call(input, next);
     input.focus();
     input.setSelectionRange(caret, caret);
+    rememberComposerCaret(input);
     input.dispatchEvent(new host.Event("input", { bubbles: true }));
     inserting = false;
     host.requestAnimationFrame(() => {
@@ -197,6 +208,7 @@
 
   function onInput(event) {
     if (!inputTarget(event) || inserting) return;
+    rememberComposerCaret(event.target);
     const before = pendingInput;
     pendingInput = null;
     if (composing || event.isComposing) return;
@@ -250,9 +262,12 @@
     }, 0);
   }
   function onPointerDown(event) {
+    if (event.target?.closest?.(".st-key-page2_chat_history"))
+      rememberComposerCaret(doc.querySelector(selector));
     if (active && !menu?.contains(event.target)) close();
   }
   function onFocus(event) {
+    if (inputTarget(event)) rememberComposerCaret(event.target);
     if (active && event.target !== active.input && !menu?.contains(event.target)) close();
   }
   function onSelection() {
@@ -260,6 +275,53 @@
         (active.input.selectionStart !== active.end ||
         active.input.selectionEnd !== active.end)) close();
   }
+
+  function insertSelectedChatText() {
+    const selection = host.getSelection();
+    const text = selection?.toString();
+    if (!text || selection.isCollapsed) return;
+    const messageSelector = '.st-key-page2_chat_history [data-testid="stChatMessageContent"]';
+    const messageFor = node => (node?.nodeType === host.Node.ELEMENT_NODE
+      ? node : node?.parentElement)?.closest?.(messageSelector);
+    if (!messageFor(selection.anchorNode) || !messageFor(selection.focusNode)) return;
+
+    const input = doc.querySelector(selector);
+    if (!input || input.disabled || !input.isConnected) return;
+    const position = composerCaret?.value === input.value ? composerCaret : input;
+    const start = position.start ?? position.selectionStart;
+    const end = position.end ?? position.selectionEnd;
+    const next = input.value.slice(0, start) + text + input.value.slice(end);
+    const caret = start + text.length;
+    close();
+    inserting = true;
+    const setter = Object.getOwnPropertyDescriptor(host.HTMLTextAreaElement.prototype, "value")?.set;
+    if (!setter) { inserting = false; return; }
+    setter.call(input, next);
+    input.setSelectionRange(caret, caret);
+    rememberComposerCaret(input);
+    input.dispatchEvent(new host.Event("input", { bubbles: true }));
+    inserting = false;
+    host.requestAnimationFrame(() => {
+      if (input.isConnected && input.value === next)
+        input.setSelectionRange(caret, caret);
+    });
+  }
+
+  function onPointerUp(event) {
+    if (event.button !== 0) return;
+    if (!event.target?.closest?.('.st-key-page2_chat_history [data-testid="stChatMessageContent"]'))
+      return;
+    host.requestAnimationFrame(insertSelectedChatText);
+  }
+
+  function onKeyUp(event) {
+    if (inputTarget(event)) {
+      rememberComposerCaret(event.target);
+      return;
+    }
+    if (event.key === "Shift") insertSelectedChatText();
+  }
+
   function handleKey(event) {
     if (!active || event.target !== active.input || composing || event.isComposing || event.keyCode === 229)
       return false;
@@ -279,7 +341,8 @@
 
   const handlers = { beforeinput: onBeforeInput, input: onInput, compositionstart: onCompositionStart,
     compositionend: onCompositionEnd, pointerdown: onPointerDown, focusin: onFocus,
-    selectionchange: onSelection, scroll: position };
+    selectionchange: onSelection, pointerup: onPointerUp, keyup: onKeyUp,
+    click: event => rememberComposerCaret(event.target), scroll: position };
   Object.entries(handlers).forEach(([name, fn]) => listen(name, fn));
   host.addEventListener("resize", position);
   host.visualViewport?.addEventListener("resize", position);
@@ -303,9 +366,9 @@
   host.__dndQuickInput = {
     handleKey,
     destroy,
-    snapshot: () => ({ config, active, selected, composing }),
+    snapshot: () => ({ config, active, selected, composing, composerCaret }),
     update(next) {
-      if (next.scope !== config.scope) close();
+      if (next.scope !== config.scope) { close(); composerCaret = null; }
       config = next;
       if (active) refresh();
     },

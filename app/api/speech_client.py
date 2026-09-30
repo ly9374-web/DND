@@ -26,6 +26,34 @@ VOICES = {
     )
 }
 
+# Qwen-Audio-TTS control tags documented for qwen-audio-3.0-tts-flash.
+EMOTION_TAGS = {
+    "": "无前缀（自然语气）",
+    "[sad]": "悲伤",
+    "[amazed]": "惊叹",
+    "[deep and loud shouting]": "深沉大声呐喊",
+    "[trembling]": "颤抖",
+    "[angry]": "愤怒",
+    "[excited]": "兴奋",
+    "[sarcastic]": "讽刺",
+    "[curious]": "好奇",
+    "[like dracula]": "低沉阴森",
+    "[bored]": "无聊",
+    "[tired]": "疲惫",
+    "[scornful]": "轻蔑",
+    "[shouting]": "大喊",
+    "[asmr]": "轻柔耳语",
+    "[panicked]": "恐慌",
+    "[mischievously]": "调皮",
+    "[empathetic]": "共情",
+    "[whispers]": "耳语",
+    "[reluctantly]": "不情愿",
+    "[crying]": "哭泣",
+    "[serious]": "严肃",
+    "[very slowly]": "非常缓慢",
+    "[very fast]": "非常快速",
+}
+
 
 class SpeechError(RuntimeError):
     pass

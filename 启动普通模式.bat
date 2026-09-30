@@ -33,7 +33,8 @@ if not exist "%APP_FILE%" (
   exit /b 1
 )
 
-set "VS_IMAGE_NOVEL_DATA_DIR=%PROJECT_DIR%.python_app_data"
+rem 数据目录放在用户目录下，与 Mac 版位置保持一致（不随项目移动）
+if not defined VS_IMAGE_NOVEL_DATA_DIR set "VS_IMAGE_NOVEL_DATA_DIR=%USERPROFILE%\.local\share\DND-data"
 
 rem ---------- 现有虚拟环境不可用（损坏 / Python 过旧）时删除重建，venv 内没有用户数据 ----------
 if exist "%VENV_PYTHON%" goto venv_check

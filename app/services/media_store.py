@@ -249,7 +249,11 @@ def _path(meta):
 
 
 def info(record):
-    """A cheap local lookup; never contacts the provider on a UI render."""
+    """A cheap local lookup; never contacts the provider on a UI render.
+
+    Raises OSError when the on-disk manifest is still in iCloud or damaged, so
+    render paths should use available()/local_path(), which degrade instead.
+    """
     with _lock:
         meta = _read(record.id)
         if meta.get("status") == "ready":
@@ -262,11 +266,19 @@ def info(record):
 
 
 def available(record):
-    return info(record).get("status") not in {"expired", "deleted", "missing"}
+    try:
+        meta = info(record)
+    except OSError:
+        # Manifest evicted to iCloud: unavailable for now, but never a crash.
+        return False
+    return meta.get("status") not in {"expired", "deleted", "missing"}
 
 
 def local_path(record):
-    meta = info(record)
+    try:
+        meta = info(record)
+    except OSError:
+        return None
     return _path(meta) if meta.get("status") == "ready" else None
 
 
@@ -510,7 +522,11 @@ def request_cache(records):
                 threading.Thread(target=_download_worker, daemon=True, name="media-download").start()
             _workers_started = True
         for record in records:
-            meta = info(record)
+            try:
+                meta = info(record)
+            except OSError:
+                # Manifest still in iCloud; a later render retries once it lands.
+                continue
             if meta.get("status") in {"ready", "expired", "deleted", "missing"}:
                 continue
             if record.id not in _pending and time.time() >= meta.get("retry_after", 0):

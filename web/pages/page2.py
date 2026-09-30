@@ -26,9 +26,10 @@ from app.api.media_clients import (
     download_video_bytes,
     is_openrouter_video_url,
 )
-from app.api.speech_client import VOICES, SpeechError
+from app.api.speech_client import EMOTION_TAGS, MODEL as TTS_MODEL, VOICES, SpeechError
 from app.video_models import (
-    VIDEO_MODELS, WAN_MODEL, WAN_DURATION_FRAMES, WAN_FPS,
+    VIDEO_MODELS, WAN_MODEL, WAN3_MODEL, WAN3_ASPECT_RATIOS,
+    WAN3_RESOLUTIONS, WAN_DURATION_FRAMES, WAN_FPS,
     normalize_video_model, video_duration_label,
 )
 from app.models import (
@@ -40,7 +41,7 @@ from app.models import (
 )
 from app.services import chat_records, page2_service, quick_inputs, story_brain_history, system_prompts
 from app.services import media_store, image_references
-from app.services.speech_generation import ACTIVE, SpeechJobs, owner_key
+from app.services.speech_generation import ACTIVE, SpeechJobs, extract_quoted_lines, owner_key
 from app.services.video_prompts import (
     MissingVideoStorySource, latest_image_prompt_source, resolve_video_story,
 )
@@ -50,7 +51,8 @@ from web.components.quick_input import quick_input_script
 from web import prompt_draft_guard
 from app.image_models import (
     DEFAULT_IMAGE_PROVIDER,
-    IMAGE2_PROVIDER, IMAGE2_QUALITIES, IMAGE2_DEFAULT_QUALITY,
+    IMAGE25_PROVIDER, IMAGE_QUALITY_PROVIDERS,
+    IMAGE25_QUALITIES, IMAGE_DEFAULT_QUALITY,
     IMAGE_PROVIDERS, image_aspect_ratios, image_aspect_ratio_label,
     normalize_image_provider, validate_image_options,
 )
@@ -74,7 +76,7 @@ _SINGLE_FLIGHT_OPERATION_KINDS = {
     "video",
 }
 
-_EMPTY_SPACE_CONTINUE_MESSAGE = "我什么都没做，继续发展至少500字"
+_EMPTY_SPACE_CONTINUE_MESSAGE = "*我什么都没做，故事继续发展至少600字，自然的让剧情引导我作出反应，比如让场景中人物与我互动或者根据故事情节出现需要处理的事件*"
 _EMPTY_SPACE_SUBMISSION_SENTINEL = "\u2063\u2063\u2063"
 _MANUAL_STORY_BRAIN_UPDATE_DELAY = 5
 _HIDDEN_ASSISTANT_MESSAGE_PREFIXES = (
@@ -161,21 +163,80 @@ def _render_video_model_selector():
 def _render_video_duration_controls(model):
     spec = VIDEO_MODELS[model]
     key = "page2_video_seconds"
+    saved_durations = settings.get(AppStorageKeys.PAGE2_VIDEO_DURATIONS, {})
+    saved_durations = dict(saved_durations) if isinstance(saved_durations, dict) else {}
+    saved_audio = settings.get(AppStorageKeys.PAGE2_VIDEO_AUDIO_BY_MODEL, {})
+    saved_audio = dict(saved_audio) if isinstance(saved_audio, dict) else {}
     previous = st.session_state.get(key)
-    if previous not in spec.durations:
+    if st.session_state.get("_page2_video_controls_model") != model:
+        chosen = saved_durations.get(model, 5)
+        st.session_state[key] = chosen if chosen in spec.durations else 5
+        audio_choice = saved_audio.get(model, True)
+        st.session_state["page2_video_generate_audio"] = (
+            audio_choice if isinstance(audio_choice, bool) else True
+        )
+        st.session_state["_page2_video_controls_model"] = model
+    elif previous not in spec.durations:
         st.session_state[key] = 5
-        if previous is not None:
-            st.caption("之前的时长不适用于当前模型，已调整为 5 秒。")
+    if previous is not None and previous not in spec.durations:
+        st.caption("之前的时长不适用于当前模型，已调整为 5 秒。")
     seconds = st.selectbox(
         "时长（秒）", options=spec.durations, key=key,
         format_func=lambda value: video_duration_label(model, value),
     )
+    if seconds != saved_durations.get(model, 5):
+        saved_durations[model] = seconds
+        settings.set(AppStorageKeys.PAGE2_VIDEO_DURATIONS, saved_durations)
     if model == WAN_MODEL:
         st.caption(f"720p · 约 {WAN_DURATION_FRAMES[seconds] / WAN_FPS:.2f} 秒 · 无声音")
         return seconds, False
     generate_audio = st.toggle("生成声音", value=True, key="page2_video_generate_audio")
-    st.caption("720p · 比例跟随输入图片；需要说话时，请在 prompt 中写明台词。")
+    if generate_audio != saved_audio.get(model, True):
+        saved_audio[model] = generate_audio
+        settings.set(AppStorageKeys.PAGE2_VIDEO_AUDIO_BY_MODEL, saved_audio)
+    if model != WAN3_MODEL:
+        st.caption("720p · 比例跟随输入图片；需要说话时，请在 prompt 中写明台词。")
     return seconds, generate_audio
+
+
+def _render_wan3_resolution_selector() -> str:
+    saved = settings.get(AppStorageKeys.PAGE2_WAN3_RESOLUTION, WAN3_RESOLUTIONS[0])
+    if saved not in WAN3_RESOLUTIONS:
+        saved = WAN3_RESOLUTIONS[0]
+    resolution = st.selectbox(
+        "分辨率", options=WAN3_RESOLUTIONS,
+        index=WAN3_RESOLUTIONS.index(saved), key="page2_wan3_resolution",
+    )
+    if resolution != saved:
+        settings.set(AppStorageKeys.PAGE2_WAN3_RESOLUTION, resolution)
+    return resolution
+
+
+def _render_wan3_input_mode(selected_id: str | None) -> bool:
+    key = "page2_wan3_input_mode"
+    saved = settings.get(AppStorageKeys.PAGE2_WAN3_INPUT_MODE)
+    if st.session_state.get(key) not in {"图片首帧", "纯文字"}:
+        st.session_state[key] = (
+            saved if isinstance(saved, str) and saved in {"图片首帧", "纯文字"}
+            else ("图片首帧" if selected_id else "纯文字")
+        )
+    chosen = st.selectbox("输入方式", options=("图片首帧", "纯文字"), key=key)
+    if chosen != saved:
+        settings.set(AppStorageKeys.PAGE2_WAN3_INPUT_MODE, chosen)
+    return chosen == "纯文字"
+
+
+def _render_wan3_aspect_ratio_selector() -> str:
+    saved = settings.get(AppStorageKeys.PAGE2_WAN3_ASPECT_RATIO, WAN3_ASPECT_RATIOS[0])
+    if saved not in WAN3_ASPECT_RATIOS:
+        saved = WAN3_ASPECT_RATIOS[0]
+    ratio = st.selectbox(
+        "画面比例", options=WAN3_ASPECT_RATIOS,
+        index=WAN3_ASPECT_RATIOS.index(saved), key="page2_wan3_aspect_ratio",
+    )
+    if ratio != saved:
+        settings.set(AppStorageKeys.PAGE2_WAN3_ASPECT_RATIO, ratio)
+    return ratio
 
 
 def _render_video_preview(record):
@@ -363,7 +424,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_pending_media_record_select", "")
     st.session_state.setdefault("page2_media_selection_nonce", 0)
     st.session_state.setdefault("page2_image_prompt", "")
-    st.session_state.setdefault("page2_image_prompt_mode", "first_person")
+    st.session_state.setdefault("page2_image_prompt_mode", _saved_image_prompt_mode())
     st.session_state.setdefault("page2_image_prompt_subject", "")
     st.session_state.setdefault("page2_image_prompt_source", {})
     st.session_state.setdefault("page2_refiner_prompt", "")
@@ -389,13 +450,14 @@ def _ensure_state():
     st.session_state.setdefault("page2_operation_outputs", {})
     st.session_state.setdefault("page2_chat_edit_target", None)
     st.session_state.setdefault("page2_tts_active", None)
+    st.session_state.setdefault("page2_tts_dialog_turn_id", "")
 
 
 _CHAT_SPEECH_RETENTION_SECONDS = 48 * 60 * 60
 
 
 @st.cache_resource
-def chat_speech_jobs(version: int = 1) -> SpeechJobs:
+def chat_speech_jobs(version: int = 2) -> SpeechJobs:
     """Durable speech jobs for chat messages; separate from the 生成语音 page."""
     return SpeechJobs(
         DATA_DIR / "ChatSpeechJobs",
@@ -425,7 +487,7 @@ def _has_dashscope_key() -> bool:
 
 
 def _tts_audio_path(filename: str) -> Path:
-    return chat_speech_jobs().output / filename
+    return chat_speech_jobs().output / Path(filename).name
 
 
 def _cleanup_expired_chat_speech() -> None:
@@ -444,28 +506,36 @@ def _cleanup_expired_chat_speech() -> None:
 
 
 def _turn_has_audio(turn: Page2ConversationTurn) -> bool:
+    for clip in getattr(turn, "assistant_audio_clips", []) or []:
+        if isinstance(clip, dict) and _tts_audio_path(str(clip.get("filename", ""))).is_file():
+            return True
     filename = str(getattr(turn, "assistant_audio_filename", "") or "")
     if not filename:
         return False
     return _tts_audio_path(filename).is_file()
 
 
-def _start_turn_tts(turn: Page2ConversationTurn, voice: str) -> None:
-    """Start a TTS job for the given assistant turn and track it in session state."""
-    text = str(turn.assistant_message or "").strip()
-    if not text:
-        return
+def _start_turn_tts(turn: Page2ConversationTurn, clips: list[dict]) -> bool:
+    """Start independent quote files for one Assistant turn."""
     try:
         api_key = _dashscope_api_key()
-    except SpeechError:
-        return
+    except SpeechError as exc:
+        st.session_state["page2_tts_error"] = str(exc)
+        return False
     jobs = chat_speech_jobs()
     owner = _chat_speech_owner()
     try:
-        job_id = jobs.start(owner, text, voice, api_key)
-    except (SpeechError, OSError):
-        return
-    st.session_state["page2_tts_active"] = {"turn_id": str(turn.id), "job_id": job_id}
+        job_id = jobs.start_quotes(owner, clips, api_key)
+    except (SpeechError, OSError) as exc:
+        st.session_state["page2_tts_error"] = str(exc)
+        return False
+    st.session_state["page2_tts_active"] = {
+        "turn_id": str(turn.id), "job_id": job_id,
+        "source_text": str(turn.assistant_message or ""),
+    }
+    st.session_state.pop("page2_tts_error", None)
+    st.session_state.pop("page2_tts_failed", None)
+    return True
 
 
 def _apply_active_tts_result() -> None:
@@ -490,13 +560,22 @@ def _apply_active_tts_result() -> None:
         return  # still running; leave active state in place
     st.session_state["page2_tts_active"] = None
     if status != "completed":
+        st.session_state["page2_tts_failed"] = {
+            "turn_id": turn_id, "job_id": job_id,
+            "error": str(job.get("error", "") or "语音生成失败。"),
+            "source_text": str(active.get("source_text", "")),
+        }
         return
-    filename = job.get("filename", "")
-    if not filename or not _tts_audio_path(filename).is_file():
+    clips = [clip for clip in job.get("clips", [])
+             if _tts_audio_path(str(clip.get("filename", ""))).is_file()]
+    if not clips:
         return
     for turn in st.session_state.get("page2_turns", []):
         if str(turn.id) == turn_id:
-            turn.assistant_audio_filename = filename
+            if str(turn.assistant_message or "") != str(active.get("source_text", "")):
+                return
+            turn.assistant_audio_clips = clips
+            turn.assistant_audio_filename = ""
             break
     _upsert_record()
 
@@ -539,47 +618,114 @@ def _render_turn_tts_status(turn: Page2ConversationTurn) -> None:
         # the filename, so refresh the page to update button states.
         if not _turn_has_audio(turn):
             st.rerun()
-    if _turn_has_audio(turn):
+    failed = st.session_state.get("page2_tts_failed") or {}
+    if str(failed.get("turn_id", "")) == str(turn.id):
+        st.error(str(failed.get("error", "语音生成失败。")))
+        if st.button("继续生成", key=f"page2_tts_retry_{turn.id}"):
+            try:
+                chat_speech_jobs().retry(
+                    str(failed["job_id"]), _chat_speech_owner(), _dashscope_api_key(),
+                )
+                st.session_state["page2_tts_active"] = {
+                    "turn_id": str(turn.id), "job_id": str(failed["job_id"]),
+                    "source_text": str(failed.get("source_text", "")),
+                }
+                st.session_state.pop("page2_tts_failed", None)
+                st.rerun()
+            except (SpeechError, OSError) as exc:
+                st.error(str(exc))
+    clips = getattr(turn, "assistant_audio_clips", []) or []
+    shown = False
+    for clip in clips:
+        path = _tts_audio_path(str(clip.get("filename", "")))
+        if not path.is_file():
+            continue
+        shown = True
+        st.audio(str(path), format="audio/wav")
+    if not clips and _turn_has_audio(turn):
         filename = str(turn.assistant_audio_filename or "")
         path = _tts_audio_path(filename)
-        try:
-            st.audio(str(path), format="audio/wav")
-        except Exception:
-            st.caption("语音文件已失效，可重新生成。")
+        st.audio(str(path), format="audio/wav")
+    elif clips and not shown:
+        st.caption("语音文件已失效，可重新生成。")
 
 
-def _handle_turn_tts_click(turn: Page2ConversationTurn, voice: str) -> None:
-    """Handle the TTS generate button: start directly or ask to overwrite."""
-    if _turn_has_audio(turn):
-        st.session_state["page2_tts_confirm_turn_id"] = str(turn.id)
-        st.session_state["page2_tts_confirm_voice"] = voice
-        st.rerun()
+def _close_tts_quote_dialog() -> None:
+    st.session_state["page2_tts_dialog_turn_id"] = ""
+
+
+def _render_tts_quote_dialog(default_voice: str) -> None:
+    turn_id = str(st.session_state.get("page2_tts_dialog_turn_id", "") or "")
+    if not turn_id:
         return
-    _start_turn_tts(turn, voice)
-    st.rerun()
-
-
-def _render_tts_overwrite_confirm() -> None:
-    """Render the overwrite confirmation dialog when requested."""
-    confirm_turn_id = str(st.session_state.get("page2_tts_confirm_turn_id", "") or "")
-    if not confirm_turn_id:
+    turn = next((item for item in st.session_state.get("page2_turns", [])
+                 if str(item.id) == turn_id), None)
+    if turn is None:
+        st.session_state["page2_tts_dialog_turn_id"] = ""
         return
+    nonce = str(st.session_state.get("page2_tts_dialog_nonce", ""))
 
-    @st.dialog("重新生成语音", width="small")
+    @st.dialog("选择台词生成语音", width="large", on_dismiss=_close_tts_quote_dialog)
     def _dialog():
-        st.write("该条消息已有语音，是否重新生成并覆盖？")
-        confirm_col, cancel_col = st.columns(2)
-        if confirm_col.button("确认覆盖", type="primary", use_container_width=True):
-            voice = str(st.session_state.pop("page2_tts_confirm_voice", "") or "")
-            st.session_state.pop("page2_tts_confirm_turn_id", None)
-            for turn in st.session_state.get("page2_turns", []):
-                if str(turn.id) == confirm_turn_id:
-                    _start_turn_tts(turn, voice or next(iter(VOICES)))
-                    break
-            st.rerun()
+        quotes = extract_quoted_lines(str(turn.assistant_message or ""))
+        if not quotes:
+            st.info("这条回复没有成对双引号中的台词。")
+        st.html("""<style>
+        div[class*="st-key-page2_tts_select_"] button[kind="primary"] {
+            background-color: #16834a; border-color: #16834a; color: white;
+        }
+        </style>""")
+        selected = []
+        for index, quote in enumerate(quotes):
+            selected_key = f"page2_tts_selected_{nonce}_{index}"
+            voice_key = f"page2_tts_voice_{nonce}_{index}"
+            emotion_key = f"page2_tts_emotion_{nonce}_{index}"
+            preview_key = f"page2_tts_preview_{nonce}_{index}"
+            if voice_key not in st.session_state:
+                st.session_state[voice_key] = default_voice
+            col_quote, col_emotion, col_voice = st.columns([5, 2, 2], vertical_alignment="center")
+            with col_quote:
+                st.button(
+                    f"{index + 1}. {quote}",
+                    key=f"page2_tts_select_{nonce}_{index}",
+                    type="primary" if st.session_state.get(selected_key, False) else "secondary",
+                    use_container_width=True,
+                    on_click=lambda key=selected_key: st.session_state.__setitem__(
+                        key, not st.session_state.get(key, False)),
+                )
+            with col_emotion:
+                emotion = st.selectbox(
+                    "语气", list(EMOTION_TAGS), format_func=EMOTION_TAGS.get,
+                    key=emotion_key, label_visibility="collapsed",
+                )
+            with col_voice:
+                voice = st.selectbox(
+                    "音色", list(VOICES), format_func=VOICES.get,
+                    key=voice_key, label_visibility="collapsed",
+                )
+            if preview_key not in st.session_state:
+                st.session_state[preview_key] = voice
+            elif st.session_state[preview_key] != voice:
+                st.session_state[preview_key] = voice
+                suffix = voice.removeprefix(TTS_MODEL + "-")
+                preview_path = Path(__file__).resolve().parents[2] / "试听" / f"{suffix}.wav"
+                if preview_path.is_file():
+                    st.audio(str(preview_path), format="audio/wav", autoplay=True)
+                else:
+                    st.caption("此音色暂时没有本地试听文件。")
+            if st.session_state.get(selected_key, False):
+                selected.append({"quote": quote.strip(), "emotion": emotion, "voice": voice})
+        error = st.session_state.get("page2_tts_error")
+        if error:
+            st.error(str(error))
+        generate_col, cancel_col = st.columns(2)
+        if generate_col.button("生成", type="primary", disabled=not selected,
+                               use_container_width=True):
+            if _start_turn_tts(turn, selected):
+                st.session_state["page2_tts_dialog_turn_id"] = ""
+                st.rerun()
         if cancel_col.button("取消", use_container_width=True):
-            st.session_state.pop("page2_tts_confirm_turn_id", None)
-            st.session_state.pop("page2_tts_confirm_voice", None)
+            st.session_state["page2_tts_dialog_turn_id"] = ""
             st.rerun()
 
     _dialog()
@@ -802,7 +948,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state.page2_pending_media_record_select = ""
     url_favorites.clear_preview_url("page2")
     st.session_state.page2_image_prompt = ""
-    st.session_state.page2_image_prompt_mode = "first_person"
+    st.session_state.page2_image_prompt_mode = _saved_image_prompt_mode()
     st.session_state.page2_image_prompt_subject = ""
     st.session_state.page2_image_prompt_source = {}
     st.session_state.page2_refiner_prompt = ""
@@ -1009,6 +1155,11 @@ def _apply_chat_edit(edit: dict) -> bool:
         if str(target.assistant_message or "") == text:
             return False
         target.assistant_message = text or None
+        target.assistant_audio_filename = ""
+        target.assistant_audio_clips = []
+        failed = st.session_state.get("page2_tts_failed") or {}
+        if str(failed.get("turn_id", "")) == str(target.id):
+            st.session_state.pop("page2_tts_failed", None)
 
     # user / assistant 都被清空的 turn 从记录中移除
     st.session_state["page2_turns"] = [
@@ -1127,9 +1278,7 @@ def _render_editable_chat_message(
                 tts_clicked = st.button(
                     "",
                     key=f"page2_tts_generate_{turn.id}",
-                    help=(
-                        "重新生成语音" if has_audio else "生成语音朗读"
-                    ),
+                    help="选择台词生成语音" if not has_audio else "重新选择台词生成语音",
                     icon=":material/volume_up:",
                     type="tertiary",
                     disabled=tts_disabled,
@@ -1137,7 +1286,10 @@ def _render_editable_chat_message(
         if edit_clicked and _open_chat_edit(turn.id, role):
             st.rerun()
         if role == "assistant" and tts_clicked:
-            _handle_turn_tts_click(turn, tts_voice)
+            st.session_state["page2_tts_dialog_turn_id"] = str(turn.id)
+            st.session_state["page2_tts_dialog_nonce"] = uuid.uuid4().hex
+            st.session_state.pop("page2_tts_error", None)
+            st.rerun()
 
 
 def _upsert_record():
@@ -1677,12 +1829,10 @@ def render_sidebar_context():
                 _chat_edit_active()
                 or _operation_kind_busy("story_brain")
                 or not bool(st.session_state.get("page2_story_brain_enabled", True))
-                or not bool(pending_story_brain_turns or waiting_for_chat)
             )
             manual_update_help = (
-                "暂无自上次成功更新以来的新完整问答。"
-                if not pending_story_brain_turns and not waiting_for_chat
-                else "使用上次成功更新后的全部新问答更新 Story Brain；成功后下次更新顺延 5 轮。"
+                "随时可用：使用上次成功更新后的全部新问答更新 Story Brain；"
+                "若暂无新问答，则重复更新最近一次完整问答。成功后下次更新顺延 5 轮。"
             )
             if st.button(
                 "更新storybrain",
@@ -1709,7 +1859,7 @@ def render_sidebar_context():
                 )
                 st.rerun()
             if not pending_story_brain_turns and not waiting_for_chat:
-                st.caption("暂无自上次成功更新以来的新完整问答。")
+                st.caption("暂无新问答，点击将重复更新最近一次完整问答。")
             temperature = st.slider(
                 "temperature",
                 min_value=0.0,
@@ -1734,13 +1884,13 @@ def render_sidebar_context():
             key="page2_sidebar_unexpected_event_threshold",
         )
 
-        st.divider()
-        with st.expander("自动生图", expanded=False):
-            auto_image_enabled = st.toggle(
-                "开启自动生图",
-                value=bool(ctx.auto_image_enabled),
-                key="page2_sidebar_auto_image_enabled",
-            )
+        auto_image_enabled = st.toggle(
+            "自动生图",
+            value=bool(ctx.auto_image_enabled),
+            key="page2_sidebar_auto_image_enabled",
+        )
+        auto_image_interval = int(ctx.auto_image_interval)
+        if auto_image_enabled:
             auto_image_interval = st.slider(
                 "每隔几轮生成一张图片",
                 min_value=1,
@@ -1749,7 +1899,7 @@ def render_sidebar_context():
                 step=1,
                 key="page2_sidebar_auto_image_interval",
             )
-            st.caption("只统计用户发起的完整问答；自动掷骰不计入。失败后下一轮重试。")
+            st.caption("只统计用户发起的完整问答；自动掷骰不计入。失败后下一轮重试。你主动生图后，自动生图重新计时。")
 
         context_changed = _apply_sidebar_context_values(
             ctx,
@@ -2065,7 +2215,10 @@ def _prepare_story_brain_operation(task: _Page2OperationTask):
         int(ctx.story_brain_turns),
     )
     if not update_turns:
-        raise ValueError("暂无自上次成功更新以来的新完整问答。")
+        # 允许随时手动更新：同一轮重复点击时，回退到最近一个完整问答重复更新。
+        update_turns = _completed_story_brain_turns(turns_snapshot)[-1:]
+    if not update_turns:
+        raise ValueError("暂无可用于更新 Story Brain 的完整问答。")
     task.meta.update(
         {
             "turn_id": turn_id,
@@ -2143,7 +2296,7 @@ def _prepare_image_operation(task: _Page2OperationTask):
     image_urls = list(task.payload.get("image_urls") or [])
     aspect_ratio = task.payload.get("aspect_ratio", page2_service.IMAGE_ASPECT_RATIO)
     refiner_prompt = str(task.payload.get("refiner_prompt", "") or "")
-    quality = task.payload.get("quality", IMAGE2_DEFAULT_QUALITY)
+    quality = task.payload.get("quality", IMAGE_DEFAULT_QUALITY)
     return lambda: media_store.cache_generated(page2_service.generate_image(
         provider=provider,
         prompt=prompt,
@@ -2151,7 +2304,7 @@ def _prepare_image_operation(task: _Page2OperationTask):
         aspect_ratio=aspect_ratio,
         refiner_prompt=refiner_prompt,
         allow_temporary_upload=bool(task.payload.get("allow_temporary_upload", False)),
-        **({"quality": quality} if provider == IMAGE2_PROVIDER else {}),
+        **({"quality": quality} if provider in IMAGE_QUALITY_PROVIDERS else {}),
     ))
 
 
@@ -2187,10 +2340,20 @@ def _prepare_video_prompt_operation(task: _Page2OperationTask):
 
 
 def _prepare_video_operation(task: _Page2OperationTask):
-    source = deepcopy(_video_operation_source(task))
-
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     prompt = str(task.payload.get("prompt", "") or "")
+    seconds = task.payload.get("seconds", 5)
+    generate_audio = bool(task.payload.get("generate_audio", True))
+    resolution = task.payload.get("resolution")
+    if task.payload.get("text_only"):
+        return lambda: media_store.cache_generated(page2_service.generate_video_from_text(
+            ctx=ctx, prompt=prompt, seconds=seconds,
+            aspect_ratio=str(task.payload.get("aspect_ratio") or "16:9"),
+            resolution=resolution or WAN3_RESOLUTIONS[0],
+            generate_audio=generate_audio,
+        ))
+
+    source = deepcopy(_video_operation_source(task))
     prompt_operation_id = str(task.payload.get("video_prompt_operation_id", "") or "")
     if prompt_operation_id:
         outputs = st.session_state.get("page2_operation_outputs") or {}
@@ -2199,14 +2362,13 @@ def _prepare_video_operation(task: _Page2OperationTask):
             raise RuntimeError("前置的视频 prompt 任务未成功，无法继续生成视频。")
         if outputs.get(prompt_operation_id + ":source") != source.id:
             raise RuntimeError("视频 prompt 与输入图片不匹配，已停止生成视频。")
-    seconds = task.payload.get("seconds", 5)
-    generate_audio = bool(task.payload.get("generate_audio", True))
     return lambda: media_store.cache_generated(page2_service.generate_video_from_image(
         ctx=ctx,
         source_record=source,
         prompt=prompt,
         seconds=seconds,
         generate_audio=generate_audio,
+        resolution=resolution,
         allow_temporary_upload=bool(task.payload.get("allow_temporary_upload", False)),
     ))
 
@@ -2436,6 +2598,8 @@ def _advance_operation_queues() -> bool:
                     + page2_service.load_context_from_settings().auto_image_interval
                 )
                 _upsert_record()
+            elif task.kind == "image":
+                _restart_auto_image_countdown()
             st.session_state["page2_operation_notice"] = f"已完成：{task.label}" + str(
                 task.meta.get("completion_notice") or task.meta.get("memory_notice") or ""
             )
@@ -2505,8 +2669,15 @@ def _render_media_operation_status() -> None:
         if task.kind == "resend" and task.meta.get("memory_notice"):
             st.warning(task.meta["memory_notice"])
     error = str(st.session_state.get("page2_operation_error", "") or "")
-    for message in filter(None, (item.strip() for item in error.split("\n\n"))):
+    messages = [item.strip() for item in error.split("\n\n") if item.strip()]
+    for message in messages:
         st.error(message)
+    if messages:
+        st.button(
+            "关闭错误提示",
+            key="page2_dismiss_operation_error",
+            on_click=_dismiss_operation_error,
+        )
 
 
 @st.fragment(run_every=1)
@@ -2514,15 +2685,9 @@ def _render_operation_queue_status() -> None:
     if (_advance_operation_queues()
             or st.session_state.get("page2_media_revision", media_store.revision()) != media_store.revision()):
         st.rerun()
-    error = str(st.session_state.get("page2_operation_error", "") or "")
-    if error:
-        st.button(
-            "关闭错误提示",
-            key="page2_dismiss_operation_error",
-            on_click=_dismiss_operation_error,
-        )
     active = _active_operations()
     queue = list(st.session_state.get("page2_operation_queue") or [])
+    error = str(st.session_state.get("page2_operation_error", "") or "")
     if not active and not queue:
         notice = str(st.session_state.pop("page2_operation_notice", "") or "")
         if notice and not error:
@@ -2536,7 +2701,6 @@ def _render_operation_queue_status() -> None:
 def _render_chat_column():
     _cleanup_expired_chat_speech()
     _apply_active_tts_result()
-    _render_tts_overwrite_confirm()
     story_brain_update_busy = _story_brain_update_busy()
     turns = st.session_state.page2_turns
     edit_target = _chat_edit_target()
@@ -2555,6 +2719,7 @@ def _render_chat_column():
             _close_chat_edit()
     ctx = page2_service.load_context_from_settings()
     tts_voice = ctx.selected_tts_voice if ctx.selected_tts_voice in VOICES else next(iter(VOICES))
+    _render_tts_quote_dialog(tts_voice)
     has_dashscope_key = _has_dashscope_key()
     chat_edit_active = _chat_edit_active()
     chat_busy = _operation_kind_busy("chat")
@@ -2721,12 +2886,29 @@ def _save_image_prompt_field(widget_key: str, state_key: str) -> None:
         st.session_state.page2_image_prompt_source = {}
 
 
+def _saved_image_prompt_mode() -> str:
+    saved = settings.get(AppStorageKeys.PAGE2_IMAGE_PROMPT_MODE, "first_person")
+    return saved if isinstance(saved, str) and saved in {"normal", "first_person", "closeup"} else "first_person"
+
+
+def _render_image_prompt_mode_selector() -> str:
+    st.session_state["_page2_image_prompt_mode"] = st.session_state.page2_image_prompt_mode
+    mode = st.selectbox(
+        "prompt 模式", options=["normal", "first_person", "closeup"],
+        key="_page2_image_prompt_mode", on_change=_save_image_prompt_field,
+        args=("_page2_image_prompt_mode", "page2_image_prompt_mode"),
+    )
+    if mode != _saved_image_prompt_mode():
+        settings.set(AppStorageKeys.PAGE2_IMAGE_PROMPT_MODE, mode)
+    return mode
+
+
 def _last_image_provider() -> str:
     saved = str(
         settings.get(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, DEFAULT_IMAGE_PROVIDER)
         or DEFAULT_IMAGE_PROVIDER
     )
-    provider = normalize_image_provider(saved)
+    provider = IMAGE25_PROVIDER if saved == "image2" else normalize_image_provider(saved)
     if provider not in IMAGE_PROVIDERS:
         return DEFAULT_IMAGE_PROVIDER
     if provider != saved:
@@ -2741,21 +2923,24 @@ def _render_image_model_selector() -> str:
             or st.session_state.get(key) not in IMAGE_PROVIDERS):
         st.session_state[key] = _last_image_provider()
         st.session_state["_page2_image_provider_scope"] = scope
-    return st.selectbox("图片生成 provider", options=IMAGE_PROVIDERS, key=key)
+    provider = st.selectbox("图片生成 provider", options=IMAGE_PROVIDERS, key=key)
+    if provider != _last_image_provider():
+        settings.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, provider)
+    return provider
 
 
 def _render_image_quality_selector(provider: str) -> str:
-    if provider != IMAGE2_PROVIDER:
-        return IMAGE2_DEFAULT_QUALITY
-    saved_quality = settings.get(AppStorageKeys.PAGE2_IMAGE2_QUALITY, IMAGE2_DEFAULT_QUALITY)
-    if saved_quality not in IMAGE2_QUALITIES:
-        saved_quality = IMAGE2_DEFAULT_QUALITY
+    if provider != IMAGE25_PROVIDER:
+        return IMAGE_DEFAULT_QUALITY
+    saved_quality = settings.get(AppStorageKeys.PAGE2_IMAGE25_QUALITY, IMAGE_DEFAULT_QUALITY)
+    if saved_quality not in IMAGE25_QUALITIES:
+        saved_quality = IMAGE_DEFAULT_QUALITY
     quality = st.selectbox(
-        "quality", options=IMAGE2_QUALITIES,
-        index=IMAGE2_QUALITIES.index(saved_quality), key="page2_image2_quality",
+        "quality", options=IMAGE25_QUALITIES,
+        index=IMAGE25_QUALITIES.index(saved_quality), key="page2_image25_quality",
     )
     if quality != saved_quality:
-        settings.set(AppStorageKeys.PAGE2_IMAGE2_QUALITY, quality)
+        settings.set(AppStorageKeys.PAGE2_IMAGE25_QUALITY, quality)
     return quality
 
 
@@ -2925,11 +3110,13 @@ def _current_auto_image_options() -> dict:
         ratio = saved_ratios.get(provider, page2_service.IMAGE_ASPECT_RATIO)
     if ratio not in image_aspect_ratios(provider):
         ratio = page2_service.IMAGE_ASPECT_RATIO
-    quality = st.session_state.get("page2_image2_quality") or settings.get(
-        AppStorageKeys.PAGE2_IMAGE2_QUALITY, IMAGE2_DEFAULT_QUALITY
-    )
-    if quality not in IMAGE2_QUALITIES:
-        quality = IMAGE2_DEFAULT_QUALITY
+    quality = IMAGE_DEFAULT_QUALITY
+    if provider == IMAGE25_PROVIDER:
+        quality = st.session_state.get("page2_image25_quality") or settings.get(
+            AppStorageKeys.PAGE2_IMAGE25_QUALITY, IMAGE_DEFAULT_QUALITY
+        )
+        if quality not in IMAGE25_QUALITIES:
+            quality = IMAGE_DEFAULT_QUALITY
     image_urls = []
     if provider not in {
         page2_service.ANILLUSTRIOUS_PROVIDER, page2_service.WAI_ILLUSTRIOUS_PROVIDER,
@@ -3015,6 +3202,28 @@ def _schedule_auto_image(*, ctx, source_turn_id: str) -> None:
     st.session_state["page2_operation_notice"] = "已加入队列：自动生图"
 
 
+def _restart_auto_image_countdown() -> None:
+    """用户主动生图成功后，自动生图的轮次计数从当前轮重新开始计。
+
+    例如自动生图间隔为 5 轮，用户在第 3 轮主动生成了图片，
+    则下一次自动生图顺延到第 3+5=8 轮，而不是原先的第 5 轮。
+    已排定的更晚时点不会被提前。
+    """
+    ctx = page2_service.load_context_from_settings()
+    if not ctx.auto_image_enabled:
+        return
+    completed = _completed_auto_image_turn_count(list(st.session_state.page2_turns))
+    target = completed + int(ctx.auto_image_interval)
+    current = st.session_state.get("page2_auto_image_next_turn")
+    if current is not None and int(current) >= target:
+        return
+    st.session_state["page2_auto_image_next_turn"] = target
+    try:
+        _upsert_record()
+    except Exception:
+        pass
+
+
 def _queue_image_generation(
     *,
     provider: str,
@@ -3024,7 +3233,7 @@ def _queue_image_generation(
     mode: str,
     subject: str,
     refiner_prompt: str = "",
-    quality: str = IMAGE2_DEFAULT_QUALITY,
+    quality: str = IMAGE_DEFAULT_QUALITY,
     allow_temporary_upload: bool = False,
 ) -> _Page2OperationTask:
     """Generate a missing prompt first, then make the image from that exact result."""
@@ -3034,7 +3243,6 @@ def _queue_image_generation(
     provider = normalize_image_provider(provider)
     image_urls = [str(url).strip() for url in image_urls if str(url).strip()]
     validate_image_options(provider, aspect_ratio, image_urls, quality)
-    settings.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, provider)
     prompt_text = str(prompt or "")
     prompt_dependency = None
     if not prompt_text.strip():
@@ -3055,7 +3263,7 @@ def _queue_image_generation(
             "aspect_ratio": aspect_ratio,
             "refiner_prompt": str(refiner_prompt or ""),
             "allow_temporary_upload": bool(allow_temporary_upload),
-            **({"quality": quality} if provider == IMAGE2_PROVIDER else {}),
+            **({"quality": quality} if provider in IMAGE_QUALITY_PROVIDERS else {}),
             "prompt_operation_id": (
                 prompt_dependency.id if prompt_dependency is not None else ""
             ),
@@ -3076,7 +3284,7 @@ def _queue_image_generation(
 def _queue_one_click_video(
     *, ctx, provider: str, image_urls: list[str], aspect_ratio: str,
     refiner_prompt: str = "",
-    quality: str = IMAGE2_DEFAULT_QUALITY,
+    quality: str = IMAGE_DEFAULT_QUALITY,
     allow_temporary_upload: bool = False,
 ) -> list[_Page2OperationTask]:
     """Prepare a new image and video prompt; video generation remains a manual action."""
@@ -3109,7 +3317,7 @@ def _queue_one_click_video(
         "provider": provider, "image_urls": image_urls, "aspect_ratio": aspect_ratio,
         "refiner_prompt": str(refiner_prompt or "") if provider == page2_service.ANILLUSTRIOUS_PROVIDER else "",
         "allow_temporary_upload": bool(allow_temporary_upload),
-        **({"quality": quality} if provider == IMAGE2_PROVIDER else {}),
+        **({"quality": quality} if provider in IMAGE_QUALITY_PROVIDERS else {}),
         "prompt_operation_id": image_prompt.id,
         "reference_revision": st.session_state.get(_reference_key() + "_revision", 0),
         "reference_url_draft": st.session_state.get(_reference_key() + "_urls", ""),
@@ -3118,8 +3326,7 @@ def _queue_one_click_video(
         "ctx": ctx, "image_operation_id": image.id,
     })
     tasks = [image_prompt, image, video_prompt]
-    # Publish the full chain only after validation, snapshots and preference save succeed.
-    settings.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, provider)
+    # Publish the full chain only after validation and snapshots succeed.
     st.session_state["page2_operation_queue"] = list(st.session_state.get("page2_operation_queue") or []) + tasks
     st.session_state["page2_operation_notice"] = "已加入队列：一键生成图片和视频 prompt"
     return tasks
@@ -3313,6 +3520,8 @@ def _save_video_prompt_field(source_id: str, image_task_id: str) -> None:
                      if item.kind == "image" and item.id == image_task_id), None)
         if task is not None:
             task.payload["pending_video_prompt"] = text
+    else:
+        st.session_state.page2_video_prompt = text
 
 
 def _close_video_story_dialog() -> None:
@@ -3405,37 +3614,52 @@ def _render_video_prompt_controls(media: list, video_model: str, *, image_option
     elif st.session_state.get("page2_video_source") not in options:
         st.session_state["page2_video_source"] = None
     selected_id = st.session_state.get("page2_video_source")
-    if selected_id in image_tasks:
+    text_only = False
+    if video_model == WAN3_MODEL:
+        text_only = _render_wan3_input_mode(selected_id)
+    if text_only:
+        st.text("视频输入：纯文字")
+    elif selected_id in image_tasks:
         st.text("视频输入：等待所选生图任务完成")
     elif selected_id in by_id:
         origin = "手动选择" if manual else "最新生成"
         st.text(f"视频输入（{origin}）：{by_id[selected_id].prompt[:48]}")
     else:
         st.text("视频输入：请在参考图片中选图，或先生成一张图片。")
-    source = by_id.get(selected_id)
-    image_dependency = image_tasks.get(selected_id)
+    source = None if text_only else by_id.get(selected_id)
+    image_dependency = None if text_only else image_tasks.get(selected_id)
     source_id = source.id if source is not None else ""
     image_task_id = image_dependency.id if image_dependency is not None else ""
-    draft = _video_prompt_draft(selected_id)
+    draft = (str(st.session_state.page2_video_prompt or "") if text_only
+             else _video_prompt_draft(selected_id))
     seconds, generate_audio = _render_video_duration_controls(video_model)
+    resolution = _render_wan3_resolution_selector() if video_model == WAN3_MODEL else None
+    aspect_ratio = None
+    if text_only:
+        aspect_ratio = _render_wan3_aspect_ratio_selector()
+    if video_model == WAN3_MODEL and not text_only:
+        st.caption("画面比例跟随输入图片；需要说话时，请在 prompt 中写明台词。")
     st.session_state["_page2_video_prompt"] = draft
     prompt_draft_guard.protect(
         "_page2_video_prompt", draft, "视频 prompt", requires_commit=False
     )
     prompt = st.text_area(
         "视频 prompt", key="_page2_video_prompt", height=68,
-        disabled=not selected_id or workflow_busy,
+        disabled=(not text_only and not selected_id) or workflow_busy,
         on_change=_save_video_prompt_field, args=(source_id, image_task_id),
     )
     render_editor_sizing()
     ctx = page2_service.load_context_from_settings()
     ctx.selected_video_generation_provider = video_model
-    kind = "video" if str(prompt or "").strip() else "video_prompt"
+    kind = "video" if text_only or str(prompt or "").strip() else "video_prompt"
     label = "生视频" if kind == "video" else "生视频prompt"
     manual_button, workflow_button = st.columns(2)
     if manual_button.button(
         label, key="page2_generate_video", use_container_width=True,
-        disabled=not selected_id or _chat_edit_active() or workflow_busy or _media_button_task("video") is not None,
+        disabled=(
+            (not str(prompt or "").strip() if text_only else not selected_id)
+            or _chat_edit_active() or workflow_busy or _media_button_task("video") is not None
+        ),
     ):
         try:
             if kind == "video_prompt" and source is not None:
@@ -3447,6 +3671,9 @@ def _render_video_prompt_controls(media: list, video_model: str, *, image_option
                 "prompt": prompt,
                 "seconds": seconds,
                 "generate_audio": generate_audio,
+                "text_only": text_only,
+                "resolution": resolution,
+                "aspect_ratio": aspect_ratio,
             }
             requirement = (
                 image_references.temporary_upload_requirement(
@@ -3473,7 +3700,7 @@ def _render_video_prompt_controls(media: list, video_model: str, *, image_option
     if workflow_button.button(
         "一键生成", key="page2_generate_video_workflow", use_container_width=True,
         disabled=(
-            image_options is None or _chat_edit_active() or workflow_busy or bool(str(prompt or "").strip())
+            text_only or image_options is None or _chat_edit_active() or workflow_busy or bool(str(prompt or "").strip())
             or (not latest_image_prompt_source(list(st.session_state.page2_turns))
                 and not _has_earlier_operation("chat"))
         ),
@@ -3706,14 +3933,7 @@ def _render_media_column_contents():
 
     # Separate widget state from the draft so background results can update it
     # after rendering, and hiding a field does not discard the saved draft.
-    st.session_state["_page2_image_prompt_mode"] = st.session_state.page2_image_prompt_mode
-    mode = st.selectbox(
-        "prompt 模式",
-        options=["normal", "first_person", "closeup"],
-        key="_page2_image_prompt_mode",
-        on_change=_save_image_prompt_field,
-        args=("_page2_image_prompt_mode", "page2_image_prompt_mode"),
-    )
+    mode = _render_image_prompt_mode_selector()
     subject = ""
     if mode == "closeup":
         st.session_state["_page2_image_prompt_subject"] = st.session_state.page2_image_prompt_subject

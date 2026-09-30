@@ -333,6 +333,7 @@ class Page2ConversationTurn:
     is_context_excluded: bool = False
     is_auto_dice_followup: bool = False
     assistant_audio_filename: str = ""
+    assistant_audio_clips: list[dict] = field(default_factory=list)
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
 
@@ -359,6 +360,10 @@ class Page2ConversationTurn:
                 if "assistant_audio_filename" in data
                 else data.get("assistantAudioFilename", "") or ""
             ),
+            assistant_audio_clips=(
+                data.get("assistant_audio_clips", [])
+                if isinstance(data.get("assistant_audio_clips", []), list) else []
+            ),
             date=data.get("date") or now_iso(),
         )
 
@@ -372,6 +377,7 @@ class Page2ConversationTurn:
             "is_context_excluded": self.is_context_excluded,
             "is_auto_dice_followup": self.is_auto_dice_followup,
             "assistant_audio_filename": str(self.assistant_audio_filename or ""),
+            "assistant_audio_clips": self.assistant_audio_clips,
             "date": self.date,
         }
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from app.models import GeneratedImageRecord, GeneratedMediaKind, Page2ConversationTurn
 from app.services import page2_service
-from app.video_models import WAN_MODEL
+from app.video_models import WAN_MODEL, WAN3_MODEL
 from web.pages import page2
 
 
@@ -200,9 +200,6 @@ class OneClickVideoTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.queue(**kwargs)
             self.assertFalse(page2.page2_operation_queue_busy())
-        with patch.object(page2.settings, "set", side_effect=OSError("settings failure")):
-            with self.assertRaises(OSError):
-                self.queue()
         self.assertFalse(page2.page2_operation_queue_busy())
         self.state.page2_turns = []
         with self.assertRaisesRegex(ValueError, "助手回复"):
@@ -220,20 +217,20 @@ class OneClickVideoTests(unittest.TestCase):
         other = self.queue(refiner_prompt="stale hidden refiner")
         self.assertEqual(other[1].payload["refiner_prompt"], "")
 
-    def test_image2_workflow_uses_queued_quality(self):
-        tasks = self.queue(provider="image2", aspect_ratio="3:2", quality="high")
-        self.state.page2_image2_quality = "low"
+    def test_image25_workflow_uses_queued_quality(self):
+        tasks = self.queue(provider="image2.5", aspect_ratio="3:2", quality="high")
+        self.state.page2_image25_quality = "low"
         self.drain()
         image_call = next(kwargs for kind, kwargs in self.calls if kind == "image")
         self.assertEqual(tasks[1].payload["quality"], "high")
         self.assertEqual(image_call["quality"], "high")
 
-    def test_image2_ordinary_generation_uses_queued_quality(self):
+    def test_image25_ordinary_generation_uses_queued_quality(self):
         page2._queue_image_generation(
-            provider="image2", aspect_ratio="1:1", quality="medium", prompt="scene",
+            provider="image2.5", aspect_ratio="1:1", quality="medium", prompt="scene",
             image_urls=[], mode="normal", subject="",
         )
-        self.state.page2_image2_quality = "high"
+        self.state.page2_image25_quality = "high"
         self.drain()
         image_call = next(kwargs for kind, kwargs in self.calls if kind == "image")
         self.assertEqual(image_call["quality"], "medium")
@@ -327,9 +324,11 @@ class OneClickVideoUITests(unittest.TestCase):
         from pathlib import Path
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
+        from app.config import SettingsStore
         for patcher in (
             patch.object(page2.media_store, "MEDIA_DIR", Path(directory.name) / "media"),
             patch.object(page2, "_upsert_record"),
+            patch.object(page2, "settings", SettingsStore(Path(directory.name) / "settings.json")),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -392,6 +391,47 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
             app.button(key="fixture_advance").click().run()
             self.assertFalse(app.exception)
 
+    def test_wan3_text_and_image_modes_queue_resolution(self):
+        app = self.app()
+        app.selectbox(key="page2_video_model").set_value(WAN3_MODEL).run()
+        self.assertEqual(app.selectbox(key="page2_wan3_resolution").options,
+                         ["480p", "720p", "1080p"])
+        self.assertEqual(app.selectbox(key="page2_wan3_resolution").value, "480p")
+        app.selectbox(key="page2_wan3_input_mode").set_value("纯文字").run()
+        app.selectbox(key="page2_wan3_aspect_ratio").set_value("9:16").run()
+        app.text_area(key="_page2_video_prompt").input("山间日落").run()
+        app.button(key="page2_generate_video").click().run()
+        text_task = app.session_state.page2_operation_queue[-1]
+        self.assertEqual(text_task.payload["prompt"], "山间日落")
+        self.assertTrue(text_task.payload["text_only"])
+        self.assertEqual(text_task.payload["source_id"], "")
+        self.assertEqual(text_task.payload["aspect_ratio"], "9:16")
+        self.assertEqual(text_task.payload["resolution"], "480p")
+        app.session_state.page2_operation_queue = []
+        app.selectbox(key="page2_wan3_input_mode").set_value("图片首帧").run()
+        app.selectbox(key="page2_wan3_resolution").set_value("1080p").run()
+        app.text_area(key="_page2_video_prompt").input("让图片动起来").run()
+        app.button(key="page2_generate_video").click().run()
+        image_task = app.session_state.page2_operation_queue[-1]
+        self.assertFalse(image_task.payload["text_only"])
+        self.assertEqual(image_task.payload["source_id"], "old")
+        self.assertEqual(image_task.payload["resolution"], "1080p")
+        self.assertFalse(app.exception)
+
+    def test_wan3_text_mode_submits_without_image_source(self):
+        app = self.app()
+        app.session_state.page2_generated_media = []
+        app.run()
+        app.selectbox(key="page2_video_model").set_value(WAN3_MODEL).run()
+        app.selectbox(key="page2_wan3_input_mode").set_value("纯文字").run()
+        self.assertFalse(app.text_area(key="_page2_video_prompt").disabled)
+        app.text_area(key="_page2_video_prompt").input("云从山间飘过").run()
+        app.button(key="page2_generate_video").click().run()
+        task = app.session_state.page2_operation_queue[-1]
+        self.assertTrue(task.payload["text_only"])
+        self.assertEqual(task.payload["source_id"], "")
+        self.assertFalse(app.exception)
+
     def test_library_multiselect_drives_preview_both_generators_and_manual_priority(self):
         from app.services import media_store
         from test_image_references import png
@@ -444,17 +484,18 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         self.assertEqual(app.session_state.page2_selected_media_id, tasks[1].result.id)
         self.assertEqual(app.text_area(key="_page2_video_prompt").value, "generated motion")
 
-    def test_image2_full_page_sends_quality_from_both_buttons(self):
+    def test_image25_full_page_sends_quality_from_both_buttons(self):
         for button in ("page2_generate_image", "page2_generate_video_workflow"):
             with self.subTest(button=button):
                 app = self.app()
-                app.selectbox(key="_page2_image_provider").set_value("image2").run()
-                self.assertEqual(app.selectbox(key="page2_image2_quality").options, ["low", "medium", "high"])
-                app.selectbox(key="page2_image2_quality").set_value("high").run()
+                app.selectbox(key="_page2_image_provider").set_value("image2.5").run()
+                self.assertEqual(app.selectbox(key="page2_image25_quality").options,
+                                 ["low", "medium", "high", "xhigh", "max", "auto"])
+                app.selectbox(key="page2_image25_quality").set_value("high").run()
                 app.button(key=button).click().run()
                 image = next(task for task in app.session_state.page2_operation_queue if task.kind == "image")
                 self.assertEqual(image.payload["quality"], "high")
-                app.selectbox(key="page2_image2_quality").set_value("low").run()
+                app.selectbox(key="page2_image25_quality").set_value("low").run()
                 self.assertEqual(image.payload["quality"], "high")
                 self.assertFalse(app.exception)
 

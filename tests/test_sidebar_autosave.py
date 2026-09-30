@@ -222,7 +222,6 @@ page2.render_sidebar_context()
             self.assertEqual(len(app.exception), 0)
             self.assertNotIn("确认", [button.label for button in app.button])
             self.assertEqual(set_many.call_count, 0)
-
             app.number_input(key="page2_sidebar_context_turn_count").set_value(12).run()
             self.assertEqual(len(app.exception), 0)
             self.assertEqual(
@@ -250,6 +249,28 @@ page2.render_sidebar_context()
             story_reasoning = app.selectbox(key="page2_sidebar_story_brain_reasoning")
             self.assertEqual(story_reasoning.value, "关思考")
             self.assertTrue(story_reasoning.disabled)
+
+            self.assertEqual(
+                app.toggle(key="page2_sidebar_auto_image_enabled").label,
+                "自动生图",
+            )
+            self.assertFalse(
+                any(slider.key == "page2_sidebar_auto_image_interval" for slider in app.slider)
+            )
+
+            app.toggle(key="page2_sidebar_auto_image_enabled").set_value(True).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(
+                app.slider(key="page2_sidebar_auto_image_interval").value,
+                5,
+            )
+            self.assertTrue(self.store.bool(AppStorageKeys.PAGE2_AUTO_IMAGE_ENABLED))
+
+            app.toggle(key="page2_sidebar_auto_image_enabled").set_value(False).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertFalse(
+                any(slider.key == "page2_sidebar_auto_image_interval" for slider in app.slider)
+            )
 
 
 if __name__ == "__main__":

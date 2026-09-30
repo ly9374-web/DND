@@ -15,10 +15,13 @@ from app.config import (
     debug_log,
     mask_authorization_header,
 )
-from app.video_models import VIDEO_MODELS, WAN_DURATION_FRAMES, WAN_FPS, WAN_MODEL, validate_video_duration
+from app.video_models import (
+    VIDEO_MODELS, WAN_DURATION_FRAMES, WAN_FPS, WAN_MODEL,
+    validate_video_duration, validate_video_resolution,
+)
 from app.image_inputs import validate_image_reference
 from app.image_models import (
-    IMAGE2_PROVIDER, IMAGE2_DEFAULT_QUALITY,
+    IMAGE25_PROVIDER, IMAGE_QUALITY_PROVIDERS, IMAGE_DEFAULT_QUALITY,
     ANILLUSTRIOUS_PROVIDER, WAI_ILLUSTRIOUS_PROVIDER, IMAGE_ASPECT_RATIO, IMAGE_ASPECT_RATIOS,
     normalize_image_provider, validate_image_options,
 )
@@ -293,7 +296,7 @@ class ReplicateImageAPIClient:
     MAX_PROCESSING_SECONDS = 600
 
     MODELS = {
-        IMAGE2_PROVIDER: "openai/gpt-image-2",
+        IMAGE25_PROVIDER: "openai/gpt-image-2.5-sunburst",
         "flux2-dev": "black-forest-labs/flux-2-dev",
         "seedream-4.5": "bytedance/seedream-4.5",
         "nanoPro": "google/nano-banana-pro",
@@ -308,7 +311,7 @@ class ReplicateImageAPIClient:
         image_urls=None,
         aspect_ratio=IMAGE_ASPECT_RATIO,
         refiner_prompt="",
-        quality=IMAGE2_DEFAULT_QUALITY,
+        quality=IMAGE_DEFAULT_QUALITY,
     ):
         provider = normalize_image_provider(provider)
         image_urls = image_urls or []
@@ -341,7 +344,7 @@ class ReplicateImageAPIClient:
             "Prefer": "wait",
         }
 
-        if provider == IMAGE2_PROVIDER:
+        if provider in IMAGE_QUALITY_PROVIDERS:
             input_body = {
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio,
@@ -780,13 +783,19 @@ class OpenRouterVideoAPIClient:
     MAX_POLL_ERRORS = 5
 
     @classmethod
-    def generate_video(cls, *, model, image_url, prompt, seconds, aspect_ratio, generate_audio=True):
+    def generate_video(cls, *, model, prompt, seconds, aspect_ratio, image_url=None,
+                       generate_audio=True, resolution=None):
         validate_video_duration(model, seconds)
         if model == WAN_MODEL:
             raise ValueError("Wan 视频请使用 Replicate API。")
         if aspect_ratio not in VIDEO_MODELS[model].aspect_ratios:
             raise ValueError("当前视频模型不支持此画面比例。")
-        image_url = validate_image_reference(image_url)
+        resolution = resolution or VIDEO_MODELS[model].resolutions[0]
+        validate_video_resolution(model, resolution)
+        if image_url:
+            image_url = validate_image_reference(image_url)
+        elif not VIDEO_MODELS[model].text_to_video:
+            raise ValueError("当前视频模型需要输入图片。")
         api_key = OpenRouterConfig.api_key()
         if not api_key:
             raise RuntimeError("缺少 OpenRouter API Key，请在 APIkey 页面填写或配置 OPENROUTER_API_KEY。")
@@ -795,15 +804,16 @@ class OpenRouterVideoAPIClient:
             "model": model,
             "prompt": prompt,
             "duration": int(seconds),
-            "resolution": "720p",
+            "resolution": resolution,
             "aspect_ratio": aspect_ratio,
             "generate_audio": bool(generate_audio),
-            "frame_images": [{
+        }
+        if image_url:
+            body["frame_images"] = [{
                 "type": "image_url",
                 "image_url": {"url": image_url},
                 "frame_type": "first_frame",
-            }],
-        }
+            }]
         try:
             response = requests.post(cls.CREATE_URL, headers=headers, json=body, timeout=(15, 60))
         except requests.RequestException as exc:

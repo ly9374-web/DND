@@ -13,7 +13,10 @@ from app.api import media_clients
 from app.config import AppStorageKeys, SettingsStore
 from app.models import GeneratedImageRecord
 from app.services import page2_service, media_store
-from app.video_models import VIDEO_MODELS, WAN_MODEL, WAN_DURATION_FRAMES, validate_video_duration
+from app.video_models import (
+    VIDEO_MODELS, WAN_MODEL, WAN3_MODEL, WAN_DURATION_FRAMES,
+    validate_video_duration, validate_video_resolution,
+)
 
 
 MINI = "bytedance/seedance-2.0-mini"
@@ -78,6 +81,39 @@ class VideoGenerationTests(unittest.TestCase):
             self.assertEqual(body["frame_images"][0]["frame_type"], "first_frame")
             self.assertEqual(self.get.call_args.args[0], "https://openrouter.ai/api/v1/videos/job-1")
             self.assertEqual(self.get.call_args.kwargs["headers"], {"Authorization": "Bearer test-key"})
+
+    def test_wan3_text_and_image_requests_use_selected_resolution(self):
+        for resolution in ("480p", "720p", "1080p"):
+            for image_url in (None, "https://example.com/image.png"):
+                with self.subTest(resolution=resolution, image_url=image_url):
+                    self.post.side_effect = None
+                    self.post.return_value = response({"id": "job-1", "status": "completed"}, 202)
+                    result = media_clients.OpenRouterVideoAPIClient.generate_video(
+                        model=WAN3_MODEL, prompt="山间日落", seconds=30,
+                        aspect_ratio="16:9", resolution=resolution,
+                        image_url=image_url, generate_audio=False,
+                    )
+                    self.assertEqual(result, CONTENT_URL)
+                    body = self.post.call_args.kwargs["json"]
+                    self.assertEqual(body["model"], WAN3_MODEL)
+                    self.assertEqual(body["resolution"], resolution)
+                    self.assertEqual(body["duration"], 30)
+                    self.assertEqual(body["aspect_ratio"], "16:9")
+                    self.assertFalse(body["generate_audio"])
+                    self.assertNotIn("quality", body)
+                    if image_url:
+                        self.assertEqual(body["frame_images"][0]["image_url"]["url"], image_url)
+                    else:
+                        self.assertNotIn("frame_images", body)
+
+    def test_wan3_rejects_unsupported_resolution_and_other_models_need_images(self):
+        with self.assertRaises(ValueError):
+            validate_video_resolution(WAN3_MODEL, "4K")
+        with self.assertRaisesRegex(ValueError, "输入图片"):
+            media_clients.OpenRouterVideoAPIClient.generate_video(
+                model=MINI, prompt="scene", seconds=5, aspect_ratio="16:9",
+            )
+        self.post.assert_not_called()
 
     def test_rejects_unsupported_durations_before_network(self):
         for model, seconds in ((MINI, 3), (MINI, 16), (PRO, 13), (PRO, 7.5), (WAN_MODEL, 4), (MINI, True)):
@@ -159,8 +195,29 @@ class VideoGenerationTests(unittest.TestCase):
             self.assertEqual(seedance.call_args.kwargs["aspect_ratio"], "3:4")
             self.assertTrue(seedance.call_args.kwargs["generate_audio"])
             self.assertEqual(result.video_generation_provider, PRO)
+            ctx.selected_video_generation_provider = WAN3_MODEL
+            result = page2_service.generate_video_from_image(
+                ctx=ctx, source_record=source, prompt="风吹树叶", seconds=30,
+                resolution="1080p",
+            )
+            self.assertEqual(seedance.call_args.kwargs["resolution"], "1080p")
+            self.assertEqual(seedance.call_args.kwargs["aspect_ratio"], "3:4")
+            self.assertEqual(result.video_generation_provider, WAN3_MODEL)
         self.post.assert_not_called()
         self.get.assert_not_called()
+
+    def test_wan3_text_service_has_no_source_image(self):
+        ctx = page2_service.default_context()
+        ctx.selected_video_generation_provider = WAN3_MODEL
+        with patch.object(media_clients.OpenRouterVideoAPIClient, "generate_video", return_value=CONTENT_URL) as generate:
+            record = page2_service.generate_video_from_text(
+                ctx=ctx, prompt="山间日落", seconds=5, aspect_ratio="9:16", resolution="480p",
+            )
+        self.assertEqual(record.video_url_string, CONTENT_URL)
+        self.assertEqual(record.source_image_id, "")
+        self.assertEqual(record.video_generation_provider, WAN3_MODEL)
+        self.assertEqual(generate.call_args.kwargs["aspect_ratio"], "9:16")
+        self.assertEqual(generate.call_args.kwargs["resolution"], "480p")
 
     def test_settings_migration_retires_keys_without_touching_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +233,79 @@ class VideoGenerationTests(unittest.TestCase):
 
 
 class VideoUITests(unittest.TestCase):
+    def test_right_panel_video_choices_survive_model_switch_and_restart(self):
+        from streamlit.testing.v1 import AppTest
+        from web.pages import page2
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+
+            def app():
+                return AppTest.from_string('''
+from web.pages import page2
+from app.video_models import WAN3_MODEL
+model = page2._render_video_model_selector()
+page2._render_video_duration_controls(model)
+if model == WAN3_MODEL:
+    page2._render_wan3_resolution_selector()
+    if page2._render_wan3_input_mode(None):
+        page2._render_wan3_aspect_ratio_selector()
+''').run()
+
+            with patch.object(page2, "settings", store):
+                current = app()
+                current.selectbox(key="page2_video_model").set_value(WAN3_MODEL).run()
+                current.selectbox(key="page2_video_seconds").set_value(12).run()
+                current.toggle(key="page2_video_generate_audio").set_value(False).run()
+                current.selectbox(key="page2_wan3_resolution").set_value("1080p").run()
+                current.selectbox(key="page2_wan3_aspect_ratio").set_value("9:16").run()
+                self.assertEqual(store.get(AppStorageKeys.PAGE2_VIDEO_DURATIONS)[WAN3_MODEL], 12)
+                self.assertFalse(store.get(AppStorageKeys.PAGE2_VIDEO_AUDIO_BY_MODEL)[WAN3_MODEL])
+                self.assertEqual(store.get(AppStorageKeys.PAGE2_WAN3_RESOLUTION), "1080p")
+                self.assertEqual(store.get(AppStorageKeys.PAGE2_WAN3_INPUT_MODE), "纯文字")
+                self.assertEqual(store.get(AppStorageKeys.PAGE2_WAN3_ASPECT_RATIO), "9:16")
+
+                current.selectbox(key="page2_video_model").set_value(MINI).run()
+                self.assertEqual(current.selectbox(key="page2_video_seconds").value, 5)
+                self.assertTrue(current.toggle(key="page2_video_generate_audio").value)
+                current.selectbox(key="page2_video_seconds").set_value(8).run()
+                current.selectbox(key="page2_video_model").set_value(WAN3_MODEL).run()
+                self.assertEqual(current.selectbox(key="page2_video_seconds").value, 12)
+                self.assertFalse(current.toggle(key="page2_video_generate_audio").value)
+                self.assertEqual(current.selectbox(key="page2_wan3_aspect_ratio").value, "9:16")
+
+                restarted = app()
+                self.assertEqual(restarted.selectbox(key="page2_video_model").value, WAN3_MODEL)
+                self.assertEqual(restarted.selectbox(key="page2_video_seconds").value, 12)
+                self.assertFalse(restarted.toggle(key="page2_video_generate_audio").value)
+                self.assertEqual(restarted.selectbox(key="page2_wan3_resolution").value, "1080p")
+                self.assertEqual(restarted.selectbox(key="page2_wan3_input_mode").value, "纯文字")
+                self.assertEqual(restarted.selectbox(key="page2_wan3_aspect_ratio").value, "9:16")
+                self.assertFalse(current.exception)
+                self.assertFalse(restarted.exception)
+
+    def test_image_prompt_mode_survives_restart(self):
+        from streamlit.testing.v1 import AppTest
+        from web.pages import page2
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            with patch.object(page2, "settings", store):
+                def app():
+                    return AppTest.from_string('''
+from web.pages import page2
+page2._ensure_state()
+page2._render_image_prompt_mode_selector()
+''').run()
+
+                current = app()
+                current.selectbox(key="_page2_image_prompt_mode").set_value("closeup").run()
+                self.assertEqual(store.get(AppStorageKeys.PAGE2_IMAGE_PROMPT_MODE), "closeup")
+                restarted = app()
+                self.assertEqual(restarted.selectbox(key="_page2_image_prompt_mode").value, "closeup")
+                self.assertFalse(current.exception)
+                self.assertFalse(restarted.exception)
+
     def test_queue_preserves_fractional_seconds_and_audio_choice(self):
         from web.pages import page2
         record = GeneratedImageRecord(id="source", provider="grok", prompt="图片")
@@ -189,6 +319,21 @@ class VideoUITests(unittest.TestCase):
             page2._prepare_video_operation(task)()
             self.assertEqual(generate.call_args.kwargs["seconds"], 7.5)
             self.assertFalse(generate.call_args.kwargs["generate_audio"])
+
+    def test_wan3_text_task_runs_without_image_source(self):
+        from web.pages import page2
+        ctx = page2_service.default_context()
+        ctx.selected_video_generation_provider = WAN3_MODEL
+        task = page2._Page2OperationTask(kind="video", label="生成视频", scope_id="test", payload={
+            "ctx": ctx, "text_only": True, "prompt": "山间日落", "seconds": 5,
+            "aspect_ratio": "16:9", "resolution": "480p", "generate_audio": True,
+        })
+        session = Mock(page2_generated_media=[])
+        with patch.object(page2.st, "session_state", session), \
+             patch.object(page2_service, "generate_video_from_text") as generate:
+            page2._prepare_video_operation(task)()
+            self.assertEqual(generate.call_args.kwargs["prompt"], "山间日落")
+            self.assertEqual(generate.call_args.kwargs["resolution"], "480p")
 
     def test_model_switch_resets_invalid_duration_and_applies_immediately(self):
         from streamlit.testing.v1 import AppTest

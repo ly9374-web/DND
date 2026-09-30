@@ -26,7 +26,7 @@ from app.api.media_clients import (
 from app.api.speech_client import VOICES
 from app.config import AppStorageKeys, settings
 from app.image_models import (
-    IMAGE2_PROVIDER, IMAGE2_DEFAULT_QUALITY,
+    IMAGE_QUALITY_PROVIDERS, IMAGE_DEFAULT_QUALITY,
     normalize_image_provider, validate_image_options,
 )
 from app.models import (
@@ -48,8 +48,8 @@ from app.services.image_prompts import build_image_prompt_system_prompt
 from app.services.video_prompts import VIDEO_PROMPT_SYSTEM_PROMPT
 from app.storage import ChatRecordStore
 from app.video_models import (
-    VIDEO_MODELS, WAN_MODEL, WAN_FPS, WAN_DURATION_FRAMES,
-    normalize_video_model, validate_video_duration,
+    VIDEO_MODELS, WAN_MODEL, WAN3_MODEL, WAN_FPS, WAN_DURATION_FRAMES,
+    normalize_video_model, validate_video_duration, validate_video_resolution,
 )
 DEFAULT_SYSTEM_PROMPT = ""
 STORY_BRAIN_SHORT = "story_brain_short"
@@ -75,7 +75,7 @@ def _normalize_tts_voice(value) -> str:
     return next(iter(VOICES))
 
 UNEXPECTED_EVENT_PROMPT = """
-本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的意外事件（不要直接告诉用户是意外事件），意外情况可以是场景中的角色主动了什么话，或做了什么行为，也可能是什么突发事件。
+本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的额外事件（不要直接告诉用户是额外事件），额外情况可以是：1.场景中的角色主动了什么话 2.场景中的角色主动做了什么行为 3.发生了什么突发事件。
 """.strip()
 
 
@@ -479,7 +479,7 @@ def generate_image(
     image_urls: Optional[list[str]] = None,
     aspect_ratio: str = IMAGE_ASPECT_RATIO,
     refiner_prompt: str = "",
-    quality: str = IMAGE2_DEFAULT_QUALITY,
+    quality: str = IMAGE_DEFAULT_QUALITY,
     allow_temporary_upload: bool = False,
 ) -> GeneratedImageRecord:
     provider = normalize_image_provider(provider)
@@ -520,7 +520,7 @@ def generate_image(
             image_urls=image_urls,
             aspect_ratio=aspect_ratio,
             refiner_prompt=refiner_prompt,
-            **({"quality": quality} if provider == IMAGE2_PROVIDER else {}),
+            **({"quality": quality} if provider in IMAGE_QUALITY_PROVIDERS else {}),
         )
 
     image_url = getattr(result, "image_url", None)
@@ -600,6 +600,7 @@ def generate_video_from_image(
     prompt: str,
     seconds: int | float,
     generate_audio: bool = True,
+    resolution: str | None = None,
     allow_temporary_upload: bool = False,
 ) -> GeneratedImageRecord:
     prompt = str(prompt or "").strip()
@@ -608,6 +609,9 @@ def generate_video_from_image(
 
     provider = str(ctx.selected_video_generation_provider or WAN_MODEL).strip()
     validate_video_duration(provider, seconds)
+    if provider != WAN_MODEL:
+        resolution = resolution or VIDEO_MODELS[provider].resolutions[0]
+        validate_video_resolution(provider, resolution)
     image_bytes = _video_input_image_bytes(source_record)
     image_reference = image_references.resolve_record(
         source_record, provider=provider, purpose="video", image_bytes=image_bytes,
@@ -628,6 +632,7 @@ def generate_video_from_image(
             seconds=seconds,
             aspect_ratio=aspect_ratio,
             generate_audio=generate_audio,
+            resolution=resolution,
         )
         effective_seconds = int(seconds)
 
@@ -643,6 +648,31 @@ def generate_video_from_image(
         source_image_data_base64=None,
         source_image_id=source_record.id,
         duration_seconds=effective_seconds,
+        video_generation_provider=provider,
+    )
+
+
+def generate_video_from_text(
+    *, ctx: Page2Context, prompt: str, seconds: int,
+    aspect_ratio: str = "16:9", resolution: str = "480p", generate_audio: bool = True,
+) -> GeneratedImageRecord:
+    provider = str(ctx.selected_video_generation_provider or WAN_MODEL).strip()
+    if provider != WAN3_MODEL:
+        raise ValueError("当前视频模型不支持纯文字生成。")
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        raise ValueError("视频 prompt 不能为空。")
+    validate_video_duration(provider, seconds)
+    validate_video_resolution(provider, resolution)
+    if aspect_ratio not in VIDEO_MODELS[provider].aspect_ratios:
+        raise ValueError("当前视频模型不支持此画面比例。")
+    video_url = OpenRouterVideoAPIClient.generate_video(
+        model=provider, prompt=prompt, seconds=seconds,
+        aspect_ratio=aspect_ratio, resolution=resolution, generate_audio=generate_audio,
+    )
+    return GeneratedImageRecord(
+        provider=provider, prompt=prompt, media_kind=GeneratedMediaKind.VIDEO,
+        video_url_string=video_url, duration_seconds=seconds,
         video_generation_provider=provider,
     )
 

@@ -11,7 +11,10 @@ from unittest.mock import Mock, patch
 from streamlit.testing.v1 import AppTest
 
 from app.api import speech_client as client
-from app.services.speech_generation import ACTIVE, SpeechJobs, owner_key, split_text
+from app.services.speech_generation import (
+    ACTIVE, SpeechJobs, extract_quoted_lines, owner_key, split_text,
+)
+from app.models import Page2ConversationTurn
 
 
 def wav_bytes(frames=2400):
@@ -48,6 +51,48 @@ class SpeechPipelineTests(unittest.TestCase):
         self.assertTrue(all(len(chunk) <= 1300 for chunk in chunks))
         self.assertEqual(split_text(""), [])
         self.assertEqual(split_text("hello. small text"), ["hello. small text"])
+
+    def test_extract_only_paired_quotes_in_source_order(self):
+        self.assertEqual(
+            extract_quoted_lines('旁白“ 第一条 ”，又说"second"，空的“ ”，未结束“忽略'),
+            ["第一条", "second"],
+        )
+
+    def test_quote_batch_uses_separate_files_and_per_quote_settings(self):
+        other_voice = list(client.VOICES)[1]
+        synth = Mock(return_value=wav_bytes())
+        jobs = SpeechJobs(self.root / "jobs", self.root / "ChatSpeech", synth)
+        job_id = jobs.start_quotes("owner", [
+            {"quote": "别过来！", "emotion": "[angry]", "voice": self.voice},
+            {"quote": "没事了。", "emotion": "", "voice": other_voice},
+        ], "test-key")
+        done = settled(jobs, job_id)
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(done["total"], 2)
+        self.assertEqual(synth.call_count, 2)
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in synth.call_args_list],
+            [("[angry]别过来！", self.voice), ("没事了。", other_voice)],
+        )
+        self.assertEqual(len(list(jobs.output.glob("*.wav"))), 2)
+        for clip in done["clips"]:
+            client.validate_wav((jobs.output / clip["filename"]).read_bytes())
+        turn = Page2ConversationTurn(assistant_message="原文", assistant_audio_clips=done["clips"])
+        self.assertEqual(Page2ConversationTurn.from_dict(turn.to_dict()).assistant_audio_clips,
+                         done["clips"])
+
+    def test_quote_batch_resume_reuses_completed_audio(self):
+        synth = Mock(side_effect=[wav_bytes(), client.SpeechError("临时失败")])
+        jobs = SpeechJobs(self.root / "jobs", self.root / "ChatSpeech", synth)
+        clips = [{"quote": word, "emotion": "", "voice": self.voice}
+                 for word in ("第一句", "第二句")]
+        job_id = jobs.start_quotes("owner", clips, "test-key")
+        self.assertEqual(settled(jobs, job_id)["status"], "failed")
+        synth.side_effect = [wav_bytes()]
+        jobs.retry(job_id, "owner", "test-key")
+        self.assertEqual(settled(jobs, job_id)["status"], "completed")
+        self.assertEqual(synth.call_count, 3)
+        self.assertEqual(synth.call_args.args[0], "第二句")
 
     def test_failed_chunk_retries_without_regenerating_success_and_merges_pause(self):
         synth = Mock(side_effect=[wav_bytes(), client.SpeechError("临时失败")])
@@ -201,6 +246,37 @@ class SpeechPipelineTests(unittest.TestCase):
 
 
 class SpeechPageTests(unittest.TestCase):
+    def test_chat_quote_dialog_collects_selected_voice_and_emotion(self):
+        source = '''
+import streamlit as st
+from unittest.mock import patch
+from app.models import Page2ConversationTurn
+from web.pages import page2
+st.session_state.setdefault("page2_turns", [
+    Page2ConversationTurn(id="turn", assistant_message="旁白“你好！”")
+])
+st.session_state.setdefault("page2_tts_dialog_turn_id", "turn")
+st.session_state.setdefault("page2_tts_dialog_nonce", "test")
+def fake_start(turn, clips):
+    st.session_state["generated_clips"] = clips
+    return True
+with patch.object(page2, "_start_turn_tts", side_effect=fake_start):
+    page2._render_tts_quote_dialog(next(iter(page2.VOICES)))
+'''
+        app = AppTest.from_string(source).run()
+        self.assertFalse(list(app.exception))
+        self.assertTrue(app.button[1].disabled)
+        app.button(key="page2_tts_select_test_0").click().run()
+        self.assertFalse(app.button[1].disabled)
+        voice = list(client.VOICES)[1]
+        app.selectbox(key="page2_tts_voice_test_0").set_value(voice).run()
+        app.selectbox(key="page2_tts_emotion_test_0").set_value("[angry]").run()
+        self.assertFalse(list(app.exception))
+        app.button[1].click().run()
+        self.assertEqual(app.session_state["generated_clips"], [
+            {"quote": "你好！", "voice": voice, "emotion": "[angry]"},
+        ])
+
     def test_page_start_cancel_resume_and_audio_result(self):
         with tempfile.TemporaryDirectory() as temp:
             (Path(temp) / "result.wav").write_bytes(wav_bytes())

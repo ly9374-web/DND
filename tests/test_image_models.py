@@ -56,30 +56,34 @@ class ImageModelRequestTests(unittest.TestCase):
         call = self.generate("flux2-dev", image_urls=refs, aspect_ratio="match_input_image")
         self.assertEqual(call.kwargs["json"]["input"]["input_images"], refs)
 
-    def test_image2_quality_and_references_reach_replicate(self):
-        for quality, ratio, refs in (
-            ("low", "1:1", []),
-            ("medium", "3:2", ["https://example.com/ref.jpg"]),
-            ("high", "2:3", ["https://example.com/a.jpg", "https://example.com/b.jpg"]),
-        ):
+    def test_image25_all_qualities_and_references_reach_replicate(self):
+        refs = ["https://example.com/ref.jpg"]
+        for quality in ("low", "medium", "high", "xhigh", "max", "auto"):
             with self.subTest(quality=quality):
-                call = self.generate("image2", quality=quality, aspect_ratio=ratio, image_urls=refs)
-                self.assertEqual(call.args[0], "https://api.replicate.com/v1/models/openai/gpt-image-2/predictions")
+                call = self.generate("image2.5", quality=quality, aspect_ratio="3:2", image_urls=refs)
+                self.assertEqual(call.args[0], "https://api.replicate.com/v1/models/openai/gpt-image-2.5-sunburst/predictions")
                 self.assertEqual(call.kwargs["json"], {"input": {
-                    "prompt": "test prompt", "quality": quality, "aspect_ratio": ratio,
+                    "prompt": "test prompt", "quality": quality, "aspect_ratio": "3:2",
                     "input_images": refs, "number_of_images": 1, "output_format": "webp",
                 }})
-        self.assertEqual(self.generate("image2").kwargs["json"]["input"]["quality"], "low")
+        self.assertEqual(self.generate("image2.5").kwargs["json"]["input"]["quality"], "low")
+        self.assertEqual(self.generate("image2.5", aspect_ratio="16:9").kwargs["json"]["input"]["aspect_ratio"], "16:9")
 
-    def test_image2_rejects_invalid_quality_before_network_call(self):
+    def test_image25_rejects_invalid_quality_before_network_call(self):
         with patch.object(media_clients.requests, "post") as post:
             for generate in (page2_service.generate_image, media_clients.ReplicateImageAPIClient.generate_image):
-                for quality in ("auto", "invalid", "", None):
-                    with self.subTest(generate=generate, quality=quality), self.assertRaisesRegex(ValueError, "quality"):
-                        generate("image2", "prompt", quality=quality)
+                with self.subTest(generate=generate), self.assertRaisesRegex(ValueError, "quality"):
+                    generate("image2.5", "prompt", quality="invalid")
             post.assert_not_called()
 
-    def test_image2_quality_is_not_sent_to_other_models(self):
+    def test_removed_image2_is_rejected_before_network_call(self):
+        with patch.object(media_clients.requests, "post") as post:
+            for generate in (page2_service.generate_image, media_clients.ReplicateImageAPIClient.generate_image):
+                with self.subTest(generate=generate), self.assertRaisesRegex(ValueError, "image2"):
+                    generate("image2", "prompt")
+            post.assert_not_called()
+
+    def test_image25_quality_is_not_sent_to_other_models(self):
         for provider in ("nano", "nanoPro", "seedream-4.5", "flux2-dev"):
             with self.subTest(provider=provider):
                 call = self.generate(provider, quality="high")
@@ -92,7 +96,7 @@ class ImageModelRequestTests(unittest.TestCase):
             ("flux2-dev", "1:1", ["https://example.com/ref.jpg"] * 5, "4 张"),
             ("seedream-4.5", "1:1", ["https://example.com/ref.jpg"] * 15, "14 张"),
             ("nano", "16:9", [], "图片尺寸"),
-            ("image2", "match_input_image", [], "图片尺寸"),
+            ("image2.5", "match_input_image", [], "图片尺寸"),
         ]
         with patch.object(media_clients.requests, "post") as post:
             for provider, ratio, refs, message in cases:
@@ -142,70 +146,74 @@ with patch.object(page2, "settings", store), patch.object(page2.url_favorites, "
     def saved(self):
         return SettingsStore(self.path).get(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER)
 
-    def test_image2_quality_defaults_low_and_survives_switches_and_restart(self):
+    def test_old_image2_selection_migrates_to_image25(self):
+        store = SettingsStore(self.path)
+        store.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, "image2")
         app = self.app()
-        self.assertNotIn("page2_image2_quality", [item.key for item in app.selectbox])
-        app.selectbox(key="_page2_image_provider").select("image2").run()
-        self.assertEqual(app.selectbox(key="page2_image2_quality").value, "low")
-        self.assertEqual(app.selectbox(key="page2_image2_quality").options, ["low", "medium", "high"])
-        self.assertEqual(app.selectbox(key="page2_image_aspect_ratio_image2").options, ["1:1", "3:2", "2:3"])
-        app.selectbox(key="page2_image2_quality").select("high").run()
-        self.assertEqual(SettingsStore(self.path).get(AppStorageKeys.PAGE2_IMAGE2_QUALITY), "high")
+        self.assertEqual(app.selectbox(key="_page2_image_provider").value, "image2.5")
+        self.assertEqual(self.saved(), "image2.5")
+        self.assertNotIn("image2", app.selectbox(key="_page2_image_provider").options)
+        self.assertFalse(app.exception)
+
+    def test_image25_quality_defaults_low_and_survives_switches_and_restart(self):
+        app = self.app()
+        self.assertNotIn("page2_image25_quality", [item.key for item in app.selectbox])
+        app.selectbox(key="_page2_image_provider").select("image2.5").run()
+        self.assertEqual(app.selectbox(key="page2_image25_quality").value, "low")
+        self.assertEqual(app.selectbox(key="page2_image25_quality").options,
+                         ["low", "medium", "high", "xhigh", "max", "auto"])
+        self.assertEqual(app.selectbox(key="page2_image_aspect_ratio_image2.5").options,
+                         ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "auto"])
+        app.selectbox(key="page2_image_aspect_ratio_image2.5").select("16:9").run()
+        app.selectbox(key="page2_image25_quality").select("max").run()
         app.button(key="generate").click().run()
-        self.assertEqual(app.session_state.page2_operation_queue[-1].payload["quality"], "high")
-        app.selectbox(key="page2_image2_quality").select("medium").run()
-        self.assertEqual(app.session_state.page2_operation_queue[-1].payload["quality"], "high")
+        self.assertEqual(app.session_state.page2_operation_queue[-1].payload["quality"], "max")
+        self.assertEqual(SettingsStore(self.path).get(AppStorageKeys.PAGE2_IMAGE25_QUALITY), "max")
         app.selectbox(key="_page2_image_provider").select("nano").run()
-        self.assertNotIn("page2_image2_quality", [item.key for item in app.selectbox])
-        app.selectbox(key="_page2_image_provider").select("image2").run()
-        self.assertEqual(app.selectbox(key="page2_image2_quality").value, "medium")
+        self.assertNotIn("page2_image25_quality", [item.key for item in app.selectbox])
+        app.selectbox(key="_page2_image_provider").select("image2.5").run()
+        self.assertEqual(app.selectbox(key="page2_image25_quality").value, "max")
         for button in ("new", "old"):
             app.button(key=button).click().run()
-            self.assertEqual(app.selectbox(key="page2_image2_quality").value, "medium")
+            self.assertEqual(app.selectbox(key="page2_image25_quality").value, "max")
         restarted = self.app()
-        self.assertEqual(restarted.selectbox(key="page2_image2_quality").value, "medium")
-        restarted.selectbox(key="page2_image2_quality").select("low").run()
-        self.assertEqual(self.app().selectbox(key="page2_image2_quality").value, "low")
+        self.assertEqual(restarted.selectbox(key="page2_image25_quality").value, "max")
+        self.assertEqual(restarted.selectbox(key="page2_image_aspect_ratio_image2.5").value, "16:9")
         self.assertFalse(app.exception)
         self.assertFalse(restarted.exception)
 
-    def test_invalid_saved_image2_quality_falls_back_to_low(self):
+    def test_invalid_saved_image25_quality_falls_back_to_low(self):
         store = SettingsStore(self.path)
-        store.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, "image2")
-        store.set(AppStorageKeys.PAGE2_IMAGE2_QUALITY, "auto")
+        store.set(AppStorageKeys.PAGE2_LAST_IMAGE_PROVIDER, "image2.5")
+        store.set(AppStorageKeys.PAGE2_IMAGE25_QUALITY, "invalid")
         app = self.app()
-        self.assertEqual(app.selectbox(key="page2_image2_quality").value, "low")
+        self.assertEqual(app.selectbox(key="page2_image25_quality").value, "low")
         self.assertFalse(app.exception)
 
-    def test_last_submitted_model_survives_new_old_and_restarted_sessions(self):
+    def test_last_selected_model_survives_new_old_and_restarted_sessions(self):
         app = self.app()
         self.assertEqual(app.selectbox(key="_page2_image_provider").value, DEFAULT_IMAGE_PROVIDER)
-        app.selectbox(key="_page2_image_provider").select("seedream-4.5").run()
-        self.assertIsNone(self.saved())
-        app.button(key="generate").click().run()
-        self.assertEqual(self.saved(), "seedream-4.5")
-        app.button(key="fail").click().run()
-        self.assertEqual(self.saved(), "seedream-4.5")
+        app.selectbox(key="_page2_image_provider").select("image2.5").run()
+        self.assertEqual(self.saved(), "image2.5")
         app.selectbox(key="_page2_image_provider").select("nano").run()
         app.button(key="new").click().run()
-        self.assertEqual(app.selectbox(key="_page2_image_provider").value, "seedream-4.5")
+        self.assertEqual(app.selectbox(key="_page2_image_provider").value, "nano")
         app.selectbox(key="_page2_image_provider").select("flux2-dev").run()
-        app.button(key="generate").click().run()
         app.selectbox(key="_page2_image_provider").select("nano").run()
         app.button(key="old").click().run()
-        self.assertEqual(app.selectbox(key="_page2_image_provider").value, "flux2-dev")
+        self.assertEqual(app.selectbox(key="_page2_image_provider").value, "nano")
         restarted = self.app()
-        self.assertEqual(restarted.selectbox(key="_page2_image_provider").value, "flux2-dev")
+        self.assertEqual(restarted.selectbox(key="_page2_image_provider").value, "nano")
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(restarted.exception), 0)
 
-    def test_failed_validation_does_not_enqueue_or_change_preference(self):
+    def test_failed_validation_does_not_enqueue_or_undo_selection(self):
         app = self.app()
-        app.selectbox(key="_page2_image_provider").select("seedream-4.5").run()
-        app.selectbox(key="page2_image_aspect_ratio_seedream-4.5").select("match_input_image").run()
+        app.selectbox(key="_page2_image_provider").select("flux2-dev").run()
+        app.selectbox(key="page2_image_aspect_ratio_flux2-dev").select("match_input_image").run()
         app.button(key="generate").click().run()
         self.assertIn("至少", app.error[0].value)
-        self.assertIsNone(self.saved())
+        self.assertEqual(self.saved(), "flux2-dev")
         self.assertEqual(app.session_state["page2_operation_queue"], [])
         self.assertEqual(len(app.exception), 0)
 

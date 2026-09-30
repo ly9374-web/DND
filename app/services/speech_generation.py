@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import uuid
@@ -12,10 +13,20 @@ from datetime import datetime
 from pathlib import Path
 
 from app.api.speech_client import (
-    VOICES, SpeechCancelled, SpeechError, check_cancelled, synthesize, validate_wav,
+    EMOTION_TAGS, VOICES, SpeechCancelled, SpeechError, check_cancelled, synthesize,
+    validate_wav,
 )
 
 ACTIVE = {"running", "cancelling"}
+
+
+_QUOTED_LINE = re.compile(r'“([^”]+)”|"([^"\n]+)"')
+
+
+def extract_quoted_lines(text: str) -> list[str]:
+    """Return nonempty, paired Chinese/ASCII double-quoted spans in source order."""
+    return [line for match in _QUOTED_LINE.finditer(text or "")
+            if (line := ((match.group(1) or match.group(2) or "").strip()))]
 
 
 def split_text(script: str) -> list[str]:
@@ -120,6 +131,32 @@ class SpeechJobs:
             self._launch(job, api_key)
             return job_id
 
+    def start_quotes(self, owner: str, clips: list[dict], api_key: str) -> str:
+        """Synthesize each chosen quote as its own WAV in a resumable batch."""
+        api_key = self._validate_key(api_key)
+        if not clips:
+            raise SpeechError("请至少选择一句台词。")
+        prepared = []
+        for clip in clips:
+            quote = str(clip.get("quote", "")).strip()
+            voice = str(clip.get("voice", ""))
+            emotion = str(clip.get("emotion", ""))
+            if not quote or voice not in VOICES or emotion not in EMOTION_TAGS:
+                raise SpeechError("台词、语气或音色无效，请重新选择。")
+            prepared.append({"quote": quote, "voice": voice, "emotion": emotion})
+        with self.lock:
+            self._ensure_available(owner)
+            job_id = uuid.uuid4().hex
+            now = datetime.now()
+            for index, clip in enumerate(prepared, 1):
+                clip["filename"] = f"{now:%Y%m%d-%H%M%S}_{job_id[:8]}_{index:02d}.wav"
+            job = {"id": job_id, "owner": owner, "clips": prepared,
+                   "created_at": now.isoformat(), "status": "pending", "completed": 0,
+                   "total": len(prepared), "error": ""}
+            self._save(job)
+            self._launch(job, api_key)
+            return job_id
+
     def retry(self, job_id: str, owner: str, api_key: str) -> None:
         api_key = self._validate_key(api_key)
         with self.lock:
@@ -171,6 +208,9 @@ class SpeechJobs:
             self._progress(job, cancel)
 
     def _work(self, job: dict, api_key: str, cancel: threading.Event) -> None:
+        if "clips" in job:
+            self._work_quotes(job, api_key, cancel)
+            return
         directory = self._directory(job["id"])
         chunks_dir = directory / "chunks"
         temporary = self.output / (job["filename"] + ".tmp")
@@ -243,3 +283,56 @@ class SpeechJobs:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _work_quotes(self, job: dict, api_key: str, cancel: threading.Event) -> None:
+        temporary = None
+        try:
+            self.output.mkdir(parents=True, exist_ok=True)
+            for index, clip in enumerate(job["clips"], 1):
+                check_cancelled(cancel)
+                job["current_chunk"] = index
+                path = self.output / clip["filename"]
+                cached = False
+                if path.is_file():
+                    try:
+                        validate_wav(path.read_bytes())
+                        cached = True
+                    except (OSError, SpeechError):
+                        pass
+                if not cached:
+                    self._stage(job, cancel, "synthesizing")
+                    audio = self.synthesizer(
+                        clip["emotion"] + clip["quote"], clip["voice"], api_key,
+                        cancel, on_progress=lambda phase, attempt, size: self._stage(
+                            job, cancel, phase, attempt, size),
+                    )
+                    self._stage(job, cancel, "saving")
+                    validate_wav(audio)
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_bytes(audio)
+                    check_cancelled(cancel)
+                    os.replace(temporary, path)
+                    temporary = None
+                job["completed"] = index
+                self._progress(job, cancel)
+            with self.lock:
+                check_cancelled(cancel)
+                job.update(status="completed", error="")
+                self._save(job)
+        except SpeechCancelled:
+            job.update(status="cancelled", error="已取消，已完成台词已保留，可继续生成。")
+        except SpeechError as exc:
+            job.update(status="failed", error=str(exc))
+        except OSError:
+            job.update(status="failed", error="文件读写失败，请检查磁盘空间和目录权限后重试。")
+        except Exception:
+            job.update(status="failed", error="语音生成遇到异常，已完成台词已保留，请重试。")
+        finally:
+            with self.lock:
+                self.running.pop(job["id"], None)
+                self._save(job)
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass

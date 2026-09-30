@@ -701,7 +701,7 @@ if st.button("模拟生成完成"):
         self.assertEqual([turn.id for turn in legacy], [turn.id for turn in turns[-2:]])
         self.assertEqual(no_new, [])
 
-    def test_story_brain_update_is_rejected_when_there_are_no_new_turns(self):
+    def test_story_brain_update_reuses_latest_turn_when_there_are_no_new_turns(self):
         from web.pages import page2
 
         class SessionState(dict):
@@ -727,11 +727,15 @@ if st.button("模拟生成完成"):
         session_state = SessionState(
             page2_turns=[turn],
             page2_story_brain_last_update_turn_id=turn.id,
+            page2_story_brain_short="旧 Story Brain",
         )
 
         with patch.object(page2.st, "session_state", session_state):
-            with self.assertRaisesRegex(ValueError, "暂无自上次成功更新以来"):
-                page2._prepare_story_brain_operation(task)
+            runner = page2._prepare_story_brain_operation(task)
+
+        self.assertTrue(callable(runner))
+        self.assertEqual(task.meta["processed_turn_count"], 1)
+        self.assertEqual(task.meta["last_processed_turn_id"], turn.id)
 
     def test_one_click_sync_writes_long_term_memory_back_to_source(self):
         template = FixedTemplateRecord(
