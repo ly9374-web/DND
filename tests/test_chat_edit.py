@@ -79,6 +79,44 @@ class ChatEditTests(unittest.TestCase):
         self.assertEqual(self.app.session_state["page2_turns"][0].assistant_message, "已修改的回复")
         self.assertEqual(self.open_editor().value, "已修改的回复")
 
+    def test_past_messages_remain_editable_during_background_operations(self):
+        from web.pages import page2
+
+        for kind in ("image_prompt", "image", "video_prompt", "video", "chat", "story_brain"):
+            with self.subTest(kind=kind):
+                task = page2._Page2OperationTask(kind=kind, label=kind, scope_id="test")
+                self.app.session_state["page2_operation_queue"] = [task]
+                self.app.run()
+                self.assertFalse(self.app.button(key="page2_chat_edit_open_assistant_one").disabled)
+                self.open_editor().input(f"{kind} 运行时修改").run()
+                self.assertFalse(self.app.text_area[0].disabled)
+                self.assertFalse(self.app.button(key="page2_chat_edit_save_assistant_one").disabled)
+                self.assertFalse(self.app.button(key="page2_chat_edit_delete_assistant_one").disabled)
+                self.app.button(key="page2_chat_edit_save_assistant_one").click().run()
+                self.assertEqual(
+                    self.app.session_state["page2_turns"][0].assistant_message,
+                    f"{kind} 运行时修改",
+                )
+                self.assertFalse(self.app.exception)
+        self.assertFalse(self.app.button(key="page2_chat_edit_open_user_one").disabled)
+        self.open_editor("user").input("运行中修改用户消息").run()
+        self.app.button(key="page2_chat_edit_save_user_one").click().run()
+        self.assertEqual(self.app.session_state["page2_turns"][0].user_message, "运行中修改用户消息")
+
+    def test_in_flight_message_cannot_be_edited_or_removed(self):
+        self.app.session_state["page2_turns"][1].is_loading = True
+        self.app.run()
+        self.assertTrue(self.app.button(key="page2_chat_edit_open_user_two").disabled)
+        from web.pages import page2
+        with patch.object(page2.st, "session_state", {
+            "page2_turns": self.app.session_state["page2_turns"],
+        }), \
+             patch.object(page2, "_upsert_record"):
+            self.assertFalse(page2._apply_chat_edit({
+                "turn_id": "two", "role": "user", "text": "",
+            }))
+        self.assertEqual(self.app.session_state["page2_turns"][1].user_message, "第二条用户记录")
+
 
 if __name__ == "__main__":
     unittest.main()

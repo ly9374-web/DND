@@ -19,8 +19,11 @@ def run():
             page.wait_for_load_state("networkidle")
             expect(page.get_by_role("heading", name="图片引用验证")).to_be_visible()
             print("Rendered buttons:", page.get_by_role("button").all_text_contents())
+            url_input = page.get_by_role("textbox", name="参考图片 URL（每行一个，可选）")
+            expect(url_input).to_be_hidden()
             page.get_by_text("参考图片与本地素材", exact=True).click()
             expect(page.get_by_text("导入本地图片", exact=True)).to_be_visible()
+            expect(url_input).to_be_visible()
             print("Rendered input types:", page.locator("input").evaluate_all("xs => xs.map(x => x.type)"))
             page.get_by_text("导入后永久保存", exact=True).click()
             expect(page.get_by_label("导入后永久保存", exact=True)).to_be_checked()
@@ -42,7 +45,9 @@ def run():
             page.get_by_role("button", name="固定本次任务的参考图", exact=True).click()
             expect(page.locator('[data-testid="stCode"]').last).to_contain_text('"frozen": ["media://')
             # Editing the draft cannot mutate references already frozen for a task.
-            page.get_by_role("textbox", name="参考图片 URL（每行一个，可选）").fill("https://example.com/extra.png")
+            if not url_input.is_visible():
+                page.get_by_text("参考图片与本地素材", exact=True).click()
+            url_input.fill("https://example.com/extra.png")
             page.get_by_role("heading", name="图片引用验证").click()
             expect(page.locator('[data-testid="stCode"]').last).to_contain_text("extra.png")
             assert state()["frozen"] == ["media://" + imported["id"]]

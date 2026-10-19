@@ -94,6 +94,17 @@ class SpeechPipelineTests(unittest.TestCase):
         self.assertEqual(synth.call_count, 3)
         self.assertEqual(synth.call_args.args[0], "第二句")
 
+    def test_same_quote_can_be_generated_again_as_a_new_file(self):
+        synth = Mock(return_value=wav_bytes())
+        jobs = SpeechJobs(self.root / "jobs", self.root / "ChatSpeech", synth)
+        clip = {"quote": "同一句", "emotion": "", "voice": self.voice}
+        first = settled(jobs, jobs.start_quotes("owner", [clip], "test-key"))
+        second = settled(jobs, jobs.start_quotes("owner", [clip], "test-key"))
+        self.assertEqual((first["status"], second["status"]), ("completed", "completed"))
+        self.assertEqual(synth.call_count, 2)
+        self.assertNotEqual(first["clips"][0]["filename"], second["clips"][0]["filename"])
+        self.assertEqual(len(list(jobs.output.glob("*.wav"))), 2)
+
     def test_failed_chunk_retries_without_regenerating_success_and_merges_pause(self):
         synth = Mock(side_effect=[wav_bytes(), client.SpeechError("临时失败")])
         jobs = SpeechJobs(self.root / "jobs", self.root / "故事", synth)
@@ -246,6 +257,55 @@ class SpeechPipelineTests(unittest.TestCase):
 
 
 class SpeechPageTests(unittest.TestCase):
+    def test_chat_batches_append_and_keep_legacy_audio(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for filename in ("legacy.wav", "first.wav", "second.wav", "third.wav", "fourth.wav"):
+                (Path(temp) / filename).write_bytes(wav_bytes())
+            source = '''
+import streamlit as st
+from pathlib import Path
+from unittest.mock import Mock, patch
+from app.models import Page2ConversationTurn
+from web.pages import page2
+st.session_state.setdefault("page2_turns", [Page2ConversationTurn(
+    id="turn", assistant_message="他说“同一句”", assistant_audio_filename="legacy.wav")])
+turn = st.session_state["page2_turns"][0]
+jobs = Mock(output=Path(TEMP))
+jobs.get.side_effect = lambda job_id, owner: {
+    "status": "completed",
+    "clips": [{"quote": "同一句", "voice": next(iter(page2.VOICES)),
+               "emotion": "", "filename": name} for name in
+              (["first.wav", "second.wav", "third.wav"] if job_id == "first"
+               else ["fourth.wav"])],
+}
+with patch.object(page2, "chat_speech_jobs", return_value=jobs), \\
+     patch.object(page2, "_upsert_record"):
+    if st.button("第一轮"):
+        st.session_state["page2_tts_active"] = {
+            "turn_id": "turn", "job_id": "first", "source_text": turn.assistant_message}
+        page2._apply_active_tts_result()
+    if st.button("第二轮"):
+        st.session_state["page2_tts_active"] = {
+            "turn_id": "turn", "job_id": "second", "source_text": turn.assistant_message}
+        page2._apply_active_tts_result()
+    page2._render_turn_tts_status(turn)
+'''.replace("TEMP", repr(temp))
+            app = AppTest.from_string(source).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(len(app.get("audio")), 1)
+            app.button[0].click().run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(len(app.get("audio")), 4)
+            app.button[1].click().run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(len(app.get("audio")), 5)
+            turn = app.session_state["page2_turns"][0]
+            self.assertEqual([clip["filename"] for clip in turn.assistant_audio_clips],
+                             ["first.wav", "second.wav", "third.wav", "fourth.wav"])
+            self.assertEqual(turn.assistant_audio_filename, "legacy.wav")
+            self.assertEqual(Page2ConversationTurn.from_dict(turn.to_dict()).assistant_audio_clips,
+                             turn.assistant_audio_clips)
+
     def test_chat_quote_dialog_collects_selected_voice_and_emotion(self):
         source = '''
 import streamlit as st

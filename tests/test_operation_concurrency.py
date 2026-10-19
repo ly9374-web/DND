@@ -94,6 +94,17 @@ class OperationConcurrencyTests(unittest.TestCase):
         self.assertEqual(context[-1].assistant_message, "first reply")
         self.assertEqual(send.call_args.kwargs["user_message"], "second")
 
+    def test_chat_completion_preserves_a_past_message_edited_during_generation(self):
+        task = self.enqueue("chat", user_text="new message", story_brain_enabled=False)
+        page2._prepare_chat_operation(task)
+        self.assertTrue(page2._apply_chat_edit({
+            "turn_id": "t1", "role": "assistant", "text": "edited old reply",
+        }))
+        task.result = "new reply"
+        page2._apply_operation(task)
+        self.assertEqual(self.state.page2_turns[0].assistant_message, "edited old reply")
+        self.assertEqual(self.state.page2_turns[1].assistant_message, "new reply")
+
     def test_memory_followup_runs_before_next_chat_without_waiting_for_video(self):
         video = self.enqueue("video")
         first = self.enqueue("chat")
@@ -159,7 +170,7 @@ class OperationConcurrencyTests(unittest.TestCase):
         self.assertTrue(other.is_started())
         self.assertIn("failed image", self.state.page2_operation_error)
 
-    def test_media_completion_merges_latest_chat_and_preserves_selection_and_drafts(self):
+    def test_media_completion_merges_latest_chat_and_selects_last_result_without_changing_drafts(self):
         image = self.enqueue("image", pending_video_prompt="new image draft")
         video = self.enqueue("video")
         self.state.page2_operation_queue = []
@@ -170,22 +181,24 @@ class OperationConcurrencyTests(unittest.TestCase):
         expected_turns = deepcopy(self.state.page2_turns)
         finish(image, GeneratedImageRecord(id="new-image", provider="grok", prompt="image"))
         finish(video, GeneratedImageRecord(id="new-video", provider="grok", prompt="video", media_kind=GeneratedMediaKind.VIDEO))
-        with patch.object(page2.url_favorites, "clear_preview_url") as clear, \
+        with patch.object(page2.media_store, "available", return_value=True), \
+             patch.object(page2.url_favorites, "clear_preview_url") as clear, \
              patch.object(page2, "_upsert_record") as save:
             page2._advance_operation_queues()
             page2._advance_operation_queues()
             page2._apply_operation(image)
-            clear.assert_not_called()
+            self.assertEqual(clear.call_count, 2)
             self.assertEqual(save.call_count, 2)
         self.assertEqual(self.state.page2_turns, expected_turns)
         self.assertEqual(self.state.page2_story_brain_short, "latest memory")
         self.assertEqual(self.state.page2_image_prompt, "user draft")
-        self.assertEqual(self.state.page2_selected_media_id, "source")
+        self.assertEqual(self.state.page2_selected_media_id, "new-video")
         self.assertEqual(self.state.page2_video_source, "source")
-        self.assertEqual(self.state.page2_pending_media_record_select, "")
+        self.assertEqual(self.state.page2_pending_media_record_select, "new-video")
         self.assertEqual(self.state.page2_pending_video_source, "new-image")
         self.assertEqual([item.id for item in self.state.page2_generated_media], ["source", "new-image", "new-video"])
-        self.assertEqual([item["media_id"] for item in self.state.page2_media_completions], ["new-image", "new-video"])
+        self.assertFalse(self.state.page2_media_completions)
+        self.assertEqual(self.state.page2_operation_notice, "")
 
     def test_save_failure_rolls_back_only_media_and_does_not_publish_success(self):
         task = self.enqueue("image")
@@ -235,19 +248,19 @@ class OperationConcurrencyTests(unittest.TestCase):
             page2._prepare_image_operation(image)()
         self.assertEqual(generate.call_args.kwargs["prompt"], "model prompt")
 
-    def test_view_opens_exact_completion_and_preserves_other_notifications(self):
-        tasks = [self.enqueue(kind) for kind in ("image", "video")]
-        for task in tasks:
-            task.result = GeneratedImageRecord(id=task.kind, provider="grok", prompt="result",
-                media_kind=GeneratedMediaKind.IMAGE if task.kind == "image" else GeneratedMediaKind.VIDEO)
-            page2._apply_operation(task)
-        with patch.object(page2.url_favorites, "clear_preview_url") as clear:
-            page2._view_completed_media(tasks[0].id, "image")
+    def test_video_completion_selects_its_result_without_changing_video_input(self):
+        video = self.enqueue("video")
+        video.result = GeneratedImageRecord(id="video", provider="grok", prompt="result",
+                                            media_kind=GeneratedMediaKind.VIDEO)
+        with patch.object(page2.media_store, "available", return_value=True), \
+             patch.object(page2.url_favorites, "clear_preview_url") as clear:
+            page2._apply_operation(video)
             clear.assert_called_once_with("page2")
-        self.assertEqual(self.state.page2_selected_media_id, "image")
-        self.assertEqual(self.state.page2_pending_media_record_select, "image")
-        self.assertEqual(self.state.page2_pending_video_source, "image")
-        self.assertEqual([item["media_id"] for item in self.state.page2_media_completions], ["video"])
+        self.assertEqual(self.state.page2_selected_media_id, "video")
+        self.assertEqual(self.state.page2_pending_media_record_select, "video")
+        self.assertFalse(self.state.get("page2_pending_video_source"))
+        self.assertEqual(self.state.page2_video_source, "source")
+        self.assertFalse(self.state.page2_media_completions)
 
     def test_old_selector_event_cannot_undo_view_but_new_selector_still_works(self):
         image = GeneratedImageRecord(id="new-image", provider="grok", prompt="new")
@@ -350,7 +363,7 @@ page2._render_video_prompt_controls(st.session_state.page2_generated_media, WAN_
         self.assertEqual(app.session_state.page2_video_source, "existing")
         self.assertEqual(app.text_area(key="_page2_video_prompt").value, "existing draft")
 
-    def test_first_completed_image_waits_for_view_across_reruns(self):
+    def test_first_completed_image_is_selected_across_reruns(self):
         import tempfile
         from streamlit.testing.v1 import AppTest
         # The record embeds legacy base64, so background workers would otherwise
@@ -375,14 +388,51 @@ with patch.object(page2, "_upsert_record"), patch.object(page2.url_favorites, "g
     page2._render_media_column()
 ''').run()
             self.assertEqual(len(app.exception), 0)
-            self.assertIsNone(app.selectbox(key="page2_media_record_select").value)
+            self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new")
             self.assertEqual(app.session_state.page2_video_source, "new")
+            self.assertFalse(any(button.label == "查看" for button in app.button))
+            self.assertFalse(any(button.label == "关闭" for button in app.button))
+            self.assertFalse(app.success)
             app.run()
             self.assertEqual(len(app.exception), 0)
-            self.assertIsNone(app.selectbox(key="page2_media_record_select").value)
-            next(button for button in app.button if button.label == "查看").click().run()
-            self.assertEqual(len(app.exception), 0)
             self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new")
+            self.assertFalse(any(button.label == "查看" for button in app.button))
+            self.assertFalse(any(button.label == "关闭" for button in app.button))
+            self.assertFalse(app.success)
+
+    def test_completed_video_is_selected_without_completion_toast(self):
+        from streamlit.testing.v1 import AppTest
+        app = AppTest.from_string('''
+import streamlit as st
+from unittest.mock import patch
+from app.models import GeneratedImageRecord, GeneratedMediaKind
+from web.pages import page2
+
+page2._ensure_state()
+with patch.object(page2, "_upsert_record"), \\
+     patch.object(page2.media_store, "available", return_value=True), \\
+     patch.object(page2.media_store, "request_cache"), \\
+     patch.object(page2.media_store, "local_path", return_value=None), \\
+     patch.object(page2.url_favorites, "get_preview_url", return_value=""), \\
+     patch.object(page2.url_favorites, "render_url_favorites"):
+    if "fixture_seeded" not in st.session_state:
+        st.session_state.fixture_seeded = True
+        task = page2._Page2OperationTask(kind="video", label="video", scope_id=page2._operation_scope_id())
+        task.result = GeneratedImageRecord(
+            id="new-video", provider="grok", prompt="new video",
+            media_kind=GeneratedMediaKind.VIDEO,
+            video_url_string="https://example.com/video.mp4",
+        )
+        page2._apply_operation(task)
+    page2._render_media_column()
+''').run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new-video")
+        self.assertFalse(any(button.label in {"查看", "关闭"} for button in app.button))
+        self.assertFalse(app.success)
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "new-video")
 
 
 if __name__ == "__main__":

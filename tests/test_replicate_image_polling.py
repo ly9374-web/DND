@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -363,6 +364,8 @@ class ReplicateImagePollingTests(unittest.TestCase):
             image_urls=[],
             aspect_ratio="3:4",
             refiner_prompt="",
+            max_attempts=3,
+            progress_callback=None,
         )
         self.assertEqual(record.provider, media_clients.ANILLUSTRIOUS_PROVIDER)
         self.assertEqual(record.image_data_base64, "dGVzdA==")
@@ -493,3 +496,140 @@ page2._render_operation_queue_status()
         app.button(key="page2_dismiss_operation_error").click().run()
         self.assertEqual(len(app.error), 0)
         self.assertEqual(len(app.exception), 0)
+
+    def test_configured_attempts_report_progress_and_stop_at_limit(self):
+        failed = {"id": "failed-task", "status": "failed", "output": None, "error": "worker failed"}
+        progress = []
+        with patch.object(media_clients.requests, "post", return_value=response(failed)) as post:
+            with self.assertRaisesRegex(RuntimeError, "连续 4 次未返回图片"):
+                self.client.generate_image(
+                    "nano", "风景", max_attempts=4,
+                    progress_callback=lambda attempt, total: progress.append((attempt, total)),
+                )
+        self.assertEqual(post.call_count, 4)
+        self.assertEqual(progress, [(1, 4), (2, 4), (3, 4), (4, 4)])
+
+        grok_progress = []
+        with (
+            patch.object(media_clients.XAIConfig, "image_api_key", return_value="test-key"),
+            patch.object(media_clients.requests, "post", return_value=response({}, 500)) as post,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "连续 2 次未返回图片"):
+                media_clients.GrokImageAPIClient.generate_image(
+                    "风景", max_attempts=2,
+                    progress_callback=lambda attempt, total: grok_progress.append((attempt, total)),
+                )
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(grok_progress, [(1, 2), (2, 2)])
+
+        success_progress = []
+        with patch.object(media_clients.requests, "post", return_value=response(self.ready)) as post:
+            self.client.generate_image(
+                "nano", "风景", max_attempts=30,
+                progress_callback=lambda attempt, total: success_progress.append((attempt, total)),
+            )
+        post.assert_called_once()
+        self.assertEqual(success_progress, [(1, 30)])
+
+        upper_progress = []
+        with patch.object(media_clients.requests, "post", return_value=response(failed)) as post:
+            with self.assertRaisesRegex(RuntimeError, "连续 30 次未返回图片"):
+                self.client.generate_image(
+                    "nano", "风景", max_attempts=30,
+                    progress_callback=lambda attempt, total: upper_progress.append((attempt, total)),
+                )
+        self.assertEqual(post.call_count, 30)
+        self.assertEqual(upper_progress, [(attempt, 30) for attempt in range(1, 31)])
+
+    def test_image_queue_displays_current_attempt(self):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_string('''
+import streamlit as st
+from web.pages import page2
+task = st.session_state.setdefault("page2_active_operation", page2._Page2OperationTask(
+    kind="image", label="生成图片", scope_id="test", payload={"max_attempts": 30},
+))
+page2._render_media_operation_status()
+''').run()
+        self.assertEqual(len(app.exception), 0)
+        app.session_state.page2_active_operation.set_image_attempt(4, 30)
+        app.run()
+        self.assertTrue(any("生图轮询 4/30" in item.value for item in app.info))
+
+
+class StopImagePollingTests(unittest.TestCase):
+    def test_stop_during_submission_prevents_polling_and_retry(self):
+        import threading
+        for client, args, config in [
+            (media_clients.ReplicateImageAPIClient, ("nano", "scene"), "ReplicateConfig.api_token"),
+            (media_clients.GrokImageAPIClient, ("scene",), "XAIConfig.image_api_key"),
+        ]:
+            with self.subTest(client=client):
+                cancel = threading.Event()
+                def submit(*args, **kwargs):
+                    cancel.set()
+                    return response({"id": "task", "status": "starting"}, 202)
+                with patch("app.api.media_clients." + config, return_value="token"), patch.object(media_clients.requests, "post", side_effect=submit) as post, patch.object(media_clients.requests, "get") as get:
+                    with self.assertRaises(media_clients.ImagePollingStopped):
+                        client.generate_image(*args, cancel_event=cancel)
+                self.assertEqual(post.call_count, 1)
+                get.assert_not_called()
+
+    def test_stop_during_get_discards_success_and_prevents_retry(self):
+        import threading
+        for data, code in [({"status": "processing"}, 200), ({"status": "succeeded", "output": ["https://example.com/image.png"]}, 200), ({}, 503)]:
+            with self.subTest(data=data):
+                cancel = threading.Event()
+                cancel.wait = Mock(return_value=False)
+                def get_result(*args, **kwargs):
+                    cancel.set()
+                    return response(data, code)
+                with patch.object(media_clients.requests, "get", side_effect=get_result) as get:
+                    with self.assertRaises(media_clients.ImagePollingStopped):
+                        media_clients.ReplicateImageAPIClient._wait_for_image({"id": "task", "status": "starting"}, "token", cancel_event=cancel)
+                self.assertEqual(get.call_count, 1)
+
+    def test_stop_interrupts_wait_before_query(self):
+        import threading
+        cancel = threading.Event()
+        def wait(seconds):
+            cancel.set()
+            return True
+        cancel.wait = wait
+        with patch.object(media_clients.requests, "get") as get:
+            with self.assertRaises(media_clients.ImagePollingStopped):
+                media_clients.ReplicateImageAPIClient._wait_for_image({"id": "task", "status": "starting"}, "token", cancel_event=cancel)
+        get.assert_not_called()
+
+    def test_button_stops_current_task_and_its_workflow(self):
+        from streamlit.testing.v1 import AppTest
+        app = AppTest.from_string('''
+import streamlit as st
+from web.pages import page2
+if "test_task" not in st.session_state:
+    task = page2._Page2OperationTask(kind="image", label="生成图片", scope_id="test", payload={"workflow_id": "flow"})
+    st.session_state.test_task = task
+    st.session_state.page2_active_operation = task
+    st.session_state.page2_operation_queue = [page2._Page2OperationTask(kind="video", label="视频", scope_id="test", payload={"workflow_id": "flow"}), page2._Page2OperationTask(kind="image", label="其他图片", scope_id="test")]
+page2._render_media_operation_status()
+''').run()
+        self.assertEqual(len(app.exception), 0)
+        next(button for button in app.button if button.label == "停止轮询").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.session_state.test_task.image_cancel.is_set())
+        self.assertIsNone(app.session_state.page2_active_operation)
+        self.assertEqual(len(app.session_state.page2_operation_queue), 1)
+        self.assertEqual(app.session_state.page2_operation_notice, "已停止轮询")
+
+    def test_late_image_is_not_cached(self):
+        from web.pages import page2
+        task = page2._Page2OperationTask(kind="image", label="图片", scope_id="test", payload={"provider": "nano", "prompt": "scene"})
+        def generate(**kwargs):
+            task.image_cancel.set()
+            return Mock()
+        with patch.object(page2.page2_service, "generate_image", side_effect=generate), patch.object(page2.media_store, "cache_generated") as cache:
+            run = page2._prepare_image_operation(task)
+            with self.assertRaises(media_clients.ImagePollingStopped):
+                run()
+        cache.assert_not_called()

@@ -3,6 +3,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import stat
 import threading
 from unittest.mock import Mock
 
@@ -77,7 +78,10 @@ def test_save_survives_deadline_and_chat_deletion(sandbox, kind):
     clock[0] += media_store.RETENTION_SECONDS - 1
     media_store.save(item)
     path = media_store.local_path(item)
-    assert "保存" in str(path) and not old_path.exists()
+    assert path.parent == media_store.MEDIA_DIR.parent / ".保存"
+    if kind == "image" and hasattr(stat, "UF_HIDDEN"):
+        assert path.stat().st_flags & stat.UF_HIDDEN
+    assert not old_path.exists()
     chat = ChatRecord(title="test", turns=[], system_prompt="", generated_images=[item])
     storage.ChatRecordStore.save_or_update_record(chat)
     storage.ChatRecordStore.delete_record(chat.id)
@@ -398,3 +402,38 @@ def test_layout_migration_hides_visible_media_folders(sandbox):
     assert not (root / "保存").exists()
     media_store.migrate_media_layout()  # Idempotent after a restart.
     assert media_store.read_bytes(permanent) == b"video-with-audio"
+
+
+def test_saved_image_migrates_from_root_to_saved_folder(sandbox):
+    _, image = sandbox
+    item = media_store.cache_generated(record())
+    media_store.save(item)
+    root = media_store.MEDIA_DIR.parent
+    current = media_store.local_path(item)
+    former = root / current.name
+    current.replace(former)
+    manifest = media_store._manifest_path(item.id)
+    meta = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest.write_text(json.dumps({**meta, "path": str(former.relative_to(root))}, ensure_ascii=False), encoding="utf-8")
+    media_store.migrate_media_layout()
+    assert media_store.local_path(item) == current
+    assert current.read_bytes() == image
+    assert not former.exists()
+    if hasattr(stat, "UF_HIDDEN"):
+        assert current.stat().st_flags & stat.UF_HIDDEN
+    media_store.migrate_media_layout()
+    assert media_store.local_path(item) == current
+
+
+def test_images_are_hidden_without_moving(sandbox):
+    _, image = sandbox
+    root = media_store.MEDIA_DIR.parent
+    saved = root / ".保存"
+    saved.mkdir()
+    for path in (root / "manually-added.PNG", saved / "another.JPG"):
+        path.write_bytes(image)
+    media_store.hide_project_images()
+    for path in (root / "manually-added.PNG", saved / "another.JPG"):
+        assert path.is_file()
+        if hasattr(stat, "UF_HIDDEN"):
+            assert path.stat().st_flags & stat.UF_HIDDEN

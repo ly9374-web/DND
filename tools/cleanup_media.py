@@ -11,4 +11,4 @@ if __name__ == "__main__":
     migrate_media_directory()
     migrate_media_layout()
     cleanup()
-    print(f"过期媒体清理完成。媒体目录：{MEDIA_DIR.parent / '.临时'} 和 {MEDIA_DIR.parent / '.保存'}")
+    print(f"过期媒体清理完成。永久媒体保存在 {MEDIA_DIR.parent / '.保存'}，临时媒体在 .临时。")

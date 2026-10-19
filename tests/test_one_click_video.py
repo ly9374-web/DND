@@ -85,11 +85,13 @@ class OneClickVideoTests(unittest.TestCase):
     def test_full_chain_uses_new_results_and_click_time_settings(self):
         ctx = page2_service.default_context()
         ctx.selected_video_generation_provider = "bytedance/seedance-1-5-pro"
+        ctx.image_poll_attempts = 30
         urls = ["https://example.com/reference.png"]
         tasks = self.queue(ctx=ctx, image_urls=urls)
         original_chat_model = ctx.selected_chat_model
         ctx.selected_video_generation_provider = WAN_MODEL
         ctx.selected_chat_model = "changed"
+        ctx.image_poll_attempts = 1
         urls.append("https://example.com/later.png")
         self.drain()
         self.assertEqual([kind for kind, _ in self.calls], ["image_prompt", "image", "video_prompt"])
@@ -99,6 +101,8 @@ class OneClickVideoTests(unittest.TestCase):
         self.assertEqual(image["prompt"], "picture: story one")
         self.assertEqual(image["image_urls"], ["https://example.com/reference.png"])
         self.assertEqual(image["aspect_ratio"], "3:4")
+        self.assertEqual(image["max_attempts"], 30)
+        self.assertTrue(callable(image["progress_callback"]))
         self.assertEqual(video_prompt["image_prompt"], image["prompt"])
         self.assertEqual(tasks[1].result.video_prompt, "motion: story one")
         self.assertEqual(tasks[1].result.source_turn_id, "t1")
@@ -107,11 +111,24 @@ class OneClickVideoTests(unittest.TestCase):
             self.assertEqual(request["ctx"].selected_chat_model, original_chat_model)
             self.assertEqual(request["ctx"].selected_video_generation_provider, "bytedance/seedance-1-5-pro")
         self.assertEqual(self.state.page2_image_prompt_mode, "closeup")
-        self.assertEqual(self.state.page2_selected_media_id, "existing-preview")
+        self.assertEqual(self.state.page2_selected_media_id, tasks[1].result.id)
         self.assertEqual(self.state.page2_video_source, "existing-input")
         self.assertEqual(self.state.page2_pending_video_source, tasks[1].result.id)
         self.assertEqual(len(self.state.page2_generated_media), 1)
         self.assertFalse(page2._one_click_video_busy())
+
+    def test_manual_image_uses_saved_attempt_limit(self):
+        ctx = page2_service.default_context()
+        ctx.image_poll_attempts = 30
+        with patch.object(page2_service, "load_context_from_settings", return_value=ctx):
+            task = page2._queue_image_generation(
+                provider="grok", prompt="ready", image_urls=[], aspect_ratio="3:4",
+                mode="normal", subject="",
+            )
+        ctx.image_poll_attempts = 1
+        self.drain()
+        self.assertEqual(task.payload["max_attempts"], 30)
+        self.assertEqual(self.calls[0][1]["max_attempts"], 30)
 
     def test_earlier_chat_is_used_and_later_chat_does_not_change_source(self):
         self.state.page2_turns = []
@@ -278,6 +295,18 @@ class OneClickVideoTests(unittest.TestCase):
         self.assertEqual(page2._manual_reference_ids(), [newer.id])
         self.assertEqual(self.state.page2_pending_video_source, newer.id)
         self.assertEqual(tasks[1].result.video_prompt, "motion: story one")
+
+    def test_regular_image_generation_selects_its_result(self):
+        task = page2._queue_image_generation(
+            provider="grok", prompt="new image", image_urls=[], aspect_ratio="3:4",
+            mode="normal", subject="",
+        )
+        self.drain()
+        self.assertEqual(self.state.page2_selected_media_id, task.result.id)
+        self.assertEqual(self.state.page2_pending_media_record_select, task.result.id)
+        self.assertEqual(self.state.page2_video_source, "existing-input")
+        self.assertEqual(self.state.page2_operation_notice, "")
+        self.assertFalse(self.state.page2_media_completions)
 
     def test_same_image_button_deduplicates_entire_prompt_image_chain(self):
         kwargs = dict(provider="grok", prompt="", image_urls=[], aspect_ratio="3:4", mode="normal", subject="")
@@ -460,7 +489,8 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         self.assertFalse(app.exception)
         self.assertEqual(image.payload["image_urls"], ["media://" + temporary.id, "media://" + saved.id])
         self.assertEqual(app.session_state.page2_video_source, temporary.id)
-        self.assertEqual(app.session_state.page2_selected_media_id, temporary.id)
+        # Completion previews the new image while the manual video input stays selected.
+        self.assertEqual(app.session_state.page2_selected_media_id, image.result.id)
         app.multiselect[0].set_value([]).run()
         self.assertEqual(app.session_state.page2_video_source, image.result.id)
         restored = next(item for item in media_store.list_images() if item.id == saved.id)
@@ -587,7 +617,8 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         self.assertFalse(app.session_state.page2_active_media_operations)
         self.assertEqual(len(app.session_state.page2_generated_media), 2)  # old + new image only
         self.assertTrue(all(item.media_kind == GeneratedMediaKind.IMAGE for item in app.session_state.page2_generated_media))
-        self.assertFalse(app.session_state.page2_selected_media_id)
+        self.assertEqual(app.session_state.page2_selected_media_id,
+                         app.session_state.page2_generated_media[-1].id)
 
     def test_left_button_keeps_manual_behavior_and_right_requires_empty_draft(self):
         app = self.app()

@@ -436,8 +436,78 @@ class ImagePersistenceTests(unittest.TestCase):
             upsert.reset_mock()
             page2._delete_media_record(selected.id)
             self.assertEqual(session.page2_generated_media, [other])
-            self.assertEqual(session.page2_selected_media_id, "")
+            self.assertEqual(session.page2_selected_media_id, other.id)
             upsert.assert_called_once()
+
+    def test_deleting_selected_image_previews_latest_remaining_image(self):
+        from web.pages import page2
+
+        class SessionState(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+
+        images = [
+            GeneratedImageRecord(id=f"image-{number}", provider="nanoPro", prompt=str(number))
+            for number in (1, 2, 3)
+        ]
+        session = SessionState(
+            page2_generated_media=images,
+            page2_selected_media_id="image-3",
+        )
+        with (
+            patch.object(page2.st, "session_state", session),
+            patch.object(page2.media_store, "delete"),
+            patch.object(page2.media_store, "available", return_value=True),
+            patch.object(page2.url_favorites, "clear_preview_url"),
+            patch.object(page2, "_upsert_record"),
+        ):
+            page2._delete_media_record("image-3")
+            self.assertEqual(session.page2_selected_media_id, "image-2")
+            self.assertEqual(session.page2_pending_media_record_select, "image-2")
+            self.assertEqual(session.page2_media_selection_nonce, 1)
+
+            page2._delete_media_record("image-2")
+            self.assertEqual(session.page2_selected_media_id, "image-1")
+
+            page2._delete_media_record("image-1")
+            self.assertEqual(session.page2_selected_media_id, "")
+            self.assertNotIn("page2_pending_media_record_select", session)
+
+    def test_deleted_image_preview_switches_in_rendered_selector(self):
+        from streamlit.testing.v1 import AppTest
+
+        encoded = base64.b64encode(self.image_bytes).decode("ascii")
+        app = AppTest.from_string(f'''
+import streamlit as st
+from unittest.mock import patch
+from app.models import GeneratedImageRecord
+from web.pages import page2
+
+page2._ensure_state()
+if not st.session_state.get("fixture_initialized"):
+    st.session_state.fixture_initialized = True
+    st.session_state.page2_generated_media = [
+        GeneratedImageRecord(id=f"image-{{number}}", provider="nanoPro", prompt=str(number),
+                             image_data_base64="{encoded}")
+        for number in (1, 2, 3)
+    ]
+    st.session_state.page2_selected_media_id = "image-3"
+with patch.object(page2.media_store, "request_cache"), \\
+     patch.object(page2.media_store, "available", return_value=True), \\
+     patch.object(page2.media_store, "delete"), \\
+     patch.object(page2, "_upsert_record"), \\
+     patch.object(page2.url_favorites, "get_preview_url", return_value=""), \\
+     patch.object(page2.url_favorites, "clear_preview_url"):
+    if st.button("模拟删除第三张"):
+        page2._delete_media_record("image-3")
+    page2._render_media_column()
+''').run()
+
+        self.assertEqual(len(app.exception), 0)
+        next(button for button in app.button if button.label == "模拟删除第三张").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state.page2_selected_media_id, "image-2")
+        self.assertEqual(app.selectbox(key="page2_media_record_select_1").value, "image-2")
 
     def test_image_media_ui_has_three_actions_without_provider_caption(self):
         from streamlit.testing.v1 import AppTest

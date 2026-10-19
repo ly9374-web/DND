@@ -2,12 +2,14 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from hashlib import sha256
 from uuid import uuid4
 
 from app.default_prompts.first_inputs import (
     FIRST_INPUT_DEFAULTS_VERSION,
     OLD_PLAYER_FIRST_INPUT,
     OLD_PLAYER_FIRST_INPUT_TITLE,
+    OLD_PLAYER_FIRST_INPUT_V1_SHA256,
 )
 
 def now_iso():
@@ -24,6 +26,14 @@ def optional_positive_int(value):
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def optional_nonnegative_int(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 class Page2ChatModel(str, Enum):
@@ -156,6 +166,8 @@ class SystemPromptRecord:
             if not any(
                 item.title.strip() == OLD_PLAYER_FIRST_INPUT_TITLE
                 or item.content.strip() == OLD_PLAYER_FIRST_INPUT
+                or sha256(item.content.strip().encode("utf-8")).hexdigest()
+                == OLD_PLAYER_FIRST_INPUT_V1_SHA256
                 for item in self.first_inputs
             ):
                 self.first_inputs.append(FirstInputRecord(
@@ -502,6 +514,7 @@ class ChatRecord:
     story_brain_next_update_turn: int | None = None
     story_brain_last_update_turn_id: str = ""
     auto_image_next_turn: int | None = None
+    auto_image_anchor_turn_count: int | None = None
     # At most two versions: current and previous, never a per-turn memory archive.
     story_brain_checkpoints: list = field(default_factory=list)
     final_setting_id: str = ""
@@ -553,6 +566,9 @@ class ChatRecord:
                 or ""
             ),
             auto_image_next_turn=optional_positive_int(data.get("auto_image_next_turn")),
+            auto_image_anchor_turn_count=optional_nonnegative_int(
+                data.get("auto_image_anchor_turn_count")
+            ),
             final_setting_id=(
                 data.get("final_setting_id")
                 or data.get("finalSettingID")
@@ -597,6 +613,9 @@ class ChatRecord:
                 self.story_brain_last_update_turn_id or ""
             ),
             "auto_image_next_turn": optional_positive_int(self.auto_image_next_turn),
+            "auto_image_anchor_turn_count": optional_nonnegative_int(
+                self.auto_image_anchor_turn_count
+            ),
             "final_setting_id": str(self.final_setting_id or ""),
             "branch_group_id": str(self.branch_group_id or ""),
             "branch_number": optional_positive_int(self.branch_number),

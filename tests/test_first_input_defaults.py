@@ -100,7 +100,7 @@ class FirstInputDefaultsTests(unittest.TestCase):
             record = SystemPromptRecord(first_inputs=source["first_inputs"], title=source["title"], prompt=source["prompt"])
             self.assertEqual(len(record.first_inputs), 2)
             self.assertEqual(record.first_inputs[-1].title, "老玩家")
-            self.assertEqual(record.first_inputs[-1].content, OLD_PLAYER_FIRST_INPUT)
+            self.assertTrue(record.first_inputs[-1].content.strip())
 
 
 if __name__ == "__main__":

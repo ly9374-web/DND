@@ -4,7 +4,9 @@ import base64
 import binascii
 import io
 import math
+import re
 import secrets
+import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Iterable, List, Optional
@@ -24,7 +26,10 @@ from app.api.media_clients import (
     download_image_bytes,
 )
 from app.api.speech_client import VOICES
-from app.config import AppStorageKeys, settings
+from app.config import (
+    AppStorageKeys, chat_request_context, model_duration_log, settings,
+)
+from app.default_prompts.internal_catalog import prompt, render
 from app.image_models import (
     IMAGE_QUALITY_PROVIDERS, IMAGE_DEFAULT_QUALITY,
     normalize_image_provider, validate_image_options,
@@ -56,6 +61,25 @@ STORY_BRAIN_SHORT = "story_brain_short"
 STORY_BRAIN_UPDATE_MODELS = list(CHAT_MODEL_OPTIONS)
 STORY_BRAIN_UPDATE_MODEL_LABELS = dict(CHAT_MODEL_LABELS)
 INVALID_STORY_BRAIN_TEXTS = {"未解析到 DeepSeek 回复内容。"}
+IMAGE_PROMPT_LOG_LABEL = "生成图片prompt"
+_DICE_DECISION_PREFIXES = ("本轮不掷骰子", "本轮掷骰子")
+_DICE_DECISION_PREFIX_PATTERN = re.compile(
+    r"\A[\s\ufeff\u200b]*"
+    r"(?P<emphasis>\*\*|__|\*|_|`)?"
+    r"(?:" + "|".join(re.escape(prefix) for prefix in _DICE_DECISION_PREFIXES) + r")"
+    r"[ \t，,。:：；;]*"
+    r"(?(emphasis)(?P=emphasis))"
+)
+
+
+def strip_dice_decision_prefix(text: str) -> str:
+    """Hide a leading dice decision while keeping the remaining text intact."""
+    value = str(text or "")
+    match = _DICE_DECISION_PREFIX_PATTERN.match(value)
+    if match:
+        return value[match.end():].lstrip(" \t\r\n，,。:：；;")
+    return value
+
 
 def normalize_story_brain_update_model(value) -> str:
     model = str(value or "").strip()
@@ -74,9 +98,7 @@ def _normalize_tts_voice(value) -> str:
         return voice
     return next(iter(VOICES))
 
-UNEXPECTED_EVENT_PROMPT = """
-本轮根据上下文，根据剧情走向和场景中角色人设发生一件自然的额外事件（不要直接告诉用户是额外事件），额外情况可以是：1.场景中的角色主动了什么话 2.场景中的角色主动做了什么行为 3.发生了什么突发事件。
-""".strip()
+UNEXPECTED_EVENT_PROMPT = prompt("chat", "unexpected_event")
 
 
 def _strip_plain_text_output(raw_text: str) -> str:
@@ -131,8 +153,10 @@ def _inject_short_story_brain_into_user_prompt(user_message: str, story_brain_sh
     if story_brain_text in INVALID_STORY_BRAIN_TEXTS:
         story_brain_text = ""
     story_brain_text = story_brain_text or "暂无"
-    story_brain_section = f"<当前故事背景>{story_brain_text}</当前故事背景>"
-    return f"{story_brain_section}\n\n{current_text}".strip()
+    return render(
+        "story_brain", "context_wrapper", story_brain=story_brain_text,
+        user_message=current_text,
+    ).strip()
 
 
 def roll_point() -> int:
@@ -141,7 +165,7 @@ def roll_point() -> int:
 
 def should_auto_roll_dice(assistant_message: str) -> bool:
     """Return whether a freshly generated reply explicitly requests a dice roll."""
-    return str(assistant_message or "").rstrip().endswith("可以开始掷骰子。")
+    return str(assistant_message or "").rstrip().endswith(prompt("chat", "auto_roll_marker"))
 
 
 def roll_unexpected_event() -> int:
@@ -169,6 +193,7 @@ class Page2Context:
     temperature: float
     selected_video_generation_provider: str
     selected_tts_voice: str
+    image_poll_attempts: int = 3
 
 
 def load_context_from_settings() -> Page2Context:
@@ -208,6 +233,7 @@ def load_context_from_settings() -> Page2Context:
         selected_tts_voice=_normalize_tts_voice(
             settings.get(AppStorageKeys.PAGE2_SELECTED_TTS_VOICE, "")
         ),
+        image_poll_attempts=min(30, max(1, settings.int(AppStorageKeys.PAGE2_IMAGE_POLL_ATTEMPTS, 3))),
     )
 
 
@@ -227,6 +253,7 @@ def default_context() -> Page2Context:
         temperature=0.8,
         selected_video_generation_provider=WAN_MODEL,
         selected_tts_voice=next(iter(VOICES)),
+        image_poll_attempts=3,
     )
 
 
@@ -267,6 +294,7 @@ def save_context_to_settings(ctx: Page2Context) -> bool:
             ctx.selected_video_generation_provider
         ),
         AppStorageKeys.PAGE2_SELECTED_TTS_VOICE: _normalize_tts_voice(ctx.selected_tts_voice),
+        AppStorageKeys.PAGE2_IMAGE_POLL_ATTEMPTS: min(30, max(1, int(ctx.image_poll_attempts))),
     }
     if all(settings.get(key) == value for key, value in updates.items()):
         return False
@@ -306,45 +334,62 @@ def _send_with_current_chat_model(
     context_messages: list[dict],
     user_message: str,
     system_prompt: str | None = None,
+    log_label: str = "聊天",
 ) -> str:
     effective_system_prompt = ctx.system_prompt if system_prompt is None else system_prompt
-    deepseek_model = deepseek_api_model_for_chat_model(ctx.selected_chat_model)
-    if deepseek_model is not None:
-        return DeepSeekAPIClient.send_message(
-            system_prompt=effective_system_prompt,
-            context_messages=context_messages,
-            user_message=user_message,
-            temperature=ctx.temperature,
-            model=deepseek_model,
-            thinking_enabled=ctx.chat_reasoning_enabled,
-            reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
+    request_id = uuid.uuid4().hex
+    token = chat_request_context.set((request_id, log_label))
+    started = time.monotonic()
+    completed = False
+    try:
+        deepseek_model = deepseek_api_model_for_chat_model(ctx.selected_chat_model)
+        if deepseek_model is not None:
+            reply = DeepSeekAPIClient.send_message(
+                system_prompt=effective_system_prompt,
+                context_messages=context_messages,
+                user_message=user_message,
+                temperature=ctx.temperature,
+                model=deepseek_model,
+                thinking_enabled=ctx.chat_reasoning_enabled,
+                reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
+            )
+        else:
+            openrouter_model = openrouter_api_model_for_chat_model(ctx.selected_chat_model)
+            if openrouter_model is not None:
+                reply = OpenRouterChatAPIClient.send_message(
+                    system_prompt=effective_system_prompt,
+                    context_messages=context_messages,
+                    user_message=user_message,
+                    temperature=ctx.temperature,
+                    model=openrouter_model,
+                )
+            else:
+                grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
+                grok_requires_reasoning = grok_model == "grok-4.6"
+                reply = GrokAPIClient.send_message(
+                    system_prompt=effective_system_prompt,
+                    context_messages=context_messages,
+                    user_message=user_message,
+                    model=grok_model,
+                    temperature=ctx.temperature,
+                    thinking_enabled=True if grok_requires_reasoning else ctx.chat_reasoning_enabled,
+                    reasoning_effort=(
+                        "high"
+                        if ctx.chat_reasoning_enabled
+                        else "low" if grok_requires_reasoning else None
+                    ),
+                )
+        completed = True
+        return reply
+    finally:
+        chat_request_context.reset(token)
+        model_duration_log(
+            request_id=request_id,
+            label=log_label,
+            model=str(ctx.selected_chat_model),
+            elapsed_seconds=time.monotonic() - started,
+            status="完成" if completed else "失败",
         )
-
-    openrouter_model = openrouter_api_model_for_chat_model(ctx.selected_chat_model)
-    if openrouter_model is not None:
-        return OpenRouterChatAPIClient.send_message(
-            system_prompt=effective_system_prompt,
-            context_messages=context_messages,
-            user_message=user_message,
-            temperature=ctx.temperature,
-            model=openrouter_model,
-        )
-
-    grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
-    grok_requires_reasoning = grok_model == "grok-4.6"
-    return GrokAPIClient.send_message(
-        system_prompt=effective_system_prompt,
-        context_messages=context_messages,
-        user_message=user_message,
-        model=grok_model,
-        temperature=ctx.temperature,
-        thinking_enabled=True if grok_requires_reasoning else ctx.chat_reasoning_enabled,
-        reasoning_effort=(
-            "high"
-            if ctx.chat_reasoning_enabled
-            else "low" if grok_requires_reasoning else None
-        ),
-    )
 
 
 def send_message(
@@ -395,13 +440,11 @@ def generate_short_story_brain(
     existing_story_brain = str(story_brain_short or "").strip()
     if existing_story_brain in INVALID_STORY_BRAIN_TEXTS:
         existing_story_brain = ""
-    generator_user_message = f"""
-过去的记录：
-{_turn_history_text(turns, history_turns) or "暂无"}
-
-现有 Story Brain：
-{existing_story_brain or "暂无"}
-""".strip()
+    generator_user_message = render(
+        "story_brain", "update_user_message",
+        history=_turn_history_text(turns, history_turns) or "暂无",
+        current=existing_story_brain or "暂无",
+    )
 
     story_brain_system_prompt = (
         str(long_term_memory_prompt or "").strip()
@@ -419,6 +462,7 @@ def generate_short_story_brain(
         system_prompt=story_brain_system_prompt,
         context_messages=[],
         user_message=generator_user_message,
+        log_label="Story Brain更新",
     )
 
     updated_story_brain = _strip_plain_text_output(raw_text)
@@ -445,11 +489,13 @@ def generate_image_prompt(
             user_message,
             story_brain_short,
         )
-    reply = _strip_plain_text_output(_send_with_current_chat_model(
+    raw_reply = _send_with_current_chat_model(
         ctx=ctx,
         context_messages=build_context_messages(turns, ctx.context_turn_count),
         user_message=user_message,
-    ))
+        log_label=IMAGE_PROMPT_LOG_LABEL,
+    )
+    reply = strip_dice_decision_prefix(_strip_plain_text_output(raw_reply))
     if not reply or reply in INVALID_STORY_BRAIN_TEXTS:
         raise ValueError("模型没有返回可用的图片 prompt，请重试。")
     return reply
@@ -466,7 +512,10 @@ def generate_video_prompt(*, ctx: Page2Context, image_prompt: str, story_text: s
         ctx=ctx,
         system_prompt=VIDEO_PROMPT_SYSTEM_PROMPT,
         context_messages=[],
-        user_message=f"图片prompt：\n{image_prompt}\n\n本轮故事内容：\n{story_text}",
+        user_message=render(
+            "video", "user_message", image_prompt=image_prompt, story_text=story_text,
+        ),
+        log_label="生成视频prompt",
     ))
     if not reply or reply in INVALID_STORY_BRAIN_TEXTS:
         raise ValueError("模型没有返回可用的视频 prompt，请重试。")
@@ -481,6 +530,9 @@ def generate_image(
     refiner_prompt: str = "",
     quality: str = IMAGE_DEFAULT_QUALITY,
     allow_temporary_upload: bool = False,
+    max_attempts: int = 3,
+    progress_callback=None,
+    cancel_event=None,
 ) -> GeneratedImageRecord:
     provider = normalize_image_provider(provider)
     prompt = str(prompt or "").strip()
@@ -512,6 +564,9 @@ def generate_image(
             resolution="1k" if provider == "grokPro" else "2k",
             quality={"grokPro": "low", "grokpro2k": "medium"}.get(provider),
             aspect_ratio=aspect_ratio,
+            max_attempts=max_attempts,
+            progress_callback=progress_callback,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
         )
     else:
         result = ReplicateImageAPIClient.generate_image(
@@ -520,6 +575,9 @@ def generate_image(
             image_urls=image_urls,
             aspect_ratio=aspect_ratio,
             refiner_prompt=refiner_prompt,
+            max_attempts=max_attempts,
+            progress_callback=progress_callback,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             **({"quality": quality} if provider in IMAGE_QUALITY_PROVIDERS else {}),
         )
 
@@ -710,6 +768,7 @@ def upsert_chat_record(
     story_brain_checkpoints: list | None = None,
     final_setting_id: str = "",
     auto_image_next_turn: int | None = None,
+    auto_image_anchor_turn_count: int | None = None,
     scope: str | None = None,
     hidden: bool = False,
 ) -> str:
@@ -754,6 +813,10 @@ def upsert_chat_record(
         final_setting_id=str(final_setting_id or ""),
         auto_image_next_turn=(
             max(1, int(auto_image_next_turn)) if auto_image_next_turn is not None else None
+        ),
+        auto_image_anchor_turn_count=(
+            max(0, int(auto_image_anchor_turn_count))
+            if auto_image_anchor_turn_count is not None else None
         ),
         story_brain_checkpoints=list(story_brain_checkpoints or [])[-2:],
         branch_group_id=existing_branch_group_id,

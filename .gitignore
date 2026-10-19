@@ -3,6 +3,17 @@
 .media/
 .临时/
 .保存/
+# Images placed directly in DND are personal media, including app saves.
+/*.[pP][nN][gG]
+/*.[jJ][pP][gG]
+/*.[jJ][pP][eE][gG]
+/*.[wW][eE][bB][pP]
+/*.[gG][iI][fF]
+/*.[hH][eE][iI][cC]
+/*.[aA][vV][iI][fF]
+/*.[bB][mM][pP]
+/*.[tT][iI][fF]
+/*.[tT][iI][fF][fF]
 .prompt_migration_backups/
 故事/*.wav
 

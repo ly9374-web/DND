@@ -105,6 +105,39 @@ class ConversationBranchPersistenceTests(unittest.TestCase):
             1,
         )
 
+    def test_dialog_defaults_and_confirmed_titles_persist(self):
+        source = self._source_record()
+        self.assertEqual(chat_records.branch_title_defaults(source.id), ("1", "1", "2"))
+
+        second = chat_records.create_branch(
+            source.id, source_title="序章", branch_title="第一幕"
+        )
+        self.assertEqual(chat_records.load_record_by_id(source.id).title, "序章")
+        self.assertEqual(chat_records.load_record_by_id(second.id).title, "第一幕")
+        self.assertEqual(
+            chat_records.branch_title_defaults(second.id), ("第一幕", "2", "3")
+        )
+
+        third = chat_records.create_branch(
+            second.id, source_title="第二幕", branch_title="第三幕"
+        )
+        self.assertEqual(chat_records.load_record_by_id(second.id).title, "第二幕")
+        self.assertEqual(chat_records.load_record_by_id(third.id).title, "第三幕")
+        self.assertEqual(third.branch_number, 3)
+
+    def test_cancel_can_restore_numeric_titles(self):
+        source = self._source_record()
+        second = chat_records.create_branch(
+            source.id, source_title="序章", branch_title="第一幕"
+        )
+        _, source_default, branch_default = chat_records.branch_title_defaults(second.id)
+        third = chat_records.create_branch(
+            second.id, source_title=source_default, branch_title=branch_default
+        )
+
+        self.assertEqual(chat_records.load_record_by_id(second.id).title, "2")
+        self.assertEqual(chat_records.load_record_by_id(third.id).title, "3")
+
     def test_normal_chat_autosave_preserves_branch_identity(self):
         source = self._source_record()
         branch = chat_records.create_branch(source.id)
@@ -180,6 +213,34 @@ class ConversationBranchInteractionTests(unittest.TestCase):
 
         start.assert_called_once_with()
         create.assert_not_called()
+
+    def test_sidebar_action_passes_both_dialog_titles_to_branch_creation(self):
+        state = SessionState(
+            page2_turns=[Page2ConversationTurn(user_message="继续")],
+            page2_generated_media=[],
+            page2_record_id="source",
+            page2_loaded_record_id="source",
+            page2_operation_queue=[],
+            page2_active_operation=None,
+            page2_story_brain_short="",
+            page2_story_brain_archive={},
+            page2_chat_edit_target=None,
+        )
+        branch = SimpleNamespace(id="branch-2", branch_number=2)
+        with (
+            patch.object(page2.st, "session_state", state),
+            patch.object(page2, "_upsert_record"),
+            patch.object(page2.chat_records, "create_branch", return_value=branch) as create,
+        ):
+            self.assertTrue(
+                page2.branch_or_start_new_conversation(
+                    source_title="序章", branch_title="第一幕"
+                )
+            )
+
+        create.assert_called_once_with(
+            "source", scope=None, source_title="序章", branch_title="第一幕"
+        )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import SettingsStore
+from app.default_prompts.internal_catalog import prompt as internal_prompt, render as render_internal_prompt
 from app.models import (
     ChatRecord,
     FixedTemplateRecord,
@@ -270,7 +271,10 @@ if st.button("模拟生成完成"):
         self.assertEqual(kwargs["system_prompt"], "原始 system")
         self.assertEqual(
             kwargs["user_message"],
-            "<当前故事背景>雨夜的旅店</当前故事背景>\n\n打开门",
+            render_internal_prompt(
+                "story_brain", "context_wrapper",
+                story_brain="雨夜的旅店", user_message="打开门",
+            ),
         )
         self.assertNotIn("characters", str(kwargs))
         self.assertNotIn("Memory Pack", str(kwargs))
@@ -318,6 +322,25 @@ if st.button("模拟生成完成"):
             subject="艾琳",
         )
         self.assertEqual(session_state.page2_turns, turns)
+
+    def test_closeup_image_prompt_hides_leading_dice_decision(self):
+        ctx = page2_service.default_context()
+        turns = [Page2ConversationTurn(assistant_message="本轮不掷骰子\n雨还在下。")]
+        examples = (
+            ("本轮不掷骰子。\n\n蓝衣少女站在窗边。", "蓝衣少女站在窗边。"),
+            ("**本轮不掷骰子。**\n\n蓝衣少女站在窗边。", "蓝衣少女站在窗边。"),
+            ("画面中的纸条写着本轮不掷骰子。", "画面中的纸条写着本轮不掷骰子。"),
+        )
+        for model_reply, expected in examples:
+            with self.subTest(model_reply=model_reply):
+                with (
+                    patch.object(page2_service, "_send_with_current_chat_model", return_value=model_reply),
+                ):
+                    actual = page2_service.generate_image_prompt(
+                        ctx=ctx, turns=turns, story_brain_enabled=False,
+                        mode="closeup", subject="蓝衣少女",
+                    )
+                self.assertEqual(actual, expected)
 
     def test_image_prompt_modes_follow_current_chat_model(self):
         models = [
@@ -390,7 +413,10 @@ if st.button("模拟生成完成"):
                             )
                         self.assertIn(prompt_marker, kwargs["user_message"])
                         self.assertTrue(kwargs["user_message"].startswith(
-                            "<当前故事背景>旅店停电</当前故事背景>"
+                            render_internal_prompt(
+                                "story_brain", "context_wrapper",
+                                story_brain="旅店停电", user_message="",
+                            ).strip()
                         ))
                         self.assertEqual(kwargs["context_messages"], [
                             {"role": "user", "content": "观察房间"},
@@ -1187,19 +1213,20 @@ if st.button("模拟生成完成"):
         )
 
     def test_auto_dice_roll_requires_exact_reply_ending(self):
-        self.assertTrue(page2_service.should_auto_roll_dice("可以开始掷骰子。"))
+        marker = internal_prompt("chat", "auto_roll_marker")
+        self.assertTrue(page2_service.should_auto_roll_dice(marker))
         self.assertTrue(
             page2_service.should_auto_roll_dice(
-                "##【行动判定】\n0—12：失败\n13—24：成功\n可以开始掷骰子。\n\n"
+                f"##【行动判定】\n0—12：失败\n13—24：成功\n{marker}\n\n"
             )
         )
         self.assertFalse(
             page2_service.should_auto_roll_dice(
-                "可以开始掷骰子。\n>当前时间：7月20日 17:25"
+                f"{marker}\n>当前时间：7月20日 17:25"
             )
         )
         self.assertFalse(
-            page2_service.should_auto_roll_dice("正文提到可以开始掷骰子。随后继续。")
+            page2_service.should_auto_roll_dice(f"正文提到{marker}随后继续。")
         )
         self.assertFalse(page2_service.should_auto_roll_dice("请求失败，请稍后重试。"))
 
@@ -1258,7 +1285,10 @@ if st.button("模拟生成完成"):
             label="发送消息",
             scope_id="test-scope",
         )
-        task.result = "##【行动判定】\n0—12：失败\n13—24：成功\n可以开始掷骰子。"
+        task.result = (
+            "##【行动判定】\n0—12：失败\n13—24：成功\n"
+            + internal_prompt("chat", "auto_roll_marker")
+        )
         task.meta = {
             "turn_id": turn.id,
             "ctx": ctx,
@@ -1285,7 +1315,9 @@ if st.button("模拟生成完成"):
         followup = session_state["page2_operation_queue"][0]
         self.assertEqual(followup.kind, "chat")
         self.assertEqual(followup.label, "自动掷骰并发送")
-        self.assertEqual(followup.payload["user_text"], "掷骰结果：“17”")
+        self.assertEqual(followup.payload["user_text"], render_internal_prompt(
+            "chat", "dice_result", point=17,
+        ))
         self.assertFalse(followup.payload["hide_user_message"])
         self.assertTrue(followup.payload["is_auto_dice_followup"])
 
@@ -1298,7 +1330,7 @@ if st.button("模拟生成完成"):
 
         ctx = page2_service.default_context()
         turn = Page2ConversationTurn(
-            user_message="掷骰结果：“17”",
+            user_message=render_internal_prompt("chat", "dice_result", point=17),
             assistant_message=None,
             is_loading=True,
         )
@@ -1307,7 +1339,7 @@ if st.button("模拟生成完成"):
             label="自动掷骰并发送",
             scope_id="test-scope",
         )
-        task.result = "结算后又出现判定。\n可以开始掷骰子。"
+        task.result = "结算后又出现判定。\n" + internal_prompt("chat", "auto_roll_marker")
         task.meta = {
             "turn_id": turn.id,
             "ctx": ctx,

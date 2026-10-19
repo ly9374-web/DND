@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import stat
 import threading
 import time
 import uuid
@@ -35,10 +36,14 @@ MEDIA_DIR = Path(os.environ.get("VS_IMAGE_NOVEL_MEDIA_DIR") or (
     DATA_DIR.parent / ".media" if DATA_DIR.name == ".python_app_data" else DATA_DIR / ".media"
 )).expanduser().resolve()
 RETENTION_SECONDS = 48 * 60 * 60
-# Media folders sit beside .media, hidden by the dot prefix, and mix images
-# with videos; .media itself only keeps the internal manifests.
+# Temporary media and saved media use separate folders. Saved images also carry
+# Finder's hidden flag, so their visibility does not depend on their folder.
 _TEMPORARY_CATEGORY = ".临时"
 _SAVED_CATEGORY = ".保存"
+_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif",
+    ".heic", ".avif", ".bmp", ".tif", ".tiff",
+}
 _CATEGORY_TARGETS = {"临时": _TEMPORARY_CATEGORY, "已保存": _SAVED_CATEGORY}
 _lock = threading.RLock()
 _pending: set[str] = set()
@@ -93,9 +98,36 @@ def _files_root():
     return MEDIA_DIR.parent
 
 
-def _layout_target(relative):
-    """Map any historical relative path to the hidden flat 临时/保存 layout."""
+def _saved_image(meta):
+    return meta.get("saved") and meta.get("kind") == "image"
+
+
+def _hide_image(path):
+    """Hide an image in Finder without changing its name or location."""
+    if hasattr(os, "chflags") and hasattr(stat, "UF_HIDDEN"):
+        current = path.stat().st_flags
+        if not current & stat.UF_HIDDEN:
+            os.chflags(path, current | stat.UF_HIDDEN)
+
+
+def hide_project_images():
+    """Hide images dropped into DND or its saved folder while the app runs."""
+    for folder in (_files_root(), _files_root() / _SAVED_CATEGORY):
+        if not folder.is_dir():
+            continue
+        for path in folder.iterdir():
+            if not path.is_symlink() and path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES:
+                try:
+                    _hide_image(path)
+                except OSError as exc:
+                    debug_log("[MediaStore] Could not hide image:", path.name, type(exc).__name__)
+
+
+def _layout_target(relative, meta):
+    """Map historical paths to the current media folders."""
     parts = Path(relative).parts
+    if _saved_image(meta):
+        return str(Path(_SAVED_CATEGORY) / parts[-1])
     first = parts[0] if parts else ""
     if first in (_TEMPORARY_CATEGORY, _SAVED_CATEGORY):
         category = first
@@ -105,9 +137,9 @@ def _layout_target(relative):
 
 
 def migrate_media_layout():
-    """Flatten 图片/视频 subfolders; media sits beside .media, mixed by lifetime."""
+    """Keep saved media in its folder and update manifests after moving it."""
     with _lock:
-        # Earlier revisions kept visible 临时/保存 folders beside .media; hide them.
+        # Earlier revisions kept visible 临时/保存 folders beside .media.
         for old, new in (("临时", _TEMPORARY_CATEGORY), ("保存", _SAVED_CATEGORY)):
             source = _files_root() / old
             if not source.is_dir():
@@ -135,10 +167,12 @@ def migrate_media_layout():
                 relative = meta.get("path")
                 if not relative:
                     continue
-                source = MEDIA_DIR / relative
-                target_relative = _layout_target(relative)
+                target_relative = _layout_target(relative, meta)
                 destination = _files_root() / target_relative
-                if source.is_file():
+                candidates = (_files_root() / relative, MEDIA_DIR / relative)
+                for source in candidates:
+                    if source == destination or not source.is_file():
+                        continue
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if destination.exists():
                         if not filecmp.cmp(source, destination, shallow=False):
@@ -146,8 +180,10 @@ def migrate_media_layout():
                         source.unlink()
                     else:
                         source.replace(destination)
-                elif not destination.exists():
+                if not destination.exists():
                     continue
+                if _saved_image(meta):
+                    _hide_image(destination)
                 if target_relative != relative:
                     _write({**meta, "path": target_relative})
             except ValueError:
@@ -171,6 +207,8 @@ def migrate_media_layout():
                     path.unlink()
                 else:
                     path.replace(destination)
+                if category == "已保存" and destination.suffix.lower() in _IMAGE_SUFFIXES:
+                    _hide_image(destination)
         # Flat files historically stored directly inside .media never auto-expire.
         for path in [p for p in MEDIA_DIR.iterdir() if p.is_file() and not p.name.startswith(".")]:
             destination = _files_root() / _SAVED_CATEGORY / path.name
@@ -181,6 +219,8 @@ def migrate_media_layout():
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 path.replace(destination)
+            if destination.suffix.lower() in _IMAGE_SUFFIXES:
+                _hide_image(destination)
         for category in _CATEGORY_TARGETS:
             base = MEDIA_DIR / category
             if base.is_dir():
@@ -326,7 +366,7 @@ def list_images():
                 continue
         # A deferred manifest may be a deletion tombstone. Do not rediscover
         # loose files until its contents are available again.
-        for category in (() if deferred_manifests else (_TEMPORARY_CATEGORY, _SAVED_CATEGORY)):
+        for category in (() if deferred_manifests else (_TEMPORARY_CATEGORY, _SAVED_CATEGORY, "")):
             for path in (_files_root() / category).glob("*"):
                 if (path.is_symlink() or not path.is_file() or path.resolve() in known_paths
                         or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}):
@@ -336,7 +376,9 @@ def list_images():
                         image.verify()
                     relative = str(path.relative_to(_files_root()))
                     modified = path.stat().st_mtime
-                    saved = category == _SAVED_CATEGORY
+                    saved = category in (_SAVED_CATEGORY, "")
+                    if saved:
+                        _hide_image(path)
                     meta = {"id": "local-" + _key(relative), "kind": "image", "status": "ready",
                             "path": relative, "saved": saved, "cached_at": modified,
                             "expires_at": None if saved else modified + RETENTION_SECONDS}
@@ -365,6 +407,8 @@ def _promote(meta):
     # Write the durable copy first, then commit its manifest before removing
     # the temporary copy. Saving and cleanup use the same lock.
     _atomic_write(destination, source.read_bytes())
+    if meta.get("kind") == "image":
+        _hide_image(destination)
     meta = {**meta, "saved": True, "expires_at": None,
             "path": str(destination.relative_to(_files_root()))}
     _write(meta)
@@ -412,6 +456,8 @@ def cache_record(record, *, permanent=False):
         filename = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S") + "-" + _key(record.id)[:16] + suffix
         path = _files_root() / (_SAVED_CATEGORY if saved else _TEMPORARY_CATEGORY) / filename
         _atomic_write(path, data)
+        if saved and kind == "image":
+            _hide_image(path)
         meta = {"id": record.id, "kind": kind, "status": "ready", "saved": saved,
                 "cached_at": now, "expires_at": None if saved else now + RETENTION_SECONDS,
                 "path": str(path.relative_to(_files_root()))}
@@ -559,6 +605,7 @@ def _maintain():
     while True:
         try:
             cleanup()
+            hide_project_images()
             from app.services import temporary_uploads
             temporary_uploads.cleanup()
         except Exception as exc:
@@ -582,6 +629,7 @@ def start_maintenance():
             migrate_media_directory()
             migrate_media_layout()
             cleanup()
+            hide_project_images()
             for category in (_TEMPORARY_CATEGORY, _SAVED_CATEGORY):
                 (_files_root() / category).mkdir(parents=True, exist_ok=True)
             threading.Thread(target=_maintain, daemon=True, name="media-maintenance").start()

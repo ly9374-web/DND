@@ -1,5 +1,6 @@
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional, List
 from urllib.parse import urlparse
@@ -12,6 +13,8 @@ from app.config import (
     KeyLinkDeepSeekV4ProConfig,
     OpenRouterConfig,
     debug_log,
+    chat_request_context,
+    model_request_log,
     mask_authorization_header,
 )
 
@@ -28,6 +31,11 @@ TRANSIENT_NETWORK_ERRORS = (
 )
 
 NETWORK_RETRY_DELAYS = (2, 5)
+
+# 重试只针对“秒级失败”的连接层瞬断（代理重启/切换节点时连接根本没建立）。
+# 请求已发出但服务器长时间无响应（读超时）说明是服务端异常，
+# 重试只会成倍拉长等待时间，直接抛错让用户尽快看到失败原因。
+SLOW_FAILURE_RETRY_LIMIT_SECONDS = 30.0
 
 
 def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_env_proxy=False, stream=False):
@@ -49,6 +57,15 @@ def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_e
             debug_log(f"{label} 网络瞬断，{delay}s 后第 {attempt + 1} 次重试：{last_exc}")
             time.sleep(delay)
         try:
+            context = chat_request_context.get()
+            request_id, request_label = context if context is not None else (uuid.uuid4().hex, label)
+            model_request_log(
+                request_id=request_id,
+                label=request_label,
+                url=url,
+                body=json_body,
+                attempt=attempt + 1,
+            )
             request_start = time.monotonic()
             response = requests.post(
                 url,
@@ -63,6 +80,13 @@ def post_with_network_retry(url, *, headers, json_body, timeout, label, bypass_e
             return response
         except TRANSIENT_NETWORK_ERRORS as exc:
             last_exc = exc
+            failure_elapsed = time.monotonic() - request_start
+            if failure_elapsed > SLOW_FAILURE_RETRY_LIMIT_SECONDS:
+                debug_log(
+                    f"{label} 服务器 {failure_elapsed:.0f}s 无响应（非瞬断），"
+                    f"判定为服务端异常，不再自动重试。"
+                )
+                break
     raise last_exc
 
 
@@ -525,7 +549,10 @@ class DeepSeekAPIClient:
             request_url,
             headers=headers,
             json_body=body,
-            timeout=3600,
+            # 连接 15 秒（直连场景正常毫秒级建立）；
+            # 读超时 10 分钟：官方服务端网关约 15 分钟会切断挂死请求，
+            # 客户端先于它超时即可更快把失败反馈给用户。
+            timeout=(15, 600),
             label="DeepSeek Chat",
             # api.deepseek.com 国内可直连，且部分代理节点会阻断该域名；
             # KeyLink 中转域名仍按环境变量代理设置访问。

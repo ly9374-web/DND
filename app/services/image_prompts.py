@@ -1,4 +1,6 @@
-"""作为普通聊天用户消息发送的图片 prompt 模式指令。"""
+"""Build image-prompt requests from the shared code-owned prompt file."""
+
+from app.default_prompts.internal_catalog import prompt, render
 
 
 def build_image_prompt_system_prompt(mode: str = "first_person", subject: str = "") -> str:
@@ -8,14 +10,7 @@ def build_image_prompt_system_prompt(mode: str = "first_person", subject: str = 
         raise ValueError("主体不能为空。")
 
     if mode == "first_person":
-        return (
-            f"根据上文，以我为第一人称视角描述一下当前场景，并用“我”代指自己使用客观具体的描述，最终输出大概230字，包括画面的场景，人物，人物和我的互动，人物外貌细节，人物表情，我所看到的场景，最终输出视角为第一人称仰视还是俯视还是平视等细节。输出中禁止出现人名，仅用形象指代我所看见的人物，客观描述客观场景。不要描述我的姿态和我的形象"
-            f"所有的女性都要额外用正面词汇描述她们的长相和身材，让她们是各自风格的美女"
-            f"禁止生成我看不到的内容，比如我自己的形象，或者背后的环境，禁止使用成语抽象描述场景。使用具体机械客观流水账式的画面描述，不要进行文学化修饰"
-            "输出结尾加上“摄像头视角：我的第一人称视角仰视/俯视/平视”和“画风：动漫”。此轮不需要输出时间地点\n"
-        )
-
+        return prompt("image", "first_person")
     if mode == "closeup":
-        return f"""生成一个{subject}当前的人物特写，不要出现{subject}的人物的名字。给我详细描述{subject}的外貌,当前穿着，当前姿势和正在做什么，当前状态，当前表情，当前持有的物品或者能被观察到的特殊物品,还有当前的背景场景。所有的女性都要额外用正面词汇描述她们的长相和身材，让她们是各自风格的美女。描述中不要出现别的角色。保证我可以完全想象出现在他的形象。使用具体机械客观流水账式的画面描述，不要进行文学化修饰。最后固定输出“画风：动漫”此轮不需要输出时间地点""".strip()
-
-    return "以第三人称视角描述一下当前场景，全篇禁止出现人物名称而是客观描述场景与人物：包括环境，灯光，人物站位，人物形象，人物姿势，人物特征，人物是否有伤，人物之间的互动，环境有什么，场景是什么。所有的女性都要额外用正面词汇描述她们的长相和身材，让她们是各自风格的美女。并且输出所有任务和场景物品的位置关系和朝向、摄像头角度。摄像头角度必须选取可以最清楚看到整个场景的角度。最后固定输出“画风：动漫”使用具体机械客观流水账式的画面描述，不要进行文学化修饰。此轮不需要输出时间地点"
+        return render("image", "closeup", subject=subject).strip()
+    return prompt("image", "normal")

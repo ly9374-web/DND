@@ -1,4 +1,4 @@
-"""Bounded, redacted application debug logs with a rolling 48-hour lifetime."""
+"""Bounded, redacted chat logs with a rolling 48-hour lifetime."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ RETENTION_SECONDS = 48 * 60 * 60
 _lock = threading.RLock()
 _started: set[Path] = set()
 _run_id = uuid.uuid4().hex[:12]
-_filename = re.compile(r"debug-(\d+)-[a-f0-9]{12}\.jsonl\Z")
+_filename = re.compile(r"(?:chat|debug)-(\d+)-[a-f0-9]{12}\.jsonl\Z")
 _data_url = re.compile(r"data:[\w.+/-]+;base64,[A-Za-z0-9+/=\s]+")
 _long_base64 = re.compile(r"[A-Za-z0-9+/=]{256,}")
 _secret_keys = {"authorization", "api_key", "apikey", "api_secret", "secret", "token", "access_token"}
@@ -47,7 +47,7 @@ def redact(value):
 def cleanup(directory: Path, *, now=None):
     cutoff = (time.time() if now is None else now) - RETENTION_SECONDS
     with _lock:
-        for path in directory.glob("debug-*.jsonl"):
+        for path in directory.glob("*.jsonl"):
             match = _filename.fullmatch(path.name)
             if not match or path.is_symlink():
                 continue
@@ -89,10 +89,23 @@ def write(directory: Path, *items, message=None):
         message = format_message(*items) if message is None else str(message)[:20000]
         with _lock:
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"debug-{int(now // 60) * 60}-{_run_id}.jsonl"
+            path = directory / f"chat-{int(now // 60) * 60}-{_run_id}.jsonl"
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"time": now, "message": message}, ensure_ascii=False) + "\n")
     except (OSError, ValueError, RecursionError):
+        pass
+
+
+def write_event(directory: Path, event: dict):
+    """Persist a complete structured chat request or timing event."""
+    try:
+        now = time.time()
+        with _lock:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"chat-{int(now // 60) * 60}-{_run_id}.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"time": now, **event}, ensure_ascii=False, default=str) + "\n")
+    except (OSError, ValueError, TypeError, RecursionError):
         pass
 
 

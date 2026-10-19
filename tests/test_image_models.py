@@ -64,7 +64,7 @@ class ImageModelRequestTests(unittest.TestCase):
                 self.assertEqual(call.args[0], "https://api.replicate.com/v1/models/openai/gpt-image-2.5-sunburst/predictions")
                 self.assertEqual(call.kwargs["json"], {"input": {
                     "prompt": "test prompt", "quality": quality, "aspect_ratio": "3:2",
-                    "input_images": refs, "number_of_images": 1, "output_format": "webp",
+                    "input_images": refs, "number_of_images": 1, "moderation": "low", "output_format": "webp",
                 }})
         self.assertEqual(self.generate("image2.5").kwargs["json"]["input"]["quality"], "low")
         self.assertEqual(self.generate("image2.5", aspect_ratio="16:9").kwargs["json"]["input"]["aspect_ratio"], "16:9")

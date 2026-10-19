@@ -87,6 +87,7 @@ class AutoImageTests(unittest.TestCase):
         page2._schedule_chat_followups(task, turn.assistant_message)
 
     def test_fifth_user_turn_uses_current_media_settings_and_first_person_fallback(self):
+        self.ctx.image_poll_attempts = 30
         self.state["page2_auto_image_next_turn"] = 5
         self.state.page2_image_prompt_mode = "closeup"
         self.state.page2_image_prompt_subject = ""
@@ -103,8 +104,97 @@ class AutoImageTests(unittest.TestCase):
         self.assertEqual(self.prompt_calls[0]["turns"][-1].id, turn.id)
         self.assertEqual(self.image_calls[0]["provider"], "grok")
         self.assertEqual(self.image_calls[0]["aspect_ratio"], "3:4")
+        self.assertEqual(self.image_calls[0]["max_attempts"], 30)
+        self.assertTrue(callable(self.image_calls[0]["progress_callback"]))
         self.assertEqual(self.state.page2_generated_media[0].source_turn_id, turn.id)
         self.assertEqual(self.state.page2_auto_image_next_turn, 10)
+        self.assertEqual(self.state.page2_auto_image_anchor_turn_count, 5)
+
+    def test_undo_generated_turn_keeps_exact_interval_after_replacement_turns(self):
+        self.ctx.auto_image_interval = 3
+        self.state["page2_auto_image_next_turn"] = 3
+        for number in range(1, 4):
+            self.followup(self.append_turn(number))
+        self.drain()
+        self.assertEqual(len(self.image_calls), 1)
+        self.assertEqual(self.state.page2_auto_image_next_turn, 6)
+
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_anchor_turn_count, 2)
+        self.assertEqual(self.state.page2_auto_image_next_turn, 5)
+        for number in ("3-replaced", "4-replaced"):
+            self.followup(self.append_turn(number))
+            self.drain()
+            self.assertEqual(len(self.image_calls), 1)
+        self.followup(self.append_turn("5-replaced"))
+        self.drain()
+        self.assertEqual(len(self.image_calls), 2)
+        self.assertEqual(self.state.page2_auto_image_next_turn, 8)
+
+    def test_undo_after_image_preserves_retained_progress_and_repeated_undo(self):
+        self.ctx.auto_image_interval = 3
+        self.state["page2_auto_image_next_turn"] = 3
+        for number in range(1, 4):
+            self.followup(self.append_turn(number))
+        self.drain()
+        self.followup(self.append_turn(4))
+        self.followup(self.append_turn(5))
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_next_turn, 6)
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_next_turn, 6)
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_next_turn, 5)
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_next_turn, 4)
+        for number in ("2-new", "3-new"):
+            self.followup(self.append_turn(number))
+            self.drain()
+            self.assertEqual(len(self.image_calls), 1)
+        self.followup(self.append_turn("4-new"))
+        self.drain()
+        self.assertEqual(len(self.image_calls), 2)
+
+    def test_undo_failed_image_turn_retries_at_replacement_turn(self):
+        self.ctx.auto_image_interval = 3
+        self.state["page2_auto_image_next_turn"] = 3
+        for number in range(1, 3):
+            self.followup(self.append_turn(number))
+        self.fail_image = True
+        self.followup(self.append_turn(3))
+        self.drain()
+        self.assertEqual(self.state.page2_auto_image_next_turn, 4)
+        self.assertEqual(self.state.page2_auto_image_anchor_turn_count, 0)
+
+        self.assertTrue(page2._undo_last_turn())
+        self.assertEqual(self.state.page2_auto_image_next_turn, 3)
+        self.fail_image = False
+        self.followup(self.append_turn("3-replaced"))
+        self.drain()
+        self.assertEqual(len(self.state.page2_generated_media), 1)
+
+    def test_loading_legacy_record_repairs_stale_target_after_undo(self):
+        self.ctx.auto_image_interval = 3
+        legacy = ChatRecord(
+            id="legacy-auto-image", title="old chat", system_prompt="",
+            final_setting_id="saved-prompt",
+            turns=[
+                Page2ConversationTurn(id=f"old-{number}", user_message=f"action {number}",
+                                      assistant_message=f"story {number}")
+                for number in range(1, 3)
+            ],
+            auto_image_next_turn=6,
+        )
+        with (
+            patch.object(page2, "get_arg", return_value=legacy.id),
+            patch.object(page2.chat_records, "load_record_by_id", return_value=legacy),
+            patch.object(page2.system_prompts, "refresh_selected_prompt", return_value=None),
+            patch.object(page2.url_favorites, "clear_preview_url"),
+        ):
+            page2._load_record_from_nav_if_needed()
+
+        self.assertEqual(self.state.page2_auto_image_anchor_turn_count, 2)
+        self.assertEqual(self.state.page2_auto_image_next_turn, 5)
 
     def test_prompt_failure_retries_on_next_user_turn(self):
         self.state["page2_auto_image_next_turn"] = 5
@@ -141,10 +231,12 @@ class AutoImageTests(unittest.TestCase):
         saved = ChatRecord(
             title="story", turns=self.state.page2_turns,
             system_prompt="", auto_image_next_turn=self.state.page2_auto_image_next_turn,
+            auto_image_anchor_turn_count=self.state.page2_auto_image_anchor_turn_count,
         )
         saved.turns[-1].is_auto_dice_followup = True
         loaded = ChatRecord.from_dict(saved.to_dict())
         self.assertEqual(loaded.auto_image_next_turn, 11)
+        self.assertEqual(loaded.auto_image_anchor_turn_count, 6)
         self.assertTrue(loaded.turns[-1].is_auto_dice_followup)
 
     def test_manual_image_generation_restarts_auto_image_countdown(self):

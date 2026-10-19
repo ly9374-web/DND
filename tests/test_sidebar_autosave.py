@@ -222,6 +222,15 @@ page2.render_sidebar_context()
             self.assertEqual(len(app.exception), 0)
             self.assertNotIn("确认", [button.label for button in app.button])
             self.assertEqual(set_many.call_count, 0)
+            self.assertEqual(app.slider(key="page2_sidebar_image_poll_attempts").value, 3)
+            app.slider(key="page2_sidebar_image_poll_attempts").set_value(30).run()
+            self.assertEqual(
+                self.store.int(AppStorageKeys.PAGE2_IMAGE_POLL_ATTEMPTS), 30,
+            )
+            self.assertEqual(page2_service.load_context_from_settings().image_poll_attempts, 30)
+            app.slider(key="page2_sidebar_image_poll_attempts").set_value(3).run()
+            self.assertEqual(self.store.int(AppStorageKeys.PAGE2_IMAGE_POLL_ATTEMPTS), 3)
+            set_many.reset_mock()
             app.number_input(key="page2_sidebar_context_turn_count").set_value(12).run()
             self.assertEqual(len(app.exception), 0)
             self.assertEqual(

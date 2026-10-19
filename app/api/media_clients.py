@@ -55,6 +55,23 @@ class GeneratedImageResult:
     image_data_base64: Optional[str] = None
 
 
+class ImagePollingStopped(Exception):
+    """The user stopped local image queries and retries."""
+
+
+def _check_image_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ImagePollingStopped("已停止轮询")
+
+
+def _image_wait(seconds, cancel_event):
+    if cancel_event is None:
+        time.sleep(seconds)
+    elif cancel_event.wait(seconds):
+        raise ImagePollingStopped("已停止轮询")
+    _check_image_cancel(cancel_event)
+
+
 class ReplicateTerminalPredictionError(RuntimeError):
     """A prediction reached a terminal state without a usable image."""
 
@@ -177,7 +194,11 @@ class GrokImageAPIClient:
         resolution="2k",
         quality=None,
         aspect_ratio=IMAGE_ASPECT_RATIO,
+        max_attempts=IMAGE_GENERATION_MAX_ATTEMPTS,
+        progress_callback=None,
+        cancel_event=None,
     ):
+        max_attempts = min(30, max(1, int(max_attempts)))
         image_urls = image_urls or []
         image_urls = [url.strip() for url in image_urls if str(url).strip()]
         image_urls = image_urls[:5]
@@ -241,7 +262,11 @@ class GrokImageAPIClient:
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", body)
 
-        for attempt in range(1, IMAGE_GENERATION_MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
+            _check_image_cancel(cancel_event)
+            if progress_callback is not None:
+                progress_callback(attempt, max_attempts)
+            _check_image_cancel(cancel_event)
             request_start = time.monotonic()
             response = requests.post(
                 url,
@@ -249,6 +274,7 @@ class GrokImageAPIClient:
                 json=body,
                 timeout=150,
             )
+            _check_image_cancel(cancel_event)
             response_received = time.monotonic()
             body_text = response.text
             body_decoded = time.monotonic()
@@ -267,20 +293,20 @@ class GrokImageAPIClient:
                 validate_http_response(response)
                 return parse_image_response(response.json())
             except (RuntimeError, ValueError) as exc:
-                if attempt >= IMAGE_GENERATION_MAX_ATTEMPTS:
+                if attempt >= max_attempts:
                     raise RuntimeError(
-                        f"Grok 连续 {IMAGE_GENERATION_MAX_ATTEMPTS} 次未返回图片。"
+                        f"Grok 连续 {max_attempts} 次未返回图片。"
                         f"最后错误：{exc}"
                     ) from exc
                 debug_log(
                     "[Grok Image] retry",
                     attempt + 1,
                     "of",
-                    IMAGE_GENERATION_MAX_ATTEMPTS,
+                    max_attempts,
                     "after:",
                     str(exc),
                 )
-                time.sleep(IMAGE_GENERATION_RETRY_INTERVAL_SECONDS)
+                _image_wait(IMAGE_GENERATION_RETRY_INTERVAL_SECONDS, cancel_event)
 
         raise RuntimeError("Grok 未返回图片。")
 
@@ -312,7 +338,11 @@ class ReplicateImageAPIClient:
         aspect_ratio=IMAGE_ASPECT_RATIO,
         refiner_prompt="",
         quality=IMAGE_DEFAULT_QUALITY,
+        max_attempts=IMAGE_GENERATION_MAX_ATTEMPTS,
+        progress_callback=None,
+        cancel_event=None,
     ):
+        max_attempts = min(30, max(1, int(max_attempts)))
         provider = normalize_image_provider(provider)
         image_urls = image_urls or []
         image_urls = [str(url).strip() for url in image_urls if str(url).strip()]
@@ -351,6 +381,7 @@ class ReplicateImageAPIClient:
                 "input_images": image_urls,
                 "quality": quality,
                 "number_of_images": 1,
+                "moderation": "low",
                 "output_format": "webp",
             }
         elif provider == "flux2-dev":
@@ -434,9 +465,12 @@ class ReplicateImageAPIClient:
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", body)
 
-        max_attempts = IMAGE_GENERATION_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
+            _check_image_cancel(cancel_event)
+            if progress_callback is not None:
+                progress_callback(attempt, max_attempts)
             try:
+                _check_image_cancel(cancel_event)
                 request_start = time.monotonic()
                 response = requests.post(
                     url,
@@ -444,6 +478,7 @@ class ReplicateImageAPIClient:
                     json=body,
                     timeout=IMAGE_SUBMISSION_TIMEOUT,
                 )
+                _check_image_cancel(cancel_event)
                 response_received = time.monotonic()
                 body_text = response.text
                 body_decoded = time.monotonic()
@@ -479,12 +514,13 @@ class ReplicateImageAPIClient:
                     "after:",
                     str(exc),
                 )
-                time.sleep(cls.POLL_INTERVAL_SECONDS)
+                _image_wait(cls.POLL_INTERVAL_SECONDS, cancel_event)
                 continue
 
             try:
                 return cls._wait_for_image(
-                    response.json(), effective_replicate_api_token
+                    response.json(), effective_replicate_api_token,
+                    **({"cancel_event": cancel_event} if cancel_event is not None else {})
                 )
             except ReplicateTerminalPredictionError as exc:
                 if attempt >= max_attempts:
@@ -500,7 +536,7 @@ class ReplicateImageAPIClient:
                     "after:",
                     str(exc),
                 )
-                time.sleep(cls.POLL_INTERVAL_SECONDS)
+                _image_wait(cls.POLL_INTERVAL_SECONDS, cancel_event)
 
         raise RuntimeError(f"{provider} 未返回图片。")
 
@@ -517,7 +553,7 @@ class ReplicateImageAPIClient:
             debug_log("[Replicate Image] cancel failed for", prediction_id, repr(exc))
 
     @classmethod
-    def _wait_for_image(cls, data, api_token):
+    def _wait_for_image(cls, data, api_token, cancel_event=None):
         """Resolve both synchronous outputs and accepted asynchronous predictions."""
         if not isinstance(data, dict):
             raise RuntimeError("Replicate 生图响应不是 JSON 对象。")
@@ -537,6 +573,7 @@ class ReplicateImageAPIClient:
         seen_started_at = False
 
         while True:
+            _check_image_cancel(cancel_event)
             if not isinstance(data, dict):
                 raise RuntimeError("Replicate 查询响应不是 JSON 对象。" + task_hint)
             status = str(data.get("status") or "").lower()
@@ -591,13 +628,14 @@ class ReplicateImageAPIClient:
 
             # Retry only GETs for this prediction, never the billable POST.
             while True:
+                _check_image_cancel(cancel_event)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
                         f"等待 Replicate 生图超时，最后状态：{last_status}。"
                         "远端任务可能仍在执行，可打开任务链接查看结果。" + task_hint
                     )
-                time.sleep(min(delay, remaining))
+                _image_wait(min(delay, remaining), cancel_event)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     continue
@@ -613,6 +651,7 @@ class ReplicateImageAPIClient:
                     retry_reason = type(exc).__name__
                     response = None
                 else:
+                    _check_image_cancel(cancel_event)
                     debug_log("====== Replicate Image Poll HTTP Status ======")
                     debug_log(response.status_code)
                     if response.status_code == 429 or 500 <= response.status_code < 600:

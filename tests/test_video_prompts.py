@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.default_prompts.internal_catalog import render as render_internal_prompt
 from app.models import GeneratedImageRecord, Page2ConversationTurn, CHAT_MODEL_OPTIONS
 from app.services import page2_service
 from app.services.video_prompts import (
@@ -85,7 +86,10 @@ class VideoPromptTests(unittest.TestCase):
             args = client.call_args.kwargs
             self.assertEqual(args["system_prompt"], VIDEO_PROMPT_SYSTEM_PROMPT)
             self.assertEqual(args["context_messages"], [])
-            self.assertEqual(args["user_message"], "图片prompt：\n蓝衣女子站在画面左侧\n\n本轮故事内容：\n编辑后故事")
+            self.assertEqual(args["user_message"], render_internal_prompt(
+                "video", "user_message", image_prompt=self.image.prompt,
+                story_text="编辑后故事",
+            ))
             expected_model = (
                 page2_service.deepseek_api_model_for_chat_model(model)
                 or page2_service.grok_api_model_for_chat_model(model)

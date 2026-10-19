@@ -222,9 +222,9 @@ def render():
     st.caption("已保存的 Key 会在本页始终以明文显示；可直接修改、复制或删除。")
 
     st.checkbox(
-        "打印并保存调试日志（48 小时）",
+        "打印并保存聊天日志（48 小时）",
         value=settings.bool(AppStorageKeys.DEBUG_LOG_ENABLED, False),
-        help="调试信息会实时打印到启动终端，同时存入 .python_app_data/logs；图片编码、密钥和 URL 签名会被省略。文件日志保留 48 小时。",
+        help="记录聊天模型实际收到的完整请求（System Prompt、上下文、最终拼接的用户内容和模型参数）及请求耗时，不记录模型回复正文。实时打印到启动终端，并在数据目录的 logs 保留 48 小时；不含 API Key 请求头。",
         key="model_settings_debug_log_enabled",
         on_change=_save_debug_enabled,
     )

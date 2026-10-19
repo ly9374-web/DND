@@ -1,6 +1,8 @@
 import json
 import os
 import time
+from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -53,6 +55,7 @@ class AppStorageKeys:
     PAGE2_WAN3_INPUT_MODE = "page2Wan3InputMode"
     PAGE2_WAN3_ASPECT_RATIO = "page2Wan3AspectRatio"
     PAGE2_SELECTED_TTS_VOICE = "page2SelectedTtsVoice"
+    PAGE2_IMAGE_POLL_ATTEMPTS = "page2ImagePollAttempts"
     PAGE2_IMAGE_ASPECT_RATIOS = "page2ImageAspectRatios"
     PAGE2_LAST_IMAGE_PROVIDER = "page2LastImageProvider"
     PAGE2_IMAGE25_QUALITY = "page2Image25Quality"
@@ -396,12 +399,19 @@ def user_facing_error_message(exc: Exception) -> str:
             "无法放进请求头。请到“模型”页面查看是否有“字符异常”的项目，"
             "删除后重新填写正确值；如果显示默认 Key 字符异常，请检查 Streamlit Secrets。"
         )
+    if "Read timed out" in message:
+        return (
+            "模型服务器长时间没有响应（读超时）。"
+            "通常是该模型服务端故障或拥堵，请稍后重试，或先切换到其他模型。"
+        )
 
     return message
 
 
-def debug_log(*items):
-    """Opt-in redacted debug output is printed and retained locally for 48 hours."""
+def debug_log(*items, category=None):
+    """Only explicit chat events reach the opt-in terminal and file log."""
+    if category != "chat":
+        return
     settings.load()
     if settings.bool(AppStorageKeys.DEBUG_LOG_ENABLED, False):
         from app import log_store
@@ -409,6 +419,66 @@ def debug_log(*items):
         print(message, flush=True)
         log_store.start_maintenance(DATA_DIR / "logs")
         log_store.write(DATA_DIR / "logs", message=message)
+
+
+chat_request_context: ContextVar[tuple[str, str] | None] = ContextVar(
+    "chat_request_context", default=None,
+)
+
+
+def _write_chat_event(event: dict) -> None:
+    """Opt-in full request logging; credentials are excluded by the caller."""
+    try:
+        settings.load()
+        if not settings.bool(AppStorageKeys.DEBUG_LOG_ENABLED, False):
+            return
+        from app import log_store
+
+        event = {"timestamp": datetime.now().astimezone().isoformat(timespec="seconds"), **event}
+        print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
+        log_store.start_maintenance(DATA_DIR / "logs")
+        log_store.write_event(DATA_DIR / "logs", event)
+    except Exception:
+        # A logging failure must not turn a successful model call into an error.
+        pass
+
+
+def model_request_log(*, request_id: str, label: str, url: str, body: dict, attempt: int) -> None:
+    _write_chat_event({
+        "event": "model_request",
+        "request_id": request_id,
+        "label": label,
+        "attempt": attempt,
+        "url": url,
+        "body": body,
+    })
+
+
+def model_duration_log(*, request_id: str, label: str, model: str, elapsed_seconds: float, status: str) -> None:
+    _write_chat_event({
+        "event": "model_duration",
+        "request_id": request_id,
+        "label": label,
+        "model": model,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "status": status,
+    })
+
+
+def chat_log(role: str, content: str, *, model: str = "", elapsed_seconds=None, label: str = "聊天"):
+    """Legacy text logger; never persist assistant output."""
+    if role == "助手":
+        return
+    from datetime import datetime
+    from app import log_store
+
+    header = f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S}] {label}"
+    if model:
+        header += f" · {model}"
+    if elapsed_seconds is not None:
+        header += f" · {elapsed_seconds:.1f}秒"
+    redacted_content = log_store.redact(str(content))
+    debug_log(f"{header} · {role}：{json.dumps(redacted_content, ensure_ascii=False)}", category="chat")
 
 
 def mask_authorization_header(value):
