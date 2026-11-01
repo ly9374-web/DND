@@ -128,7 +128,9 @@ html, body {{ margin: 0; padding: 0; background: transparent; }}
   padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 8px;
-  background: rgba(31, 41, 55, 0.9);
+  background: linear-gradient(145deg, rgba(255,255,255,.065), transparent), rgba(31,41,55,.28);
+  -webkit-backdrop-filter: blur(16px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(130%);
   color: #e5e7eb;
   cursor: pointer;
 }}

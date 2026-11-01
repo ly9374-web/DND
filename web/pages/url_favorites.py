@@ -127,7 +127,8 @@ def render_url_display_with_copy(url: str, key: str, label: str = "图片 URL（
   </div>
   <button id="{btn_id}" type="button" data-text="{safe_text}"
     style="height:40px;min-width:64px;padding:0 14px;border-radius:8px;cursor:pointer;
-           border:1px solid rgba(255,255,255,0.14);background:rgba(31,41,55,0.9);
+           border:1px solid rgba(255,255,255,0.14);background:linear-gradient(145deg,rgba(255,255,255,.065),transparent),rgba(31,41,55,.28);
+           -webkit-backdrop-filter:blur(16px) saturate(130%);backdrop-filter:blur(16px) saturate(130%);
            color:#e5e7eb;font-size:13px;font-weight:600;flex-shrink:0;">复制</button>
 </div>
 </div>
@@ -186,7 +187,8 @@ def render_header_with_copy(url: str, key: str, label: str = "收藏列表") -> 
   <p style="font-size:14px;font-weight:600;color:#e5e7eb;margin:0;flex:1;min-width:0;">{html.escape(label)}</p>
   <button id="{btn_id}" type="button" data-text="{safe_text}"
     style="height:30px;min-width:60px;padding:0 12px;border-radius:8px;cursor:pointer;
-           border:1px solid rgba(255,255,255,0.14);background:rgba(31,41,55,0.9);
+           border:1px solid rgba(255,255,255,0.14);background:linear-gradient(145deg,rgba(255,255,255,.065),transparent),rgba(31,41,55,.28);
+           -webkit-backdrop-filter:blur(16px) saturate(130%);backdrop-filter:blur(16px) saturate(130%);
            color:#e5e7eb;font-size:13px;font-weight:600;flex-shrink:0;">复制</button>
 </div>
 </div>

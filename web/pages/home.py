@@ -24,55 +24,79 @@ section[data-testid="stMain"] .block-container {
   margin-inline: auto;
 }
 
-/* Push buttons mirrored from the Eassy-podcast 设置/历史记录 buttons. */
-.st-key-home_start .stButton > button,
-.st-key-home_secondary .stButton > button {
-  min-height: 4.6rem;
-  font-size: 1.02rem;
-  font-weight: 560;
-  letter-spacing: 0.02em;
-  border: 1px solid rgba(23, 59, 89, 0.82) !important;
-  border-radius: 14px !important;
-  background: linear-gradient(180deg, #101822, #0a0f16) !important;
-  color: #f5f7fa !important;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.12),
-    0 5px 0 rgb(13, 31, 46),
-    0 14px 26px rgba(0, 0, 0, 0.58) !important;
-  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease !important;
+/* ===== Liquid-glass buttons, mirrored from the sign-in page ===== */
+section[data-testid="stMain"] .st-key-home_start .stButton > button,
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button {
+  min-height: 4.4rem;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  border-radius: 16px !important;
+  color: #f8fafc !important;
+  -webkit-backdrop-filter: blur(1px) !important;
+  backdrop-filter: blur(1px) !important;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease, background 160ms ease !important;
 }
 
-.st-key-home_start .stButton > button:hover,
-.st-key-home_secondary .stButton > button:hover {
-  border-color: #55b8ff !important;
-  color: #f5f7fa !important;
-  transform: translateY(-2px);
+/* Primary pair (开始 / 继续) — same material as the 登录 button. */
+section[data-testid="stMain"] .st-key-home_start .stButton > button {
+  border: 1px solid rgba(191, 219, 254, 0.52) !important;
+  background: linear-gradient(135deg, rgba(39,143,218,.30), rgba(118,87,219,.30)) !important;
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.16),
-    0 6px 0 rgb(32, 68, 94),
-    0 17px 34px rgba(0, 0, 0, 0.58),
-    0 0 24px rgba(85, 184, 255, 0.18) !important;
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 12px 28px rgba(49, 117, 208, 0.24),
+    0 0 24px rgba(118, 87, 219, 0.14) !important;
 }
 
-.st-key-home_start .stButton > button:active,
-.st-key-home_secondary .stButton > button:active {
-  transform: translateY(3px);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    0 2px 0 rgb(12, 29, 44),
-    0 7px 14px rgba(0, 0, 0, 0.58) !important;
+/* Secondary group (prompt / 记录 / APIkey / 生成语音) — same material as the 游客进入 button. */
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button {
+  border: 1px solid rgba(148, 163, 184, 0.24) !important;
+  background: rgba(15, 23, 42, 0.40) !important;
+  color: rgba(226, 232, 240, 0.82) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
 }
 
-.st-key-home_start .stButton > button:focus-visible,
-.st-key-home_secondary .stButton > button:focus-visible {
-  outline: 3px solid rgba(85, 184, 255, 0.18) !important;
+section[data-testid="stMain"] .st-key-home_start .stButton > button:hover,
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button:hover {
+  transform: translateY(-1px) !important;
+}
+
+section[data-testid="stMain"] .st-key-home_start .stButton > button:hover {
+  border-color: rgba(224, 231, 255, 0.82) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 14px 34px rgba(49, 117, 208, 0.30),
+    0 0 30px rgba(139, 92, 246, 0.20) !important;
+}
+
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button:hover {
+  border-color: rgba(148, 197, 255, 0.50) !important;
+  background: rgba(30, 41, 59, 0.58) !important;
+}
+
+section[data-testid="stMain"] .st-key-home_start .stButton > button:active,
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button:active {
+  transform: translateY(1px) !important;
+}
+
+section[data-testid="stMain"] .st-key-home_start .stButton > button:focus-visible,
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button:focus-visible {
+  outline: 3px solid rgba(85, 184, 255, 0.30) !important;
   outline-offset: 3px;
+}
+
+section[data-testid="stMain"] .st-key-home_start .stButton > button:disabled,
+section[data-testid="stMain"] .st-key-home_secondary .stButton > button:disabled {
+  border-color: rgba(148, 163, 184, 0.14) !important;
+  background: rgba(15, 23, 42, 0.24) !important;
+  color: rgba(226, 232, 240, 0.34) !important;
+  box-shadow: none !important;
 }
 
 @media (max-width: 640px) {
   .dnd-home-stage { height: 8vh; }
-  .st-key-home_start .stButton > button,
-  .st-key-home_secondary .stButton > button { min-height: 4rem; }
+  section[data-testid="stMain"] .st-key-home_start .stButton > button,
+  section[data-testid="stMain"] .st-key-home_secondary .stButton > button { min-height: 4rem; }
 }
 </style>
 """

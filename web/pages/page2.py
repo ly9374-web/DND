@@ -684,7 +684,7 @@ def _render_tts_quote_dialog(default_voice: str) -> None:
             st.info("这条回复没有成对双引号中的台词。")
         st.html("""<style>
         div[class*="st-key-page2_tts_select_"] button[kind="primary"] {
-            background-color: #16834a; border-color: #16834a; color: white;
+            background: rgba(22,131,74,.28) !important; border-color: #16834a; color: white;
         }
         </style>""")
         selected = []
@@ -4374,6 +4374,44 @@ section[data-testid="stMain"] .block-container {
   opacity: 1 !important;
   visibility: visible !important;
   pointer-events: auto !important;
+}
+
+/* Chat message actions (编辑消息 / 生成语音): bare white icon, no chrome. */
+section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button,
+section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  color: #ffffff !important;
+}
+
+section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button svg,
+section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button svg {
+  color: #ffffff !important;
+  fill: currentColor !important;
+}
+
+section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:hover,
+section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:hover {
+  background: rgba(255, 255, 255, 0.06) !important;
+  border-color: transparent !important;
+  color: #ffffff !important;
+}
+
+section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:disabled,
+section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:disabled {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  opacity: 1 !important;
+  color: rgba(255, 255, 255, 0.35) !important;
+}
+
+section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:disabled svg,
+section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:disabled svg {
+  color: rgba(255, 255, 255, 0.35) !important;
 }
 </style>
         """,

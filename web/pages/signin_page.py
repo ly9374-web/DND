@@ -189,7 +189,7 @@ section.main > div.block-container > [data-testid="stVerticalBlock"] {
 }
 .st-key-signin_login button {
   border: 1px solid rgba(191, 219, 254, 0.52) !important;
-  background: linear-gradient(135deg, #278fda, #7657db) !important;
+  background: linear-gradient(135deg, rgba(39,143,218,.30), rgba(118,87,219,.30)) !important;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     0 12px 28px rgba(49, 117, 208, 0.24),

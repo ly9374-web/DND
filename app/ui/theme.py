@@ -273,12 +273,23 @@ label, .stTextInput label, .stTextArea label, .stSelectbox label, .stRadio label
   color: var(--nm-text) !important;
 }
 
+/* Glass changes only the button material. Page-owned geometry, colors,
+ * typography, focus indicators and interaction behavior stay unchanged. */
+:where(.stApp button, [data-testid="stDialog"] button) {
+  background: linear-gradient(145deg, rgba(255,255,255,.065), transparent), rgba(31,41,55,.28) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(130%) !important;
+  backdrop-filter: blur(16px) saturate(130%) !important;
+}
+:where(.stApp button:is([kind="primary"], [kind="primaryFormSubmit"]), [data-testid="stDialog"] button:is([kind="primary"], [kind="primaryFormSubmit"])) {
+  background: linear-gradient(145deg, rgba(255,255,255,.08), transparent), rgba(255,75,75,.26) !important;
+}
+
 /* Buttons */
 .stButton > button {
   border-color: var(--nm-border) !important;
 }
 .stButton > button:not([kind="primary"]) {
-  background: var(--nm-surface) !important;
+  background: linear-gradient(145deg, rgba(255,255,255,.065), transparent), rgba(31,41,55,.28) !important;
   color: var(--nm-text) !important;
 }
 
@@ -558,11 +569,11 @@ div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas,
   min-height: var(--page2-chat-btn) !important;
   padding: 0 !important;
   border-radius: 14px !important;
-  background: rgba(55, 65, 81, 0.92) !important;
+  background: rgba(55, 65, 81, 0.28) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
 }
 .st-key-page2_chat_dice_btn button:hover {
-  background: rgba(75, 85, 99, 0.96) !important;
+  background: rgba(75, 85, 99, 0.38) !important;
   border-color: rgba(255, 255, 255, 0.26) !important;
 }
 /* Undo button: visually dock to the left of the submit button */
