@@ -642,7 +642,10 @@ class DeepSeekAPIClient:
 class OpenRouterChatAPIClient:
     CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
     DEFAULT_MODEL = "mistralai/mistral-large-2512"
-    SUPPORTED_MODELS = {DEFAULT_MODEL}
+    SUPPORTED_MODELS = {
+        DEFAULT_MODEL,
+        "google/gemini-3.8-flash",
+    }
 
     @classmethod
     def send_message(
@@ -653,7 +656,15 @@ class OpenRouterChatAPIClient:
         temperature=0.8,
         model=DEFAULT_MODEL,
         max_tokens=20000,
+        thinking_enabled=None,
+        reasoning_effort=None,
     ):
+        """调用 OpenRouter chat/completions。
+
+        thinking_enabled 为 None 时沿用非流式请求（Mistral 等无思考模型）；
+        传入布尔值时走流式请求，并按开关附带 reasoning 参数与 usage 统计，
+        用于 Gemini 这类支持思考的模型。
+        """
         model = str(model or cls.DEFAULT_MODEL).strip()
         if model not in cls.SUPPORTED_MODELS:
             raise ValueError("未知 OpenRouter 聊天模型：" + model)
@@ -676,19 +687,52 @@ class OpenRouterChatAPIClient:
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
         }
+        use_stream = thinking_enabled is not None
         body = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "stream": False,
+            "stream": use_stream,
         }
         if max_tokens is not None:
             body["max_tokens"] = int(max_tokens)
+        if thinking_enabled is not None:
+            # Gemini 3.8 Flash 的 reasoning 为 mandatory，无法真正关闭；
+            # 关思考时降到最低档 low，开思考时使用请求的强度。
+            body["reasoning"] = {
+                "effort": str(reasoning_effort or "high") if thinking_enabled else "low"
+            }
+        if use_stream:
+            body["stream_options"] = {"include_usage": True}
 
         debug_log("====== OpenRouter Chat Request ======")
         debug_log("URL:", cls.CHAT_URL)
         debug_log("Authorization:", mask_authorization_header(headers["Authorization"]))
         debug_log("Body:", json.dumps(body, ensure_ascii=False))
+
+        if use_stream:
+            stream_body = dict(body)
+            try:
+                response = post_with_network_retry(
+                    cls.CHAT_URL,
+                    headers=headers,
+                    json_body=stream_body,
+                    timeout=(15, 600),
+                    label="OpenRouter Chat",
+                    stream=True,
+                )
+                if response.status_code == 200:
+                    content = cls._consume_chat_stream(response, "OpenRouter Chat")
+                    if content:
+                        return content
+                    debug_log("OpenRouter 流式未返回内容，回退非流式。")
+                else:
+                    cls._raise_for_error_response(response)
+            except TRANSIENT_NETWORK_ERRORS as exc:
+                debug_log(f"OpenRouter 流式请求网络失败，回退非流式：{exc}")
+
+            body.pop("stream_options", None)
+            body["stream"] = False
 
         response = post_with_network_retry(
             cls.CHAT_URL,
@@ -717,6 +761,8 @@ class OpenRouterChatAPIClient:
         if int(response.status_code) >= 400:
             raise RuntimeError(f"OpenRouter API HTTP 错误：{response.status_code}")
 
+        cls._log_reasoning_usage(data.get("usage"), "OpenRouter Chat")
+
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise RuntimeError("OpenRouter 响应缺少 choices，没有可用的模型输出。")
@@ -743,3 +789,75 @@ class OpenRouterChatAPIClient:
             "OpenRouter 未返回可用的最终内容"
             f"（finish_reason={finish_reason}）。"
         )
+
+    @classmethod
+    def _consume_chat_stream(cls, response, label):
+        """消费 chat/completions 的 SSE 流并拼接 delta.content。"""
+        text_parts = []
+        usage = None
+        # SSE 流为 UTF-8；响应头未声明 charset 时 requests 默认用
+        # ISO-8859-1 解码会导致中文乱码，这里显式指定。
+        if (response.encoding or "").lower().replace("-", "") != "utf8":
+            response.encoding = "utf-8"
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            error = event.get("error")
+            if isinstance(error, dict) or (isinstance(error, str) and error.strip()):
+                raise RuntimeError("OpenRouter API error: " + str(error))
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            choices = event.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            first = choices[0]
+            if not isinstance(first, dict):
+                continue
+            delta = first.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        piece = block.get("text") or block.get("content")
+                        if isinstance(piece, str):
+                            text_parts.append(piece)
+
+        cls._log_reasoning_usage(usage, label)
+        return "".join(text_parts).strip()
+
+    @staticmethod
+    def _log_reasoning_usage(usage, label):
+        if not isinstance(usage, dict):
+            return
+        details = usage.get("completion_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        if reasoning_tokens is not None:
+            debug_log(
+                f"[{label}] 推理 token：{reasoning_tokens}，"
+                f"总 token：{usage.get('total_tokens')}"
+            )
+
+    @staticmethod
+    def _raise_for_error_response(response):
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"OpenRouter 返回了无法解析的响应（HTTP {response.status_code}）。"
+            ) from exc
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError("OpenRouter API error: " + str(data.get("error")))
+        raise RuntimeError(f"OpenRouter API HTTP 错误：{response.status_code}")

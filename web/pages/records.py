@@ -97,9 +97,9 @@ def render(
 
     has_extra_action = bool(extra_action_label and extra_renderer)
     with actions:
-        action_columns = st.columns([1, 1, 1, 1] if has_extra_action else [1, 1, 1])
+        action_columns = st.columns([1, 1, 1, 1, 1] if has_extra_action else [1, 1, 1, 1])
     with action_columns[0]:
-        if st.button("打开", type="primary", use_container_width=True):
+        if st.button("打开", key="records_open_button", type="primary", use_container_width=True):
             _open_record(open_page, item.id)
     with action_columns[1]:
         if st.button("重命名", use_container_width=True):
@@ -112,6 +112,12 @@ def render(
             else:
                 store.delete_record(item.id, scope=scope)
                 st.rerun()
+    with action_columns[3]:
+        if st.button("批量删除", use_container_width=True, key="records_batch_delete_button"):
+            st.session_state["records_batch_delete"] = {
+                "scope": str(scope or ""),
+                "token": uuid.uuid4().hex,
+            }
 
     def _delete(record_id: str) -> None:
         store.delete_record(record_id, scope=scope)
@@ -119,8 +125,36 @@ def render(
     if confirm_delete:
         render_delete_confirmation("ordinary_chat_record", _delete)
 
+    batch = st.session_state.get("records_batch_delete")
+    if isinstance(batch, dict) and batch.get("scope") == str(scope or ""):
+        token = str(batch.get("token") or "")
+
+        @st.dialog("批量删除聊天记录", dismissible=False)
+        def _batch_delete_dialog():
+            st.caption("勾选要删除的聊天记录，确认后一次删除。删除后无法恢复。")
+            selected = []
+            with st.container(height=360):
+                for record in items:
+                    label = f"{record.title or '未命名聊天'}    {record.updated_at}"
+                    if st.checkbox(label, key=f"records_batch_{token}_{record.id}"):
+                        selected.append(record.id)
+            confirm_col, cancel_col = st.columns(2)
+            if confirm_col.button("确认删除", type="primary", use_container_width=True,
+                                  disabled=not selected, key=f"records_batch_confirm_{token}"):
+                for record_id in selected:
+                    store.delete_record(record_id, scope=scope)
+                if st.session_state.get("records_selected_id") in selected:
+                    st.session_state.pop("records_selected_id", None)
+                st.session_state.pop("records_batch_delete", None)
+                st.rerun()
+            if cancel_col.button("取消", use_container_width=True, key=f"records_batch_cancel_{token}"):
+                st.session_state.pop("records_batch_delete", None)
+                st.rerun()
+
+        _batch_delete_dialog()
+
     if has_extra_action:
-        with action_columns[3]:
+        with action_columns[4]:
             if st.button(extra_action_label, use_container_width=True):
                 st.session_state.records_debug_record_id = item.id
 

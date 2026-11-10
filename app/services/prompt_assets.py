@@ -10,6 +10,7 @@ from app.models import (
     FirstInputRecord,
     FixedTemplateRecord,
     PromptTextRecord,
+    chat_model_supports_reasoning,
     deepseek_api_model_for_chat_model,
     grok_api_model_for_chat_model,
     normalize_chat_model,
@@ -103,6 +104,17 @@ def _load_long_term_memory_spaces() -> tuple[list[PromptTextRecord], list[Prompt
         AppStorageKeys.LONG_TERM_MEMORY_RECORDS,
         AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS,
     )
+    from app.services.story_brain_prompts import remove_obsolete_foreshadow_rule
+    for key, items in ((AppStorageKeys.LONG_TERM_MEMORY_RECORDS, records),
+                       (AppStorageKeys.HIDDEN_LONG_TERM_MEMORY_RECORDS, hidden_records)):
+        changed = False
+        for record in items:
+            cleaned = remove_obsolete_foreshadow_rule(record.content)
+            if cleaned != record.content:
+                record.content = cleaned
+                changed = True
+        if changed:
+            _persist_text_records(key, items)
     if not settings.bool(AppStorageKeys.LONG_TERM_MEMORY_DEFAULT_SEEDED, False):
         default_record = next(
             (
@@ -598,14 +610,20 @@ def _send_generation(
             max_tokens=max_tokens,
         )
     elif (openrouter_model := openrouter_api_model_for_chat_model(selected_model)) is not None:
-        output = OpenRouterChatAPIClient.send_message(
-            system_prompt=system_prompt,
-            context_messages=[],
-            user_message=user_prompt,
-            temperature=0.8,
-            model=openrouter_model,
-            max_tokens=max_tokens,
-        )
+        openrouter_kwargs = {
+            "system_prompt": system_prompt,
+            "context_messages": [],
+            "user_message": user_prompt,
+            "temperature": 0.8,
+            "model": openrouter_model,
+            "max_tokens": max_tokens,
+        }
+        if chat_model_supports_reasoning(selected_model):
+            openrouter_kwargs.update(
+                thinking_enabled=thinking_enabled,
+                reasoning_effort=effective_effort,
+            )
+        output = OpenRouterChatAPIClient.send_message(**openrouter_kwargs)
     else:
         grok_model = grok_api_model_for_chat_model(selected_model) or "grok-4.3"
         if grok_model == "grok-4.6" and not thinking_enabled:

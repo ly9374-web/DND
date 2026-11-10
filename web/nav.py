@@ -31,7 +31,8 @@ def nav_state() -> _NavState:
     )
 
 
-def goto(page: str, push_history: bool = True, **kwargs: Any):
+def navigate(page: str, push_history: bool = True, **kwargs: Any):
+    """Set the destination in a widget callback, before the next script run."""
     nav_init()
     if push_history:
         st.session_state.nav_history.append(
@@ -42,6 +43,10 @@ def goto(page: str, push_history: bool = True, **kwargs: Any):
         )
     st.session_state.nav_page = page
     st.session_state.nav_page_kwargs = kwargs
+
+
+def goto(page: str, push_history: bool = True, **kwargs: Any):
+    navigate(page, push_history=push_history, **kwargs)
     st.rerun()
 
 

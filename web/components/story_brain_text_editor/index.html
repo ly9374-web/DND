@@ -6,15 +6,17 @@
     <title>story_brain_text_editor</title>
     <style>
       :root {
-        color-scheme: light;
+        /* Keep the iframe canvas transparent so the page veil shows through.
+           `dark` makes the canvas opaque (#121212) and hides the mask. */
+        color-scheme: normal;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        --editor-bg: rgba(7, 16, 24, 0.58);
-        --editor-surface: rgba(10, 21, 32, 0.82);
-        --editor-surface-2: rgba(15, 23, 42, 0.92);
-        --editor-border: rgba(96, 165, 250, 0.16);
-        --editor-border-strong: rgba(96, 165, 250, 0.34);
-        --editor-text: #e5e7eb;
-        --editor-text-muted: rgba(229, 231, 235, 0.58);
+        --editor-bg: transparent;
+        --editor-surface: rgba(16, 24, 28, 0.72);
+        --editor-surface-2: rgba(12, 19, 23, 0.82);
+        --editor-border: rgba(196, 212, 189, 0.16);
+        --editor-border-strong: rgba(196, 212, 189, 0.42);
+        --editor-text: #eee5e0;
+        --editor-text-muted: rgba(238, 229, 224, 0.58);
       }
 
       html,
@@ -28,13 +30,11 @@
         box-sizing: border-box;
         width: 100%;
         min-height: 220px;
-        border: 1px solid var(--editor-border);
-        border-radius: 8px;
+        border: 0;
+        border-radius: 0;
         background: var(--editor-bg);
-        box-shadow:
-          inset 0 1px 0 rgba(255, 255, 255, 0.05),
-          0 10px 24px rgba(0, 0, 0, 0.34);
-        overflow: hidden;
+        box-shadow: none;
+        overflow: visible;
       }
 
       .viewer,
@@ -45,12 +45,12 @@
       }
 
       .viewer {
-        padding: 12px 14px;
+        padding: 0;
         white-space: pre-wrap;
         overflow-wrap: anywhere;
-        color: var(--editor-text);
-        font-size: 14px;
-        line-height: 1.55;
+        color: var(--dnd-editor-ink, var(--editor-text));
+        font-size: 16px;
+        line-height: 1.9;
         cursor: text;
       }
 
@@ -66,23 +66,29 @@
         box-sizing: border-box;
         display: block;
         width: 100%;
-        min-height: 780px;
-        padding: 12px 14px;
-        border: 0;
+        min-height: 220px;
+        max-height: 420px;
+        padding: 10px 12px;
+        border: 1px solid var(--editor-border);
+        border-radius: 8px;
         outline: 0;
-        resize: vertical;
+        resize: none;
         color: var(--editor-text);
         background: var(--editor-surface);
-        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font: 15px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      textarea:focus {
+        border-color: var(--editor-border-strong);
       }
 
       .toolbar {
         display: flex;
         justify-content: flex-end;
         gap: 8px;
-        padding: 8px;
-        border-top: 1px solid var(--editor-border);
-        background: var(--editor-surface-2);
+        padding: 10px 0 0;
+        border-top: 0;
+        background: transparent;
       }
 
       button {
@@ -90,7 +96,7 @@
         height: 32px;
         border: 1px solid var(--editor-border);
         border-radius: 6px;
-        background: linear-gradient(145deg, rgba(255,255,255,.065), transparent), rgba(15,23,42,.28);
+        background: rgba(48, 53, 55, 0.4);
         -webkit-backdrop-filter: blur(16px) saturate(130%);
         backdrop-filter: blur(16px) saturate(130%);
         color: var(--editor-text);
@@ -100,17 +106,17 @@
 
       button.primary {
         border-color: var(--editor-border-strong);
-        background: rgba(96, 165, 250, 0.22);
-        color: #ffffff;
+        background: rgba(196, 212, 189, 0.2);
+        color: #eef3e9;
       }
 
       button:hover {
         border-color: var(--editor-border-strong);
-        background: rgba(30, 41, 59, 0.38);
+        background: rgba(196, 212, 189, 0.1);
       }
 
       button.primary:hover {
-        background: rgba(96, 165, 250, 0.32);
+        background: rgba(196, 212, 189, 0.28);
       }
 
       .is-editing .viewer {
@@ -142,6 +148,7 @@
       const cancelButton = document.getElementById("cancel")
       let value = ""
       let disabled = false
+      let lastFrameHeight = 0
 
       function post(type, payload) {
         window.parent.postMessage(
@@ -156,12 +163,15 @@
 
       function setHeight() {
         const height = Math.max(shell.scrollHeight, 240)
+        if (height === lastFrameHeight) return
+        lastFrameHeight = height
         post("streamlit:setFrameHeight", { height })
       }
 
       function renderViewer() {
         const text = String(value || "")
-        viewer.textContent = text || "Story Brain"
+        const nextText = text || "Story Brain"
+        if (viewer.textContent !== nextText) viewer.textContent = nextText
         viewer.classList.toggle("placeholder", !text)
         setHeight()
       }
@@ -189,6 +199,13 @@
           dataType: "json",
         })
       }
+
+      document.addEventListener("wheel", (event) => {
+        if (shell.classList.contains("is-editing")) return
+        try {
+          window.parent.__dndImmersive?.wheelFromBrain(event)
+        } catch (_) {}
+      }, { passive: false })
 
       viewer.addEventListener("dblclick", (event) => {
         event.preventDefault()
@@ -223,6 +240,7 @@
         renderViewer()
       })
 
+      new ResizeObserver(setHeight).observe(shell)
       post("streamlit:componentReady", { apiVersion: 1 })
       renderViewer()
     </script>

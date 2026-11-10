@@ -1,0 +1,167 @@
+{
+  "prototype": "immersive-chat",
+  "version": 3,
+  "exportedAt": "2026-11-02T07:06:14.054Z",
+  "viewport": {
+    "width": 1512,
+    "height": 827
+  },
+  "layout": {
+    "grid": {
+      "expandChat": {
+        "x": -0.91796875,
+        "y": -2.94921875
+      }
+    },
+    "media": {
+      "conversation": {
+        "x": 0,
+        "y": 51.703125,
+        "h": 393.31640625
+      },
+      "composer": {
+        "x": 0,
+        "y": 51.53515625,
+        "h": 49.140625
+      },
+      "editable-1": {
+        "x": 0,
+        "y": 0.125
+      },
+      "expandChat": {
+        "x": -4.375,
+        "y": 16.6328125
+      },
+      "latest": {
+        "x": -12.765625,
+        "y": 14.62890625
+      },
+      "editable-10": {
+        "x": 0,
+        "y": -549.109375
+      },
+      "rightDrawer": {
+        "x": 0,
+        "y": 0.5546875
+      },
+      "brain": {
+        "x": 0,
+        "y": 0
+      }
+    }
+  },
+  "prefs": {
+    "font": 16,
+    "veil": 60,
+    "reserve": 301,
+    "fill": "edge",
+    "text": "complement",
+    "bare": true,
+    "veilHeight": 100
+  },
+  "view": {
+    "kind": "image",
+    "src": "inline-demo",
+    "label": "白天海港 · 明亮背景",
+    "expanded": false,
+    "reveal": 0
+  },
+  "elements": [
+    {
+      "id": "editable-0",
+      "name": "左上导航",
+      "x": 24,
+      "y": 24.25,
+      "width": 255.6640625,
+      "height": 38
+    },
+    {
+      "id": "editable-1",
+      "name": "右上工具",
+      "x": 1176,
+      "y": 23.125,
+      "width": 312,
+      "height": 40.5
+    },
+    {
+      "id": "leftDrawer",
+      "name": "左侧设置抽屉",
+      "x": -307,
+      "y": 80,
+      "width": 301,
+      "height": 723
+    },
+    {
+      "id": "rightDrawer",
+      "name": "右侧创作抽屉",
+      "x": 1518,
+      "y": 80.5546875,
+      "width": 301,
+      "height": 723
+    },
+    {
+      "id": "conversation",
+      "name": "聊天记录区",
+      "x": 14,
+      "y": 370.703125,
+      "width": 1484,
+      "height": 393.3125
+    },
+    {
+      "id": "latest",
+      "name": "回到最新按钮",
+      "x": 1426.234375,
+      "y": 386.33203125,
+      "width": 28,
+      "height": 28
+    },
+    {
+      "id": "expandChat",
+      "name": "展开聊天按钮",
+      "x": 1465.625,
+      "y": 388.3359375,
+      "width": 28,
+      "height": 28
+    },
+    {
+      "id": "composer",
+      "name": "输入框",
+      "x": 14,
+      "y": 771.84765625,
+      "width": 1484,
+      "height": 49.140625
+    },
+    {
+      "id": "undo",
+      "name": "撤回按钮",
+      "x": 1415,
+      "y": 778.41796875,
+      "width": 34,
+      "height": 36
+    },
+    {
+      "id": "dice",
+      "name": "骰子按钮",
+      "x": 1453,
+      "y": 778.41796875,
+      "width": 34,
+      "height": 36
+    },
+    {
+      "id": "editable-10",
+      "name": "输入框下方提示",
+      "x": 14,
+      "y": 220.34375,
+      "width": 1484,
+      "height": 34
+    },
+    {
+      "id": "brain",
+      "name": "Story Brain",
+      "x": 14,
+      "y": 803.453125,
+      "width": 1484,
+      "height": 300
+    }
+  ]
+}

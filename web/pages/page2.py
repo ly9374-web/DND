@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import threading
 import uuid
+from html import escape
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
+from PIL import Image, ImageStat
 
 from app.config import (
     DATA_DIR,
     AppStorageKeys,
     CloudinaryConfig,
     OpenRouterConfig,
+    debug_log,
     get_effective_api_key,
     settings,
     user_facing_error_message,
@@ -40,7 +43,7 @@ from app.models import (
     Page2ConversationTurn,
     chat_model_supports_reasoning,
 )
-from app.services import chat_records, page2_service, quick_inputs, story_brain_history, system_prompts
+from app.services import chat_records, page2_service, quick_inputs, story_brain_history, system_prompts, foreshadowing
 from app.services import media_store, image_references
 from app.services.speech_generation import ACTIVE, SpeechJobs, extract_quoted_lines, owner_key
 from app.services.video_prompts import (
@@ -49,6 +52,7 @@ from app.services.video_prompts import (
 from web.components.video_prompt import render_editor_sizing, render_toast_style
 from web.components.media_button_guard import render_media_button_guard
 from web.components.quick_input import quick_input_script
+from web.components.immersive_workspace import render_workspace, render_workspace_styles
 from web import prompt_draft_guard
 from app.image_models import (
     DEFAULT_IMAGE_PROVIDER,
@@ -61,11 +65,6 @@ from web.nav import get_arg, goto
 from web.pages import url_favorites
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
 
-
-_story_brain_text_editor_component = components.declare_component(
-    "page2_story_brain_text_editor",
-    path=str(Path(__file__).resolve().parents[1] / "components" / "story_brain_text_editor"),
-)
 
 _SINGLE_FLIGHT_OPERATION_KINDS = {
     "chat",
@@ -191,7 +190,8 @@ def _render_video_duration_controls(model):
     if model == WAN_MODEL:
         st.caption(f"720p · 约 {WAN_DURATION_FRAMES[seconds] / WAN_FPS:.2f} 秒 · 无声音")
         return seconds, False
-    generate_audio = st.toggle("生成声音", value=True, key="page2_video_generate_audio")
+    st.session_state.setdefault("page2_video_generate_audio", True)
+    generate_audio = st.toggle("生成声音", key="page2_video_generate_audio")
     if generate_audio != saved_audio.get(model, True):
         saved_audio[model] = generate_audio
         settings.set(AppStorageKeys.PAGE2_VIDEO_AUDIO_BY_MODEL, saved_audio)
@@ -422,6 +422,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_turns", [])
     st.session_state.setdefault("page2_generated_media", [])
     st.session_state.setdefault("page2_selected_media_id", "")
+    st.session_state.setdefault("page2_background_visible", True)
     st.session_state.setdefault("page2_pending_media_record_select", "")
     st.session_state.setdefault("page2_media_selection_nonce", 0)
     st.session_state.setdefault("page2_image_prompt", "")
@@ -432,6 +433,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_video_prompt", "")
     st.session_state.setdefault("page2_video_story_toast", None)
     st.session_state.setdefault("page2_story_brain_archive", {})
+    st.session_state.setdefault("page2_foreshadowing", None)
     st.session_state.setdefault("page2_story_brain_short", "")
     st.session_state.setdefault("page2_story_brain_enabled", True)
     st.session_state.setdefault("page2_story_brain_short_editor_nonce", 0)
@@ -441,6 +443,7 @@ def _ensure_state():
     st.session_state.setdefault("page2_story_brain_last_update_turn_id", "")
     st.session_state.setdefault("page2_auto_image_next_turn", None)
     st.session_state.setdefault("page2_auto_image_anchor_turn_count", None)
+    st.session_state.setdefault("page2_auto_image_first_turn_pending", False)
     st.session_state.setdefault("page2_story_brain_checkpoints", [])
     st.session_state.setdefault("page2_operation_queue", [])
     st.session_state.setdefault("page2_active_operation", None)
@@ -451,8 +454,110 @@ def _ensure_state():
     st.session_state.setdefault("page2_operation_error", "")
     st.session_state.setdefault("page2_operation_outputs", {})
     st.session_state.setdefault("page2_chat_edit_target", None)
+    st.session_state.setdefault("page2_chat_anchor_turn_id", "")
     st.session_state.setdefault("page2_tts_active", None)
     st.session_state.setdefault("page2_tts_dialog_turn_id", "")
+
+
+_VEIL_AUTO_CACHE: dict[str, int] = {}
+
+
+def _selected_background_media():
+    media_id = str(st.session_state.get("page2_selected_media_id") or "")
+    media = next((item for item in st.session_state.get("page2_generated_media", [])
+                  if item.id == media_id), None)
+    return media or _find_video_source(media_id)
+
+
+def _veil_auto_source_key() -> str:
+    url = url_favorites.get_preview_url("page2")
+    if url:
+        return "url:" + url
+    return str(st.session_state.get("page2_selected_media_id") or "")
+
+
+def _image_veil_opacity(record):
+    """按图片下半屏的平均亮度给出蒙版不透明度（0-65），读不到时返回 None。"""
+    cache_key = str(getattr(record, "id", "") or "") + ":" + str(getattr(record, "created_at", "") or "")
+    if cache_key in _VEIL_AUTO_CACHE:
+        return _VEIL_AUTO_CACHE[cache_key]
+    image = None
+    path = media_store.local_path(record)
+    if path:
+        try:
+            image = Image.open(path)
+        except Exception:
+            image = None
+    if image is None and getattr(record, "image_data_base64", None):
+        try:
+            raw = str(record.image_data_base64).split(",", 1)[-1]
+            image = Image.open(io.BytesIO(base64.b64decode(raw)))
+        except Exception:
+            image = None
+    if image is None:
+        return None
+    try:
+        # draft 让 JPEG 在解码阶段就降采样；随后统一缩到 16×16，只读一次像素。
+        image.draft("L", (64, 64))
+        gray = image.convert("L")
+        width, height = gray.size
+        if not width or not height:
+            return None
+        sample = gray.crop((0, height // 2, width, height)).resize((16, 16))
+        luminance = ImageStat.Stat(sample).mean[0] / 255.0
+    except Exception:
+        return None
+    # 斜率 80、封顶 70：同等亮度再高一档，纯黑仍为 0。
+    opacity = min(70, round(80 * max(0.0, min(1.0, (luminance - 0.06) / 0.89))))
+    if len(_VEIL_AUTO_CACHE) >= 16:
+        _VEIL_AUTO_CACHE.clear()
+    _VEIL_AUTO_CACHE[cache_key] = opacity
+    return opacity
+
+
+def _auto_veil_opacity():
+    if not st.session_state.get("page2_veil_auto", True):
+        return None
+    if not st.session_state.get("page2_background_visible", True):
+        return None
+    if url_favorites.get_preview_url("page2"):
+        return None
+    media = _selected_background_media()
+    if media is None:
+        return None
+    kind = getattr(media.media_kind, "value", media.media_kind)
+    if kind != "image":
+        return None
+    return _image_veil_opacity(media)
+
+
+def _sync_auto_veil() -> None:
+    """换背景时自动写入一次蒙版值；之后手动拖动保持到下一张图。"""
+    if not st.session_state.get("page2_veil_auto", True):
+        st.session_state.pop("page2_veil_auto_pending", None)
+        return
+    if not st.session_state.get("page2_background_visible", True):
+        st.session_state.pop("page2_veil_auto_pending", None)
+        return
+    if url_favorites.get_preview_url("page2"):
+        st.session_state.pop("page2_veil_auto_pending", None)
+        return
+    source = _veil_auto_source_key()
+    if st.session_state.get("page2_veil_auto_applied") == source:
+        return
+    st.session_state["page2_veil_auto_applied"] = source
+    opacity = _auto_veil_opacity()
+    if opacity is None:
+        st.session_state.pop("page2_veil_auto_pending", None)
+        return
+    if "page2_veil_opacity" in st.session_state:
+        st.session_state["page2_veil_opacity"] = opacity
+    else:
+        st.session_state["page2_veil_auto_pending"] = opacity
+
+
+def _on_veil_auto_toggle() -> None:
+    st.session_state.pop("page2_veil_auto_applied", None)
 
 
 _CHAT_SPEECH_RETENTION_SECONDS = 48 * 60 * 60
@@ -604,7 +709,6 @@ def _tts_stage_caption(job: dict) -> str:
     return description
 
 
-@st.fragment(run_every=1)
 def _render_turn_tts_status(turn: Page2ConversationTurn) -> None:
     """Render TTS progress and all saved audio for an assistant turn."""
     active_before = st.session_state.get("page2_tts_active") or {}
@@ -660,6 +764,20 @@ def _render_turn_tts_status(turn: Page2ConversationTurn) -> None:
         st.audio(str(path), format="audio/wav")
     if (clips or legacy_filename) and not shown:
         st.caption("语音文件已失效，可重新生成。")
+
+
+@st.fragment(run_every=1)
+def _poll_turn_tts_status(turn: Page2ConversationTurn) -> None:
+    """Only the turn with a running speech job needs a refresh timer."""
+    _render_turn_tts_status(turn)
+
+
+def _render_turn_audio_region(turn: Page2ConversationTurn) -> None:
+    active = st.session_state.get("page2_tts_active") or {}
+    if str(active.get("turn_id", "")) == str(turn.id):
+        _poll_turn_tts_status(turn)
+    else:
+        _render_turn_tts_status(turn)
 
 
 def _close_tts_quote_dialog() -> None:
@@ -955,6 +1073,7 @@ def start_new_conversation(reset_settings: bool = False):
     if reset_settings:
         page2_service.reset_context_settings()
         st.session_state.pop("page2_prompt_record_select", None)
+        st.session_state.pop("page2_veil_opacity", None)
     selected_prompt = system_prompts.refresh_selected_prompt(
         hidden_space=bool(st.session_state.get("hidden_unlocked", False))
     )
@@ -966,8 +1085,10 @@ def start_new_conversation(reset_settings: bool = False):
         else settings.get(AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID, "") or ""
     )
     st.session_state.page2_turns = []
+    st.session_state["page2_chat_anchor_turn_id"] = ""
     st.session_state.page2_generated_media = []
     st.session_state.page2_selected_media_id = ""
+    st.session_state.page2_background_visible = True
     st.session_state.page2_pending_media_record_select = ""
     url_favorites.clear_preview_url("page2")
     st.session_state.page2_image_prompt = ""
@@ -980,6 +1101,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state.pop("page2_video_story_dialog", None)
     st.session_state.pop("page2_pending_video_source", None)
     st.session_state.page2_story_brain_archive = {}
+    st.session_state["page2_foreshadowing"] = None
     st.session_state.page2_story_brain_short = ""
     st.session_state.page2_story_brain_enabled = True
     st.session_state["page2_story_brain_short_update_notice"] = ""
@@ -988,6 +1110,7 @@ def start_new_conversation(reset_settings: bool = False):
     st.session_state["page2_story_brain_last_update_turn_id"] = ""
     st.session_state["page2_auto_image_next_turn"] = None
     st.session_state["page2_auto_image_anchor_turn_count"] = 0
+    st.session_state["page2_auto_image_first_turn_pending"] = False
     st.session_state["page2_story_brain_checkpoints"] = []
     st.session_state["page2_operation_queue"] = []
     st.session_state["page2_active_operation"] = None
@@ -1045,6 +1168,7 @@ def branch_or_start_new_conversation(
     st.session_state.page2_loaded_record_id = branch.id
     st.session_state["page2_operation_scope_id"] = "record:" + str(branch.id)
     st.session_state["page2_media_completions"] = []
+    st.session_state["page2_chat_anchor_turn_id"] = ""
     st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
     st.session_state["page2_operation_notice"] = f"已创建会话分支 {branch.branch_number}。"
     st.session_state["page2_operation_error"] = ""
@@ -1125,10 +1249,13 @@ def _load_record_from_nav_if_needed():
 
     st.session_state.page2_record_id = record.id
     st.session_state.page2_loaded_record_id = record.id
+    st.session_state["page2_media_selection_nonce"] = int(st.session_state.get("page2_media_selection_nonce", 0)) + 1
     st.session_state["page2_operation_scope_id"] = "record:" + str(record.id)
     st.session_state["page2_media_completions"] = []
     st.session_state.pop("page2_video_source", None)
     st.session_state.page2_turns = list(record.turns or [])
+    st.session_state["page2_foreshadowing"] = deepcopy(record.foreshadowing)
+    st.session_state["page2_chat_anchor_turn_id"] = ""
     # Direct/deep-linked record loads should also reveal the newest message.
     st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
     st.session_state.page2_generated_media = list(record.generated_images or [])
@@ -1176,10 +1303,13 @@ def _load_record_from_nav_if_needed():
         list(st.session_state.page2_turns)
     )
     auto_image_ctx = page2_service.load_context_from_settings()
+    auto_image_anchor = getattr(record, "auto_image_anchor_turn_count", None)
+    first_turn_pending = bool(getattr(record, "auto_image_first_turn_pending", False))
     if auto_image_next_turn is None:
         if auto_image_ctx.auto_image_enabled:
-            auto_image_next_turn = completed_auto_image_turns + auto_image_ctx.auto_image_interval
-    auto_image_anchor = getattr(record, "auto_image_anchor_turn_count", None)
+            auto_image_anchor = completed_auto_image_turns
+            auto_image_next_turn = completed_auto_image_turns + 1
+            first_turn_pending = True
     if auto_image_anchor is None:
         auto_image_anchor = (
             min(
@@ -1198,11 +1328,17 @@ def _load_record_from_nav_if_needed():
             auto_image_next_turn = auto_image_anchor + auto_image_ctx.auto_image_interval
     st.session_state["page2_auto_image_next_turn"] = auto_image_next_turn
     st.session_state["page2_auto_image_anchor_turn_count"] = auto_image_anchor
+    st.session_state["page2_auto_image_first_turn_pending"] = first_turn_pending
     _refresh_short_story_brain_editor()
     latest_media_id = _latest_image_media_id(st.session_state.page2_generated_media)
-    st.session_state.page2_selected_media_id = latest_media_id
-    st.session_state.page2_pending_media_record_select = latest_media_id
+    saved_background = getattr(record, "background_media_id", None)
+    selected_background = latest_media_id if saved_background is None else str(saved_background)
+    st.session_state.page2_selected_media_id = selected_background
+    st.session_state.page2_pending_media_record_select = selected_background
+    st.session_state.page2_background_visible = bool(getattr(record, "background_visible", True))
     url_favorites.clear_preview_url("page2")
+    if getattr(record, "background_url", ""):
+        st.session_state["page2_url_preview"] = record.background_url
     st.session_state["page2_story_brain_retry_pending"] = False
     st.session_state["page2_operation_notice"] = ""
     st.session_state["page2_operation_error"] = ""
@@ -1347,7 +1483,7 @@ def _render_editable_chat_message(
             )
             st.markdown(display_text or "")
             if role == "assistant":
-                _render_turn_tts_status(turn)
+                _render_turn_audio_region(turn)
         with edit_col:
             edit_clicked = st.button(
                 "",
@@ -1391,6 +1527,7 @@ def _upsert_record():
         generated_media=st.session_state.page2_generated_media,
         system_prompt=ctx.system_prompt,
         story_brain=st.session_state.get("page2_story_brain_archive", {}),
+        foreshadowing=st.session_state.get("page2_foreshadowing") or {},
         story_brain_short=st.session_state.get("page2_story_brain_short", ""),
         story_brain_next_update_turn=st.session_state.get(
             "page2_story_brain_next_update_turn"
@@ -1403,12 +1540,16 @@ def _upsert_record():
         auto_image_anchor_turn_count=st.session_state.get(
             "page2_auto_image_anchor_turn_count"
         ),
+        auto_image_first_turn_pending=st.session_state.get("page2_auto_image_first_turn_pending", False),
         final_setting_id=str(
             st.session_state.get("page2_final_setting_id", "") or ""
         ),
         story_brain_checkpoints=st.session_state.get("page2_story_brain_checkpoints", []),
         scope=_chat_scope(),
         hidden=bool(st.session_state.get("hidden_unlocked", False)),
+        background_media_id=str(st.session_state.get("page2_selected_media_id") or ""),
+        background_url=url_favorites.get_preview_url("page2"),
+        background_visible=bool(st.session_state.get("page2_background_visible", True)),
     )
 
 
@@ -1492,6 +1633,7 @@ def _undo_last_turn() -> bool:
         st.session_state.get("page2_auto_image_anchor_turn_count"),
     )
     st.session_state.page2_turns = turns[:-1]
+    st.session_state["page2_chat_anchor_turn_id"] = ""
     _set_memory_state(memory, checkpoints)
     try:
         _rewind_auto_image_schedule(turns, turns[:-1])
@@ -1526,17 +1668,34 @@ def _save_short_story_brain_to_current_record(story_brain: str, *, checkpoint: b
 
 
 def _render_short_story_brain_text_editor(value: str, *, disabled: bool = False) -> str:
-    result = _story_brain_text_editor_component(
-        value=str(value or ""),
-        disabled=disabled,
-        key=(
-            "page2_story_brain_text_editor_component_"
-            + str(int(st.session_state.get("page2_story_brain_short_editor_nonce", 0) or 0))
-        ),
-        default=None,
-    )
-    if not disabled and isinstance(result, str):
-        return result
+    if not _workspace_section_mounted("brain_editor"):
+        editable = "false" if disabled else "true"
+        st.html(f'<div class="dnd-brain-viewer" data-editable="{editable}" '
+                f'role="button" tabindex="0" title="双击编辑 Story Brain">'
+                f'{escape(str(value or "Story Brain"))}</div>')
+        return str(value or "")
+    key = "page2_brain_editor_" + str(st.session_state.get("page2_story_brain_short_editor_nonce", 0))
+    with st.container(key="page2_brain_editor"):
+        prompt_draft_guard.protect(key, value, "Story Brain")
+        st.session_state.setdefault(key, str(value or ""))
+        edited = st.text_area(
+            "编辑 Story Brain", key=key, height=220, disabled=disabled,
+            label_visibility="collapsed",
+        )
+        prompt_draft_guard.save_action("page2_brain_save", key)
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            save = st.button("保存", key="page2_brain_save", disabled=disabled)
+        with cancel_col:
+            cancel = st.button("取消", key="page2_brain_cancel")
+    if save:
+        # Acknowledge the draft only after persistence has succeeded.
+        _save_short_story_brain_to_current_record(edited)
+        prompt_draft_guard.saved(key)
+    if save or cancel:
+        _workspace_sections().discard("brain_editor")
+        _refresh_short_story_brain_editor()
+        st.rerun()
     return str(value or "")
 
 
@@ -1592,6 +1751,10 @@ def _story_brain_turns_since_last_update(
                 return completed_turns[index + 1 :]
 
     fallback_count = max(1, int(legacy_fallback_turns))
+    # Hidden events must survive a delayed or failed first memory update.
+    first_event = next((i for i, t in enumerate(completed_turns) if t.special_events), len(completed_turns))
+    if first_event < max(0, len(completed_turns) - fallback_count):
+        return completed_turns[first_event:]
     return completed_turns[-fallback_count:]
 
 
@@ -1763,9 +1926,53 @@ def _apply_sidebar_context_values(
     return current != previous
 
 
+def _workspace_sections() -> set:
+    scope = _operation_scope_id()
+    if st.session_state.get("page2_workspace_mount_scope") != scope:
+        st.session_state["page2_workspace_mount_scope"] = scope
+        st.session_state["page2_workspace_sections"] = set()
+    return st.session_state["page2_workspace_sections"]
+
+
+def _workspace_section_mounted(section: str) -> bool:
+    if section != "brain_editor" and not st.session_state.get("page2_workspace_lazy", False):
+        return True
+    return section in _workspace_sections()
+
+
+def _mount_workspace_section(section: str) -> None:
+    _workspace_sections().add(section)
+
+
+def _history_window() -> tuple[int, list]:
+    """Show six recent turns, preserving the older range after it is expanded."""
+    turns = st.session_state.page2_turns
+    scope = _operation_scope_id()
+    window = st.session_state.get("page2_history_window") or {}
+    expanded = window.get("scope") == scope and window.get("expanded", False)
+    first_id = window.get("first_id") if expanded else None
+    start = next((i for i, turn in enumerate(turns) if str(turn.id) == first_id), max(0, len(turns) - 6))
+    st.session_state["page2_history_window"] = {"scope": scope, "first_id": str(turns[start].id) if turns else "", "expanded": expanded}
+    return start, turns[start:]
+
+
+def _load_earlier_chat_turns() -> None:
+    start, _ = _history_window()
+    turns = st.session_state.page2_turns
+    st.session_state["page2_chat_anchor_turn_id"] = ""
+    if turns:
+        st.session_state["page2_history_window"]["first_id"] = str(turns[max(0, start - 6)].id)
+        st.session_state["page2_history_window"]["expanded"] = True
+
+
 def render_sidebar_context():
     _ensure_state()
     _load_record_from_nav_if_needed()
+    _sync_auto_veil()
+    if not _workspace_section_mounted("settings"):
+        with st.sidebar:
+            st.caption("正在打开游戏设置…")
+        return
 
     with st.sidebar:
         if st.button(
@@ -1787,7 +1994,6 @@ def render_sidebar_context():
             else:
                 st.info(f"队列等待启动：{waiting} 项")
 
-        st.subheader("上下文设置")
         ctx = page2_service.load_context_from_settings()
         previous_auto_image = (ctx.auto_image_enabled, ctx.auto_image_interval)
 
@@ -1885,7 +2091,7 @@ def render_sidebar_context():
                 disabled=not chat_reasoning_supported,
             )
             if not chat_reasoning_supported:
-                st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
+                st.caption("当前模型不提供可配置思考模式。")
             story_brain_update_models = list(page2_service.STORY_BRAIN_UPDATE_MODELS)
             if (
                 st.session_state.get("page2_sidebar_story_brain_update_model")
@@ -1923,7 +2129,7 @@ def render_sidebar_context():
                 disabled=not story_brain_reasoning_supported,
             )
             if not story_brain_reasoning_supported:
-                st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
+                st.caption("当前模型不提供可配置思考模式。")
             story_brain_turns = st.number_input(
                 "Story Brain 更新间隔",
                 min_value=1,
@@ -2043,7 +2249,18 @@ def render_sidebar_context():
                 step=1,
                 key="page2_sidebar_auto_image_interval",
             )
-            st.caption("只统计保留的用户完整问答；撤回的轮次和自动掷骰不计入。失败后下一轮重试。你主动生图后，自动生图重新计时。")
+            st.caption("每次开启后，首轮完整问答即生成一张图片，之后按所选间隔生成。只统计保留的用户完整问答；撤回的轮次和自动掷骰不计入。失败后下一轮重试。你主动生图后，自动生图重新计时。")
+
+        with st.container(key="page2_veil_row"):
+            pending_veil = st.session_state.pop("page2_veil_auto_pending", None)
+            if "page2_veil_opacity" in st.session_state:
+                st.slider("蒙版不透明度", 0, 98, key="page2_veil_opacity")
+            else:
+                st.slider("蒙版不透明度", 0, 98,
+                          value=pending_veil if pending_veil is not None else 30,
+                          key="page2_veil_opacity")
+            st.toggle("自动", value=True, key="page2_veil_auto",
+                      label_visibility="collapsed", on_change=_on_veil_auto_toggle)
 
         context_changed = _apply_sidebar_context_values(
             ctx,
@@ -2062,14 +2279,7 @@ def render_sidebar_context():
             auto_image_interval=auto_image_interval,
         )
         if previous_auto_image != (ctx.auto_image_enabled, ctx.auto_image_interval):
-            st.session_state["page2_auto_image_anchor_turn_count"] = (
-                _completed_auto_image_turn_count(list(st.session_state.page2_turns))
-                if ctx.auto_image_enabled else None
-            )
-            st.session_state["page2_auto_image_next_turn"] = (
-                st.session_state["page2_auto_image_anchor_turn_count"] + ctx.auto_image_interval
-                if ctx.auto_image_enabled else None
-            )
+            _update_auto_image_schedule(ctx=ctx, previous=previous_auto_image)
         if context_changed:
             try:
                 page2_service.save_context_to_settings(ctx)
@@ -2206,6 +2416,34 @@ def _queue_resend(*, ctx, story_brain_enabled: bool) -> bool:
     return True
 
 
+def _events_for_turn(turns):
+    config = st.session_state.get("page2_foreshadowing")
+    if config is None and "page2_foreshadowing" in st.session_state:
+        # Copy once at game start. Existing records without the feature stay unchanged.
+        config = {}
+        if not turns:
+            state = system_prompts.load_state(
+                hidden_space=bool(st.session_state.get("hidden_unlocked", False))
+            )
+            record = system_prompts.get_record(state, str(st.session_state.get("page2_final_setting_id", "") or ""))
+            if record:
+                config = foreshadowing.snapshot(record.foreshadowing)
+        st.session_state["page2_foreshadowing"] = config
+    events = foreshadowing.due_events(config or {}, turns)
+    if events:
+        debug_log(
+            "【事件触发】\n" + "\n".join(
+                "- " + "：".join(filter(None, [
+                    str(event.get("title") or event.get("location") or ""),
+                    str(event.get("event_content") or ""),
+                ]))
+                for event in events
+            ),
+            category="chat",
+        )
+    return events
+
+
 def _prepare_resend_operation(task: _Page2OperationTask):
     turns = deepcopy(list(st.session_state.page2_turns))
     target_turn_id = str(task.payload.get("target_turn_id", "") or "")
@@ -2219,6 +2457,7 @@ def _prepare_resend_operation(task: _Page2OperationTask):
     memory, checkpoints, notice = _memory_rewind_plan(remaining)
     replacement = Page2ConversationTurn(
         user_message=original.user_message,
+        special_events=[] if original.is_auto_dice_followup else _events_for_turn(remaining),
         is_user_message_hidden=original.is_user_message_hidden,
         is_auto_dice_followup=original.is_auto_dice_followup,
     )
@@ -2236,7 +2475,7 @@ def _prepare_resend_operation(task: _Page2OperationTask):
         st.session_state["page2_operation_notice"] = notice
     # Staging only: no live turn, memory or persisted record changes until success.
     return lambda: page2_service.send_message(
-        ctx=ctx, turns=remaining, user_message=original.user_message,
+        ctx=ctx, turns=remaining, user_message=foreshadowing.turn_user_message(replacement),
         story_brain_short=memory["short"], story_brain_enabled=task.meta["story_brain_enabled"],
     )
 
@@ -2293,12 +2532,15 @@ def _prepare_chat_operation(task: _Page2OperationTask):
 
     new_turn = Page2ConversationTurn(
         user_message=current_text,
+        special_events=[] if task.payload.get("is_auto_dice_followup", False) else _events_for_turn(turns),
         assistant_message=None,
         is_loading=True,
         is_user_message_hidden=bool(task.payload.get("hide_user_message", False)),
         is_auto_dice_followup=bool(task.payload.get("is_auto_dice_followup", False)),
     )
     st.session_state.page2_turns = turns + [new_turn]
+    # Pin this exchange to the top of the reading surface once it renders.
+    st.session_state["page2_chat_anchor_turn_id"] = new_turn.id
     _upsert_record()
     task.meta.update(
         {
@@ -2315,7 +2557,7 @@ def _prepare_chat_operation(task: _Page2OperationTask):
     return lambda: page2_service.send_message(
         ctx=ctx,
         turns=turns,
-        user_message=new_turn.user_message,
+        user_message=foreshadowing.turn_user_message(new_turn),
         story_brain_short=story_brain_short,
         story_brain_enabled=story_brain_enabled,
     )
@@ -2568,6 +2810,8 @@ def _apply_chat_operation(task: _Page2OperationTask) -> None:
         raise RuntimeError("消息任务完成后未找到待写回的对话记录。")
     target_turn.assistant_message = reply
     target_turn.is_loading = False
+    if task.error is not None or not reply.strip():
+        target_turn.special_events = []
     _upsert_record()
 
     _schedule_chat_followups(task, reply)
@@ -2621,7 +2865,6 @@ def _schedule_chat_followups(task: _Page2OperationTask, reply: str) -> None:
         _schedule_auto_image(
             ctx=page2_service.load_context_from_settings(), source_turn_id=turn_id,
         )
-    st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
 
 
 def _apply_operation(task: _Page2OperationTask) -> None:
@@ -2681,10 +2924,19 @@ def _apply_operation(task: _Page2OperationTask) -> None:
             record.video_prompt = str(task.payload.get("pending_video_prompt") or "")
         previous_media = list(st.session_state.page2_generated_media)
         st.session_state.page2_generated_media = previous_media + [record]
+        selection_keys = ("page2_selected_media_id", "page2_pending_media_record_select",
+                          "page2_background_visible", "page2_media_selection_nonce", "page2_url_preview")
+        previous_selection = {key: st.session_state.get(key) for key in selection_keys}
         try:
+            _select_media_preview(record.id)
             _upsert_record()
         except Exception:
             st.session_state.page2_generated_media = previous_media
+            for key, value in previous_selection.items():
+                if value is None:
+                    st.session_state.pop(key, None)
+                else:
+                    st.session_state[key] = value
             raise
         outputs = dict(st.session_state.get("page2_operation_outputs") or {})
         outputs[task.id] = record.id
@@ -2699,12 +2951,7 @@ def _apply_operation(task: _Page2OperationTask) -> None:
                 _consume_workflow_references(task)
             if not _manual_reference_ids():
                 st.session_state["page2_pending_video_source"] = record.id
-            # The queue status fragment reruns the page after applying this task.
-            # Select the new image now so that rerun shows it without a View click.
-            _select_media_preview(record.id)
-        else:
-            # 视频完成后也直接切换预览，保留当前视频输入图片的选择。
-            _select_media_preview(record.id)
+            # The selected background was persisted with this media result above.
         # 图片和视频原来的完成提示写入方式留作恢复参考：
         # st.session_state["page2_media_completions"] = list(
         #     st.session_state.get("page2_media_completions") or []
@@ -2762,6 +3009,7 @@ def _advance_operation_queues() -> bool:
             if task.error is not None:
                 raise task.error
             if task.payload.get("auto_image") and task.kind == "image":
+                st.session_state["page2_auto_image_first_turn_pending"] = False
                 st.session_state["page2_auto_image_anchor_turn_count"] = int(
                     task.payload["auto_image_turn_count"]
                 )
@@ -2872,6 +3120,12 @@ def _render_media_operation_status() -> None:
         )
 
 
+def _render_media_status_if_needed() -> None:
+    """Only mount the 1s fragment while there is something to poll."""
+    if _active_operations() or st.session_state.get("page2_operation_error"):
+        _render_media_operation_status()
+
+
 @st.fragment(run_every=1)
 def _render_operation_queue_status() -> None:
     if (_advance_operation_queues()
@@ -2925,27 +3179,36 @@ def _render_chat_column():
             border=False,
         )
         with history:
-            for turn in turns:
-                if turn.user_message and not bool(
-                    getattr(turn, "is_user_message_hidden", False)
-                ):
-                    _render_editable_chat_message(
-                        turn=turn,
-                        role="user",
-                        text=turn.user_message,
-                        story_brain_update_busy=story_brain_update_busy,
-                        tts_voice=tts_voice,
-                        has_dashscope_key=has_dashscope_key,
-                    )
-                if turn.assistant_message is not None:
-                    _render_editable_chat_message(
-                        turn=turn,
-                        role="assistant",
-                        text=turn.assistant_message or "",
-                        story_brain_update_busy=story_brain_update_busy,
-                        tts_voice=tts_voice,
-                        has_dashscope_key=has_dashscope_key,
-                    )
+            _, visible_turns = _history_window()
+            for turn in visible_turns:
+                with st.container(key="page2_chat_turn_" + str(turn.id)):
+                    if turn.user_message and not bool(
+                        getattr(turn, "is_user_message_hidden", False)
+                    ):
+                        _render_editable_chat_message(
+                            turn=turn,
+                            role="user",
+                            text=turn.user_message,
+                            story_brain_update_busy=story_brain_update_busy,
+                            tts_voice=tts_voice,
+                            has_dashscope_key=has_dashscope_key,
+                        )
+                    if turn.assistant_message is not None:
+                        _render_editable_chat_message(
+                            turn=turn,
+                            role="assistant",
+                            text=turn.assistant_message or "",
+                            story_brain_update_busy=story_brain_update_busy,
+                            tts_voice=tts_voice,
+                            has_dashscope_key=has_dashscope_key,
+                        )
+            active_tts = st.session_state.get("page2_tts_active") or {}
+            active_turn_id = str(active_tts.get("turn_id", ""))
+            if active_turn_id and not any(str(turn.id) == active_turn_id for turn in visible_turns):
+                active_turn = next((turn for turn in turns if str(turn.id) == active_turn_id), None)
+                if active_turn is not None:
+                    with st.container(key="page2_hidden_tts_status"):
+                        _poll_turn_tts_status(active_turn)
             if scroll_to_bottom_request:
                 with st.container(key="page2_chat_scroll_trigger"):
                     st.iframe(
@@ -2994,49 +3257,51 @@ def _render_chat_column():
                 disabled=chat_edit_active,
             )
 
+            undo_clicked = st.button(
+                "",
+                key="page2_chat_undo_btn",
+                help=None,
+                icon=":material/undo:",
+                type="tertiary",
+                disabled=story_brain_update_busy or chat_edit_active or not bool(turns),
+                use_container_width=True,
+            )
+
     if dice_clicked:
         user_text = _roll_user_dice_message()
 
-    undo_clicked = st.button(
-        "",
-        key="page2_chat_undo_btn",
-        help=None,
-        icon=":material/undo:",
-        type="tertiary",
-        disabled=story_brain_update_busy or chat_edit_active or not bool(turns),
-        use_container_width=True,
-    )
+    with st.container(key="page2_story_brain_panel"):
+        with st.container(key="page2_brain_scroll"):
+            story_brain_enabled = bool(st.session_state.get("page2_story_brain_enabled", True))
+            story_brain_clicked = st.button(
+                "点击关闭story brain" if story_brain_enabled else "点击开启story brain",
+                key="page2_story_brain_btn",
+                use_container_width=True,
+                disabled=story_brain_update_busy or chat_edit_active,
+            )
+            if story_brain_clicked:
+                story_brain_enabled = not story_brain_enabled
+                st.session_state["page2_story_brain_enabled"] = story_brain_enabled
 
-    story_brain_enabled = bool(st.session_state.get("page2_story_brain_enabled", True))
-    story_brain_clicked = st.button(
-        "点击关闭story brain" if story_brain_enabled else "点击开启story brain",
-        key="page2_story_brain_btn",
-        use_container_width=True,
-        disabled=story_brain_update_busy or chat_edit_active,
-    )
-    if story_brain_clicked:
-        story_brain_enabled = not story_brain_enabled
-        st.session_state["page2_story_brain_enabled"] = story_brain_enabled
-
-    if story_brain_enabled:
-        st.subheader("Story Brain")
-        if story_brain_update_busy:
-            st.caption("队列执行中，Story Brain 可查看，暂时不能编辑。")
-        else:
-            notice = str(st.session_state.pop("page2_story_brain_short_update_notice", "") or "").strip()
-            if notice:
-                if notice.startswith("Story Brain 更新失败"):
-                    st.error(notice)
+            if story_brain_enabled:
+                st.subheader("Story Brain")
+                if story_brain_update_busy:
+                    st.caption("队列执行中，Story Brain 可查看，暂时不能编辑。")
                 else:
-                    st.success(notice)
-        story_brain_short = _current_short_story_brain()
-        next_story_brain_short = _render_short_story_brain_text_editor(
-            story_brain_short, disabled=story_brain_update_busy
-        )
-        if not story_brain_update_busy and next_story_brain_short != story_brain_short:
-            _save_short_story_brain_to_current_record(next_story_brain_short)
-            _refresh_short_story_brain_editor()
-            st.rerun()
+                    notice = str(st.session_state.pop("page2_story_brain_short_update_notice", "") or "").strip()
+                    if notice:
+                        if notice.startswith("Story Brain 更新失败"):
+                            st.error(notice)
+                        else:
+                            st.success(notice)
+                story_brain_short = _current_short_story_brain()
+                next_story_brain_short = _render_short_story_brain_text_editor(
+                    story_brain_short, disabled=story_brain_update_busy
+                )
+                if not story_brain_update_busy and next_story_brain_short != story_brain_short:
+                    _save_short_story_brain_to_current_record(next_story_brain_short)
+                    _refresh_short_story_brain_editor()
+                    st.rerun()
 
     if undo_clicked and turns:
         _undo_last_turn()
@@ -3062,14 +3327,6 @@ def _render_chat_column():
         hide_user_message=hide_user_message,
         story_brain_enabled=story_brain_enabled,
     )
-
-
-def _render_url_preview_image(url: str) -> None:
-    """显示「URL 收藏」里点「显示图片」选中的图片。"""
-    try:
-        st.image(url)
-    except Exception:
-        st.error("无法显示该 URL 的图片。")
 
 
 def _save_image_prompt_field(widget_key: str, state_key: str) -> None:
@@ -3349,14 +3606,36 @@ def _current_auto_image_options() -> dict:
     }
 
 
+def _update_auto_image_schedule(*, ctx, previous: tuple[bool, int]) -> None:
+    """Opening the toggle schedules the next complete user turn, regardless of interval."""
+    if not ctx.auto_image_enabled:
+        st.session_state["page2_auto_image_anchor_turn_count"] = None
+        st.session_state["page2_auto_image_next_turn"] = None
+        st.session_state["page2_auto_image_first_turn_pending"] = False
+        return
+    completed = _completed_auto_image_turn_count(list(st.session_state.page2_turns))
+    # Moving the slider before the first reply must not postpone that first image.
+    first_turn_pending = not previous[0] or bool(
+        st.session_state.get("page2_auto_image_first_turn_pending", False)
+    )
+    st.session_state["page2_auto_image_first_turn_pending"] = first_turn_pending
+    delay = 1 if first_turn_pending else ctx.auto_image_interval
+    st.session_state["page2_auto_image_anchor_turn_count"] = completed
+    st.session_state["page2_auto_image_next_turn"] = completed + delay
+
+
 def _schedule_auto_image(*, ctx, source_turn_id: str) -> None:
     if not ctx.auto_image_enabled or not source_turn_id:
         return
     completed = _completed_auto_image_turn_count(list(st.session_state.page2_turns))
     next_turn = st.session_state.get("page2_auto_image_next_turn")
     if next_turn is None:
-        st.session_state["page2_auto_image_anchor_turn_count"] = 0
-        next_turn = ctx.auto_image_interval
+        # A new conversation may inherit an already enabled setting. This hook
+        # runs after the first reply, so that completed turn is already due.
+        st.session_state["page2_auto_image_anchor_turn_count"] = max(0, completed - 1)
+        next_turn = max(1, completed)
+        st.session_state["page2_auto_image_next_turn"] = next_turn
+        st.session_state["page2_auto_image_first_turn_pending"] = True
     elif st.session_state.get("page2_auto_image_anchor_turn_count") is None:
         st.session_state["page2_auto_image_anchor_turn_count"] = max(
             0, int(next_turn) - ctx.auto_image_interval
@@ -3412,13 +3691,16 @@ def _restart_auto_image_countdown() -> None:
     ctx = page2_service.load_context_from_settings()
     if not ctx.auto_image_enabled:
         return
+    first_turn_pending = st.session_state.get("page2_auto_image_first_turn_pending", False)
+    st.session_state["page2_auto_image_first_turn_pending"] = False
     completed = _completed_auto_image_turn_count(list(st.session_state.page2_turns))
     target = completed + int(ctx.auto_image_interval)
     current = st.session_state.get("page2_auto_image_next_turn")
-    if current is not None and int(current) >= target:
+    if current is not None and int(current) >= target and not first_turn_pending:
         return
-    st.session_state["page2_auto_image_anchor_turn_count"] = completed
-    st.session_state["page2_auto_image_next_turn"] = target
+    if current is None or int(current) < target:
+        st.session_state["page2_auto_image_anchor_turn_count"] = completed
+        st.session_state["page2_auto_image_next_turn"] = target
     try:
         _upsert_record()
     except Exception:
@@ -3637,14 +3919,22 @@ def _media_selectbox_key() -> str:
 
 def _activate_media_selection(selectbox_key: str = "page2_media_record_select") -> None:
     if selectbox_key != _media_selectbox_key():
-        return  # Ignore delayed events from the selector replaced by View.
-    url_favorites.activate_generated_media_selection(
-        "page2", "page2_selected_media_id", selectbox_key,
-    )
-    source_id = st.session_state.get(selectbox_key, "")
+        return
+    source_id = str(st.session_state.get(selectbox_key) or "")
+    if source_id:
+        url_favorites.activate_generated_media_selection("page2", "page2_selected_media_id", selectbox_key)
+    st.session_state.page2_selected_media_id = source_id
+    st.session_state.page2_background_visible = bool(source_id)
+    url_favorites.clear_preview_url("page2")
     if not _one_click_video_busy() and _find_video_source(source_id) is not None:
-        # 仅设为视频输入源，不自动带入生图参考图；参考图只能由用户在参考图片区主动选择。
         st.session_state["page2_pending_video_source"] = source_id
+    if "page2_record_id" in st.session_state:
+        _upsert_record()
+
+
+def _background_visibility_changed(widget_key: str) -> None:
+    st.session_state.page2_background_visible = bool(st.session_state.get(widget_key))
+    _upsert_record()
 
 
 def _dismiss_media_completion(task_id: str) -> None:
@@ -3658,6 +3948,7 @@ def _select_media_preview(media_id: str) -> bool:
     if (_find_video_source(media_id) is not None or
             any(item.id == media_id and media_store.available(item) for item in st.session_state.page2_generated_media)):
         st.session_state.page2_selected_media_id = media_id
+        st.session_state.page2_background_visible = True
         st.session_state.page2_pending_media_record_select = media_id
         # A fresh widget identity prevents an in-flight old selection event
         # from undoing a preview change during a fragment rerun.
@@ -4017,126 +4308,6 @@ def _render_media_column_contents():
     # _render_media_completions()
     url_preview = url_favorites.get_preview_url("page2")
 
-    if not media:
-        st.session_state.page2_selected_media_id = None
-        st.session_state[_media_selectbox_key()] = None
-        if url_preview:
-            with st.container(key="page2_media_preview"):
-                _render_url_preview_image(url_preview)
-        else:
-            st.caption("暂无媒体记录。")
-        _render_media_operation_status()
-    else:
-        media_ids = []
-        labels_by_id = {}
-        for item in media:
-            kind = item.media_kind.value if hasattr(item.media_kind, "value") else str(item.media_kind)
-            label = f"{kind.upper()} • {item.provider} • {str(item.created_at or '')}"
-            media_ids.append(item.id)
-            labels_by_id[item.id] = label
-
-        preview_container = st.container(key="page2_media_preview")
-        # 任务状态与错误提示紧跟图片预览下方、prompt 区块上方。
-        _render_media_operation_status()
-        prompt_container = st.container()
-
-        selected_media_id = str(st.session_state.get("page2_selected_media_id", "") or "")
-        desired_media_id = (
-            selected_media_id
-            if selected_media_id in media_ids
-            else None
-        )
-
-        media_selectbox_key = _media_selectbox_key()
-        pending_media_id = str(
-            st.session_state.pop("page2_pending_media_record_select", "") or ""
-        )
-        current_media_id = st.session_state.get(media_selectbox_key)
-        if pending_media_id in media_ids:
-            st.session_state[media_selectbox_key] = pending_media_id
-        elif current_media_id not in media_ids:
-            st.session_state[media_selectbox_key] = desired_media_id
-
-        selected_id = st.selectbox(
-            "选择记录",
-            options=media_ids,
-            index=None,
-            placeholder="选择素材；新图片和视频生成后会自动显示",
-            key=media_selectbox_key,
-            format_func=lambda media_id: labels_by_id.get(media_id, media_id),
-            on_change=_activate_media_selection,
-            args=(media_selectbox_key,),
-            label_visibility="collapsed",
-        )
-        st.session_state.page2_selected_media_id = selected_id
-        url_preview = url_favorites.get_preview_url("page2")
-
-        selected = None
-        for item in media:
-            if item.id == selected_id:
-                selected = item
-                break
-
-        if url_preview:
-            with preview_container:
-                _render_url_preview_image(url_preview)
-        elif selected is not None:
-            kind = selected.media_kind.value if hasattr(selected.media_kind, "value") else str(selected.media_kind)
-            with preview_container:
-                if kind == GeneratedMediaKind.IMAGE.value:
-                    if media_store.local_path(selected):
-                        st.image(media_store.read_bytes(selected))
-                    elif selected.image_data_base64:
-                        st.image(_decode_image_base64(selected.image_data_base64))
-                    elif selected.image_url_string:
-                        st.image(selected.image_url_string)
-                else:
-                    url = selected.video_url_string or ""
-                    if url:
-                        _render_video_preview(selected)
-                    else:
-                        st.warning("该视频记录没有 URL。")
-
-        if not url_preview and selected is not None:
-            kind = selected.media_kind.value if hasattr(selected.media_kind, "value") else str(selected.media_kind)
-            with prompt_container:
-                if kind == GeneratedMediaKind.VIDEO.value:
-                    model = selected.video_generation_provider or selected.provider
-                    label = VIDEO_MODELS[model].label if model in VIDEO_MODELS else model
-                    duration = selected.duration_seconds
-                    suffix = f" · {duration:g} 秒" if isinstance(duration, (int, float)) else ""
-                    st.caption(f"视频 · {label}{suffix}")
-                st.caption("prompt")
-                st.code(
-                    str(selected.prompt or ""),
-                    language=None,
-                    wrap_lines=True,
-                    height=120,
-                )
-
-            if kind == GeneratedMediaKind.IMAGE.value:
-                url = selected.image_url_string or ""
-                if url:
-                    url_favorites.render_url_display_with_copy(
-                        url,
-                        key=f"page2_media_url_copy_{selected.id}",
-                        label="图片 URL（可复制）",
-                    )
-            else:
-                url = selected.video_url_string or ""
-                if url:
-                    url_favorites.render_url_display_with_copy(
-                        url,
-                        key=f"page2_media_url_copy_{selected.id}",
-                        label="视频 URL（可复制）",
-                    )
-
-            _render_media_actions(selected, labels_by_id.get(selected_id, "当前媒体记录"))
-
-            render_delete_confirmation("page2_generated_media", _delete_media_record,
-                                       warning="这会删除对应的本地图片或视频，包括已永久保存的文件。删除后无法恢复。")
-
-    st.divider()
     st.subheader("生成图片")
 
     image_prompt_conversation = page2_service.build_recent_image_prompt_conversation(
@@ -4267,186 +4438,156 @@ def _render_media_column_contents():
         "quality": quality,
     })
 
+    st.subheader("背景展示")
+    if not media:
+        st.session_state.page2_selected_media_id = None
+        st.session_state[_media_selectbox_key()] = None
+        if url_preview:
+            st.caption("URL 预览将作为背景展示。")
+        else:
+            st.caption("暂无媒体记录。")
+        _render_media_status_if_needed()
+    else:
+        media_ids = [""]
+        labels_by_id = {"": "无图片／正常背景"}
+        for item in media:
+            kind = item.media_kind.value if hasattr(item.media_kind, "value") else str(item.media_kind)
+            label = f"{kind.upper()} • {item.provider} • {str(item.created_at or '')}"
+            media_ids.append(item.id)
+            labels_by_id[item.id] = label
+
+        # 任务状态与错误提示紧跟媒体选择下方、prompt 区块上方。
+        _render_media_status_if_needed()
+        prompt_container = st.container()
+
+        selected_media_id = str(st.session_state.get("page2_selected_media_id", "") or "")
+        desired_media_id = (
+            selected_media_id
+            if selected_media_id in media_ids
+            else ""
+        )
+
+        media_selectbox_key = _media_selectbox_key()
+        pending_media_id = str(
+            st.session_state.pop("page2_pending_media_record_select", "") or ""
+        )
+        current_media_id = st.session_state.get(media_selectbox_key)
+        if pending_media_id and pending_media_id in media_ids:
+            st.session_state[media_selectbox_key] = pending_media_id
+        elif current_media_id not in media_ids:
+            st.session_state[media_selectbox_key] = desired_media_id
+
+        selected_id = st.selectbox(
+            "选择记录",
+            options=media_ids,
+            index=None,
+            placeholder="选择素材；新图片和视频生成后会自动显示",
+            key=media_selectbox_key,
+            format_func=lambda media_id: labels_by_id.get(media_id, media_id),
+            on_change=_activate_media_selection,
+            args=(media_selectbox_key,),
+            label_visibility="collapsed",
+        )
+        st.session_state.page2_selected_media_id = selected_id or ""
+        visibility_key = "page2_background_visible_control_" + str(st.session_state.get("page2_media_selection_nonce", 0))
+        st.checkbox("展示选中的图片／视频", value=bool(st.session_state.get("page2_background_visible", True)),
+                    key=visibility_key, on_change=_background_visibility_changed, args=(visibility_key,),
+                    disabled=not bool(selected_id or url_preview))
+        url_preview = url_favorites.get_preview_url("page2")
+
+        selected = None
+        for item in media:
+            if item.id == selected_id:
+                selected = item
+                break
+
+        if not url_preview and selected is not None:
+            kind = selected.media_kind.value if hasattr(selected.media_kind, "value") else str(selected.media_kind)
+            with prompt_container:
+                if kind == GeneratedMediaKind.VIDEO.value:
+                    model = selected.video_generation_provider or selected.provider
+                    label = VIDEO_MODELS[model].label if model in VIDEO_MODELS else model
+                    duration = selected.duration_seconds
+                    suffix = f" · {duration:g} 秒" if isinstance(duration, (int, float)) else ""
+                    st.caption(f"视频 · {label}{suffix}")
+                st.caption("prompt")
+                st.code(
+                    str(selected.prompt or ""),
+                    language=None,
+                    wrap_lines=True,
+                    height=120,
+                )
+
+            if kind == GeneratedMediaKind.IMAGE.value:
+                url = selected.image_url_string or ""
+                if url:
+                    url_favorites.render_url_display_with_copy(
+                        url,
+                        key=f"page2_media_url_copy_{selected.id}",
+                        label="图片 URL（可复制）",
+                    )
+            else:
+                url = selected.video_url_string or ""
+                if url:
+                    url_favorites.render_url_display_with_copy(
+                        url,
+                        key=f"page2_media_url_copy_{selected.id}",
+                        label="视频 URL（可复制）",
+                    )
+
+            _render_media_actions(selected, labels_by_id.get(selected_id, "当前媒体记录"))
+
+            render_delete_confirmation("page2_generated_media", _delete_media_record,
+                                       warning="这会删除对应的本地图片或视频，包括已永久保存的文件。删除后无法恢复。")
+
+    # Native URL previews and current media actions remain in this drawer.
     url_favorites.render_url_favorites("page2")
     if st.session_state.get("page2_cloudinary_upload_confirmation"):
         _render_cloudinary_upload_dialog()
 
 
 def render():
+    render_workspace_styles()
     _ensure_state()
     _load_record_from_nav_if_needed()
-    st.html(
-        """
-<style>
-/* Page2: use the space released by the transparent, zero-height app header. */
-section[data-testid="stMain"] .block-container {
-  padding-top: 20px !important;
-  padding-bottom: 20px !important;
-}
-
-/* Each desktop column owns its scroll range. Keep native wheel targeting and
-   nested text-field scrolling; only stop chaining at the column boundary. */
-@media (min-width: 769px) {
-  section[data-testid="stMain"]:has(.st-key-page2_workspace) {
-    overflow: hidden !important;
-  }
-
-  .st-key-page2_dialogue_pane,
-  .st-key-page2_media_pane {
-    height: calc(100dvh - 40px) !important;
-    max-height: calc(100dvh - 40px) !important;
-    min-height: 0 !important;
-    flex: 0 0 auto !important;
-    overflow-y: auto !important;
-    overflow-x: hidden !important;
-    overscroll-behavior-y: contain;
-  }
-
-  .st-key-page2_dialogue_pane > div,
-  .st-key-page2_media_pane > div {
-    flex-shrink: 0 !important;
-  }
-
-  .st-key-page2_dialogue_pane,
-  .st-key-page2_media_pane {
-    scrollbar-width: none;
-  }
-
-  .st-key-page2_dialogue_pane::-webkit-scrollbar,
-  .st-key-page2_media_pane::-webkit-scrollbar {
-    display: none;
-    width: 0;
-    height: 0;
-  }
-}
-
-/* Hide the chat-history scrollbar without affecting nested text fields. */
-.st-key-page2_dialogue_pane .st-key-page2_chat_history {
-  scrollbar-width: none;
-}
-
-.st-key-page2_dialogue_pane .st-key-page2_chat_history::-webkit-scrollbar {
-  display: none;
-  width: 0;
-  height: 0;
-}
-
-/* Let a finished chat-history scroll continue into the left column so Story
-   Brain remains reachable. The outer pane contains scrolling on desktop. */
-.st-key-page2_dialogue_pane div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas {
-  overscroll-behavior: auto !important;
-}
-
-/* A narrow viewport uses the document's normal vertical flow. Target only
-   the workspace columns, leaving button rows and other nested columns alone. */
-@media (max-width: 768px) {
-  .st-key-page2_workspace > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
-    flex-direction: column !important;
-  }
-
-  .st-key-page2_workspace > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-    width: 100% !important;
-    flex: 1 1 100% !important;
-    min-width: 0 !important;
-  }
-}
-
-/* Keep the image fullscreen control inside the preview's top-right corner. */
-.st-key-page2_media_preview
-  [data-testid="stElementToolbar"]:has(button[aria-label="Fullscreen"]) {
-  top: 8px !important;
-  right: 8px !important;
-  padding: 0 !important;
-  opacity: 0 !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-  transition: opacity 150ms ease, visibility 150ms ease !important;
-  z-index: 10 !important;
-}
-
-.st-key-page2_media_preview
-  [data-testid="stFullScreenFrame"]:hover
-  [data-testid="stElementToolbar"]:has(button[aria-label="Fullscreen"]),
-.st-key-page2_media_preview
-  [data-testid="stFullScreenFrame"]:focus-within
-  [data-testid="stElementToolbar"]:has(button[aria-label="Fullscreen"]) {
-  top: 8px !important;
-  opacity: 1 !important;
-  visibility: visible !important;
-  pointer-events: auto !important;
-}
-
-/* Chat message actions (编辑消息 / 生成语音): bare white icon, no chrome. */
-section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button,
-section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button {
-  background: transparent !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-  color: #ffffff !important;
-}
-
-section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button svg,
-section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button svg {
-  color: #ffffff !important;
-  fill: currentColor !important;
-}
-
-section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:hover,
-section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:hover {
-  background: rgba(255, 255, 255, 0.06) !important;
-  border-color: transparent !important;
-  color: #ffffff !important;
-}
-
-section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:disabled,
-section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:disabled {
-  background: transparent !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-  opacity: 1 !important;
-  color: rgba(255, 255, 255, 0.35) !important;
-}
-
-section[data-testid="stMain"] [class*="st-key-page2_chat_edit_open_"] button:disabled svg,
-section[data-testid="stMain"] [class*="st-key-page2_tts_generate_"] button:disabled svg {
-  color: rgba(255, 255, 255, 0.35) !important;
-}
-</style>
-        """,
-    )
-
-    # Keep the chat canvas and portrait image preview balanced on a full-screen layout.
-    with st.container(key="page2_workspace"):
-        left, right = st.columns([1.00, 1.00])
-        with left:
-            with st.container(key="page2_dialogue_pane"):
-                _render_chat_column()
-        with right:
-            with st.container(key="page2_media_pane"):
+    _sync_auto_veil()
+    history_start, visible_turns = _history_window()
+    # Before the stylesheet's renderer is ready, constrain the native layout
+    # instead of briefly exposing the full unstyled conversation.
+    with st.container(key="page2_workspace", height=1, border=False):
+        with st.container(key="page2_workspace_actions"):
+            st.button("加载更早的 6 轮", key="page2_load_earlier", disabled=history_start == 0,
+                      on_click=_load_earlier_chat_turns)
+            for section in ("settings", "media", "brain_editor"):
+                st.button("打开 " + section, key="page2_mount_" + section,
+                          on_click=_mount_workspace_section, args=(section,))
+        with st.container(key="page2_dialogue_pane", height=1, border=False):
+            _render_chat_column()
+        with st.container(key="page2_media_pane"):
+            if _workspace_section_mounted("media"):
                 _render_media_column()
-                # Keep queue feedback reachable inside the scrollable workspace.
+            else:
+                st.caption("正在打开图片与视频工具…")
+            if _pending_operations() or st.session_state.get("page2_operation_error"):
                 _render_operation_queue_status()
-
-    # Mutual exclusion: only one chat audio may play at a time.
-    st.iframe(
-        """
-<script>
-(() => {
-  const parent = window.parent;
-  if (parent.__dndAudioMutexInstalled) return;
-  parent.__dndAudioMutexInstalled = true;
-  const doc = parent.document;
-  doc.addEventListener('play', (event) => {
-    const target = event.target;
-    if (!(target instanceof HTMLAudioElement)) return;
-    doc.querySelectorAll('audio').forEach((a) => {
-      if (a !== target) a.pause();
-    });
-  }, true);
-})();
-</script>
-        """,
-        height=1,
+    media_id = str(st.session_state.get("page2_selected_media_id") or "")
+    selected = next((item for item in st.session_state.page2_generated_media if item.id == media_id), None)
+    selected = selected or _find_video_source(media_id)
+    if "page2_veil_opacity" in st.session_state:
+        veil_opacity = int(st.session_state["page2_veil_opacity"])
+    else:
+        veil_opacity = int(st.session_state.get("page2_veil_auto_pending", 30))
+    render_workspace(
+        scope=_operation_scope_id(),
+        record_id=str(st.session_state.page2_record_id or ""),
+        selected=selected,
+        url=url_favorites.get_preview_url("page2"),
+        visible=bool(st.session_state.get("page2_background_visible", True)),
+        veil_opacity=veil_opacity,
+        history={
+            "firstId": str(visible_turns[0].id) if visible_turns else "",
+            "hasMore": history_start > 0,
+            "anchorId": str(st.session_state.get("page2_chat_anchor_turn_id") or ""),
+        },
+        sections=list(_workspace_sections()),
     )

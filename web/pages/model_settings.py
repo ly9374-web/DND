@@ -58,7 +58,7 @@ FIELDS = [
         "https://keylinkclub.com/keys",
     ),
     (
-        "输入 OpenRouter API Key（Mistral 聊天与 Seedance 视频模型共用，会本地持久化保存）",
+        "输入 OpenRouter API Key（Mistral / Gemini 聊天与 Seedance 视频模型共用，会本地持久化保存）",
         AppStorageKeys.OPENROUTER_API_KEY,
         "OPENROUTER_API_KEY",
         "OPENROUTER_API_KEY",

@@ -1,0 +1,18 @@
+{
+  "log_file": "/Users/jason/.local/share/DND-data/logs/chat-1793548500-529356869941.jsonl",
+  "log_timestamp": "2026-11-01T23:55:33+08:00",
+  "record_file": "/Users/jason/.local/share/DND-data/ChatRecords/record-831ca94c-5015-4d4c-a581-9f34f78c8d73.json",
+  "turn_id": "35ae26a8-59c0-465f-980e-d600981e31c9",
+  "turn_date": "2026-11-01T23:55:33",
+  "media_id": "8f0e9196-133e-42d1-b31b-b7b125d7eb6d",
+  "media_date": "2026-11-01T23:56:14",
+  "media_local_path": "/Users/jason/Desktop/DND/.临时/20261101-235624-1f144e0d612a5447.webp",
+  "recent_turn_count": 3,
+  "message_count": 6,
+  "layout_file": "/Users/jason/Downloads/游戏聊天页-布局.json",
+  "reference_viewport": {
+    "width": 1512,
+    "height": 827
+  },
+  "note": "仅复制最近三轮消息、对应背景图与短期 Story Brain；未复制 system prompt、API 设置或密钥。HTML 中的所有编辑只影响本地预览。"
+}

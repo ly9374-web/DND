@@ -274,9 +274,19 @@ page2.render_sidebar_context()
                 5,
             )
             self.assertTrue(self.store.bool(AppStorageKeys.PAGE2_AUTO_IMAGE_ENABLED))
+            self.assertEqual(app.session_state["page2_auto_image_next_turn"], 1)
+            self.assertTrue(app.session_state["page2_auto_image_first_turn_pending"])
+
+            app.slider(key="page2_sidebar_auto_image_interval").set_value(12).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(app.session_state["page2_auto_image_next_turn"], 1)
+            app.run()
+            self.assertEqual(app.session_state["page2_auto_image_next_turn"], 1)
 
             app.toggle(key="page2_sidebar_auto_image_enabled").set_value(False).run()
             self.assertEqual(len(app.exception), 0)
+            self.assertIsNone(app.session_state["page2_auto_image_next_turn"])
+            self.assertFalse(app.session_state["page2_auto_image_first_turn_pending"])
             self.assertFalse(
                 any(slider.key == "page2_sidebar_auto_image_interval" for slider in app.slider)
             )

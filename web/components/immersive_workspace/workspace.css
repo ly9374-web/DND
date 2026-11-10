@@ -1,0 +1,128 @@
+/* All rules are scoped to Page2: other pages retain the existing theme. */
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace){--dnd-left:14px;--dnd-right:14px;--dnd-side:301px;--dnd-chat-height:50dvh;--dnd-chat-fade-height:calc(var(--dnd-chat-height)*.2);--dnd-brain-height:0px;--dnd-veil-height:50dvh;--dnd-veil:.6;--dnd-ink:#ffffff;--dnd-veil-rgb:52,56,59}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) section[data-testid="stMain"]{overflow:hidden!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .block-container{padding:0!important;max-width:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogue_pane{position:fixed!important;left:var(--dnd-left)!important;right:var(--dnd-right)!important;bottom:6px!important;width:auto!important;min-width:0!important;height:auto!important;max-height:none!important;overflow:visible!important;z-index:5!important;gap:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogue_pane>div{gap:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_canvas{height:auto!important;min-height:0!important;max-height:none!important;background:none!important;border:0!important;box-shadow:none!important;border-radius:0!important;padding:0!important;gap:8px!important;overflow:visible!important;flex:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_history){height:var(--dnd-chat-height)!important;min-height:0!important;flex:none!important;overflow:hidden!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history{height:var(--dnd-chat-height)!important;max-height:var(--dnd-chat-height)!important;overflow-y:auto!important;padding:12px 0 12px!important;scrollbar-width:none!important;overscroll-behavior:contain!important;-webkit-mask-image:linear-gradient(transparent,#000 var(--dnd-chat-fade-height));mask-image:linear-gradient(transparent,#000 var(--dnd-chat-fade-height))}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history::before{display:none!important}body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history::-webkit-scrollbar{display:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history>div:has(>.st-key-page2_chat_scroll_trigger),body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_scroll_trigger{position:absolute!important;inset:0 auto auto 0!important;width:0!important;height:0!important;min-height:0!important;overflow:hidden!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_composer){height:50px!important;min-height:50px!important;flex:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_composer{height:50px!important;min-height:50px!important;position:relative!important;padding:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input [data-testid="stChatInput"]{height:50px!important;min-height:50px!important;box-sizing:border-box!important;border-radius:12px!important;background:rgba(48,53,55,.24)!important;border:1px solid #ffffff10!important;box-shadow:none!important;backdrop-filter:blur(12px)}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input [data-testid="stChatInput"]>div{height:48px!important;min-height:48px!important;padding:6px 12px!important;box-sizing:border-box!important;display:flex!important;align-items:center!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input textarea{font-size:16px!important;color:var(--dnd-ink)!important;box-sizing:border-box!important;min-height:36px!important;height:36px!important;max-height:36px!important;padding:6px 94px 6px 16px!important;line-height:24px!important;overflow-y:auto!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input [data-testid="stChatInputSubmitButton"]{visibility:hidden!important;pointer-events:none!important;position:absolute!important;width:1px!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_dice_btn,.st-key-page2_chat_undo_btn{position:absolute!important;top:6px!important;height:36px!important;width:34px!important;min-width:34px!important;max-width:34px!important;margin:0!important;z-index:8!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_dice_btn{right:10px!important}body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_undo_btn{right:48px!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_dice_btn button,.st-key-page2_chat_undo_btn button{width:34px!important;min-width:34px!important;max-width:34px!important;height:36px!important;min-height:36px!important;padding:0!important;background:transparent!important;border:0!important;border-radius:7px!important;box-shadow:none!important;color:var(--dnd-ink)!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_undo_btn button:hover,.st-key-page2_chat_dice_btn button:hover{background:#ffffff12!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stChatMessage"]{background:transparent!important;border:0!important;padding:12px 0!important;margin:0!important;gap:0!important;color:var(--dnd-ink)!important;position:relative!important;width:100%!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid^="stChatMessageAvatar"]{display:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stChatMessageContent"]{width:100%!important;min-width:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history .stMarkdown p,.st-key-page2_chat_history .stMarkdown li,.st-key-page2_chat_history .stMarkdown blockquote{font-size:16px!important;line-height:1.95!important;color:var(--dnd-ink)!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stHorizontalBlock"]:has([class*="st-key-page2_chat_edit_open_"]){position:relative!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stHorizontalBlock"]:has([class*="st-key-page2_chat_edit_open_"])>[data-testid="stColumn"]:first-child{width:100%!important;flex:1!important;min-width:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stHorizontalBlock"]:has([class*="st-key-page2_chat_edit_open_"])>[data-testid="stColumn"]:last-child{position:absolute!important;right:0;top:0;width:36px!important;min-width:36px!important;opacity:0;background:#14212ed9;border-radius:7px;z-index:2}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stChatMessage"]:hover [data-testid="stColumn"]:last-child,.st-key-page2_chat_history [data-testid="stChatMessage"]:focus-within [data-testid="stColumn"]:last-child{opacity:1!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [class*="st-key-page2_chat_edit_open_"] button,.st-key-page2_chat_history [class*="st-key-page2_tts_generate_"] button{border:0!important;background:transparent!important;box-shadow:none!important;color:var(--dnd-ink)!important;min-height:30px!important;padding:0!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_story_brain_panel{height:var(--dnd-brain-height)!important;max-height:var(--dnd-brain-height)!important;min-height:0!important;overflow:hidden!important;padding:0!important;margin:0!important;flex:none!important;color:var(--dnd-ink)!important}
+/* Skip layout/paint for closed surfaces; their DOM stays alive so opening them
+   stays instant. The Brain iframe is the single most expensive hidden subtree. */
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_story_brain_panel{content-visibility:hidden}
+body.dnd-brain-open .st-key-page2_story_brain_panel{content-visibility:visible}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace):not(.dnd-right-open) .st-key-page2_media_pane{content-visibility:hidden}
+body.dnd-right-open .st-key-page2_media_pane{content-visibility:visible}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"]:not([aria-expanded="true"]){content-visibility:hidden}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_brain_scroll{height:auto!important;max-height:none!important;min-height:0!important;box-sizing:border-box!important;overflow-y:auto!important;overflow-x:hidden!important;overscroll-behavior:contain!important;padding:18px 0!important;scrollbar-width:thin!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_story_brain_panel h3{font-size:14px!important;letter-spacing:2px;font-weight:400!important;color:var(--dnd-ink)!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_story_brain_btn button{font-size:11px!important;min-height:26px!important;padding:3px 10px!important;background:transparent!important;width:auto!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane{position:fixed!important;right:14px!important;top:80px!important;bottom:24px!important;width:var(--dnd-side)!important;min-width:0!important;height:auto!important;max-height:none!important;overflow-y:auto!important;overflow-x:hidden!important;overscroll-behavior:contain!important;z-index:25!important;padding:20px!important;border-radius:20px!important;transform:translateX(calc(100% + 24px));visibility:hidden;scrollbar-width:thin;gap:15px!important}
+body.dnd-right-open .st-key-page2_media_pane{transform:translateX(0);visibility:visible}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_immersive_bridge{display:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"]{position:fixed!important;top:80px!important;bottom:24px!important;left:14px!important;height:calc(100dvh - 104px)!important;max-height:none!important;width:var(--dnd-side)!important;max-width:var(--dnd-side)!important;min-width:0!important;border-radius:20px!important;z-index:25!important;overflow:hidden!important}
+/* Keep closing drawers rendered until their slide-out has finished. */
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"],body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane{transition:transform .32s cubic-bezier(.22,1,.36,1),opacity .24s ease,visibility 0s linear .32s!important;opacity:0;pointer-events:none}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"]{transform:translateX(calc(-100% - 24px))!important;visibility:hidden}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"][aria-expanded="true"],body.dnd-right-open .st-key-page2_media_pane{transform:translateX(0)!important;opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogue_pane,#dnd-chat-resize{transition:left .32s cubic-bezier(.22,1,.36,1),right .32s cubic-bezier(.22,1,.36,1)}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"]>div{background:transparent!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebarContent"]{height:100%!important;overflow-y:auto!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebarHeader"]{display:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebarUserContent"]{padding:20px!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stExpandSidebarButton"]{opacity:0!important;pointer-events:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"],.st-key-page2_media_pane{background:linear-gradient(140deg,rgba(255,255,255,.065),rgba(255,255,255,.008) 44%,rgba(151,202,255,.025)),rgba(14,24,36,.04)!important;backdrop-filter:blur(6px) saturate(150%) contrast(102%)!important;-webkit-backdrop-filter:blur(6px) saturate(150%) contrast(102%)!important;border:1px solid rgba(231,244,255,.22)!important;box-shadow:inset 1px 1px 0 #ffffff33,inset -1px -1px 0 #c0ddff0f,0 12px 32px #0000001a!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane h3,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] h3{font-size:12px!important;font-weight:400!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] button,.st-key-page2_media_pane button{background:linear-gradient(135deg,#ffffff09,rgba(18,32,48,.075))!important;border-color:#ffffff24!important;box-shadow:inset 0 1px 0 #ffffff10!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] [data-baseweb="select"]>div,.st-key-page2_media_pane [data-baseweb="select"]>div,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] input,.st-key-page2_media_pane input,.st-key-page2_media_pane textarea{background:rgba(14,24,38,.075)!important;border-color:#ffffff24!important}
+#dnd-immersive-bg{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0;background:transparent}
+#dnd-immersive-bg img,#dnd-immersive-bg video{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:100%;height:100%;object-fit:contain;mask-image:linear-gradient(transparent,#000 55px,#000 calc(100% - 55px),transparent),linear-gradient(90deg,transparent,#000 65px,#000 calc(100% - 65px),transparent);mask-composite:intersect}
+#dnd-immersive-bg canvas{position:absolute;inset:0;width:100%;height:100%;filter:blur(25px);transform:scale(1.055)}
+#dnd-immersive-veil{position:fixed;inset:auto 0 0;height:var(--dnd-veil-height);pointer-events:none;z-index:1;background:linear-gradient(rgba(var(--dnd-veil-rgb),0),rgba(var(--dnd-veil-rgb),var(--dnd-veil)) var(--dnd-chat-fade-height))}
+body:not(.dnd-has-media) #dnd-immersive-veil{opacity:0}
+#dnd-immersive-topbar{position:fixed;left:24px;right:24px;top:23px;z-index:30;display:flex;justify-content:space-between;pointer-events:none;font:13px -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+#dnd-immersive-topbar button{pointer-events:auto;background:rgba(17,25,36,.12);border:1px solid #ffffff24;border-radius:9px;color:#e3edf5;padding:9px 12px;cursor:pointer;backdrop-filter:blur(6px);display:flex;align-items:center;gap:8px}
+#dnd-immersive-topbar svg,#dnd-chat-resize svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+#dnd-chat-resize{position:fixed;height:22px;z-index:15;display:flex;align-items:center;justify-content:center;cursor:ns-resize;touch-action:none;opacity:0;background:linear-gradient(transparent,#779dc012,transparent);border:0;outline:none}
+#dnd-chat-resize:hover,#dnd-chat-resize:focus-visible,body.dnd-chat-resizing #dnd-chat-resize{opacity:1}
+#dnd-chat-resize svg{border:1px solid #bdd8ef42;background:#142536c9;border-radius:6px;padding:3px;width:25px;height:25px;color:#e0effb;pointer-events:none}
+body.dnd-chat-resizing{user-select:none}
+@media(max-width:850px){body:has(.st-key-page2_game_mount,.st-key-page2_workspace){--dnd-side:min(301px,42vw);--dnd-left:10px;--dnd-right:10px}body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane{right:8px!important;padding:14px!important}body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"]{left:8px!important}#dnd-immersive-topbar{left:14px;right:14px}}
+@media(prefers-reduced-motion:reduce){#dnd-immersive-bg,#dnd-immersive-veil,#dnd-chat-resize,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"],body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogue_pane{transition:none!important}}
+/* Remove the legacy neon message cards within the new reading surface. */
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stChatMessage"],body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_history [data-testid="stChatMessageContent"]{box-shadow:none!important;border-radius:0!important;outline:none!important;background:transparent!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input [data-testid="stChatInput"]>div,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_chat_input textarea{background:transparent!important;box-shadow:none!important;font-weight:400!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane [data-rac][role="group"],body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] [data-rac][role="group"],body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane [data-testid="stTextArea"]>div,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] [data-testid="stNumberInputContainer"]{background:rgba(14,24,38,.075)!important;border-color:#ffffff24!important;border-radius:8px!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_media_pane [data-rac][role="group"] input,body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] [data-rac][role="group"] input{background:transparent!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_story_brain_panel>div:has(>.st-key-page2_brain_scroll){height:auto!important;max-height:none!important;min-height:0!important;flex:1 1 auto!important;display:flex!important;flex-direction:column!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_brain_scroll{min-height:0!important;max-height:none!important;flex:1 1 auto!important}
+#dnd-immersive-topbar button[hidden]{display:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) [data-testid="stSidebar"] .st-key-sidebar_back{width:100%!important}
+
+/* The mount exists before sidebar/record work. Keep incomplete game content
+   out of the first paint and reveal only once per visit, never on a rerun. */
+.st-key-page2_game_mount,.st-key-page2_navigation_bridge{position:absolute!important;width:0!important;height:0!important;min-height:0!important;overflow:hidden!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace):not(.dnd-game-ready) .st-key-page2_dialogue_pane,
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace):not(.dnd-game-ready) [data-testid="stSidebar"],
+body:not(.dnd-game-ready) #dnd-immersive-bg,body:not(.dnd-game-ready) #dnd-immersive-veil,body:not(.dnd-game-ready) #dnd-immersive-topbar{opacity:0!important;pointer-events:none!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogue_pane{transition:opacity .24s ease,left .32s cubic-bezier(.22,1,.36,1),right .32s cubic-bezier(.22,1,.36,1)}
+#dnd-immersive-bg,#dnd-immersive-topbar{transition:opacity .24s ease}
+#dnd-immersive-veil{transition:opacity .24s ease}
+#dnd-immersive-bg img,#dnd-immersive-bg video,#dnd-immersive-bg canvas{opacity:0;transition:opacity .32s ease}
+#dnd-immersive-bg .dnd-media-ready{opacity:1}
+#dnd-game-transition{position:fixed;inset:0;z-index:99990;background:#0b0f14;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .24s ease,visibility 0s linear .24s}
+#dnd-game-transition.dnd-transition-active{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .12s ease}
+@media(prefers-reduced-motion:reduce){#dnd-game-transition,#dnd-immersive-topbar,#dnd-immersive-bg img,#dnd-immersive-bg video,#dnd-immersive-bg canvas{transition:none!important}}
+
+/* Native reading surfaces: no JavaScript wheel routing or scroll chaining. */
+.st-key-page2_workspace_actions{display:none!important}
+body:has(.st-key-page2_workspace) .st-key-page2_chat_history{overscroll-behavior:none!important;transition:height .2s ease,max-height .2s ease}
+body:has(.st-key-page2_workspace) .st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_history){transition:height .2s ease}
+body:has(.st-key-page2_workspace) .st-key-page2_brain_scroll{overscroll-behavior:none!important}
+body:has(.st-key-page2_workspace) .st-key-page2_story_brain_panel{content-visibility:visible;transition:height .2s ease,max-height .2s ease}
+.dnd-brain-viewer{white-space:pre-wrap;overflow-wrap:anywhere;font-size:16px;line-height:1.9;color:var(--dnd-ink);cursor:text;min-height:220px}
+.st-key-page2_brain_editor textarea{color:var(--dnd-ink)!important;overscroll-behavior:none}
+.st-key-page2_brain_editor{position:relative}
+.st-key-page2_brain_save,.st-key-page2_brain_cancel{display:inline-block!important;width:auto!important}
+/* Keep a clear band between the composer and the story brain, and let the
+   editor fill the panel: the header chrome collapses, the box grows into the
+   freed height, and the actions sit in one row instead of stacking. */
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace).dnd-brain-open .st-key-page2_brain_scroll{padding-top:28px!important}
+body:has(.st-key-page2_game_mount,.st-key-page2_workspace):has(.st-key-page2_brain_editor) .st-key-page2_brain_scroll{padding:28px 0 12px!important;overflow:hidden!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_scroll>*:not(:has(.st-key-page2_brain_editor)){display:none!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_scroll>*:has(.st-key-page2_brain_editor){flex:1 1 auto!important;min-height:0!important;height:auto!important;display:flex!important;flex-direction:column!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_editor{display:flex!important;flex-direction:column!important;flex:1 1 auto!important;height:100%!important;min-height:0!important;gap:12px!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_editor>[data-testid="stElementContainer"]:has(>[data-testid="stTextArea"]){display:flex!important;flex-direction:column!important;flex:1 1 0!important;min-height:0!important;height:auto!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_editor [data-testid="stTextArea"]{flex:1 1 0!important;height:auto!important;min-height:0!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_editor [data-testid="stTextAreaRootElement"]{flex:1 1 0!important;height:auto!important;min-height:0!important}
+body:has(.st-key-page2_brain_editor) .st-key-page2_brain_editor textarea{height:100%!important;min-height:0!important;max-height:none!important;resize:none!important}
+@media(prefers-reduced-motion:reduce){.st-key-page2_story_brain_panel,.st-key-page2_chat_history,.st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_history){transition:none!important}}
+body.dnd-chat-resizing .st-key-page2_chat_history,body.dnd-chat-resizing .st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_history){transition:none!important}
+.st-key-page2_hidden_tts_status{display:none!important}
+body:has(.st-key-page2_workspace) .st-key-page2_workspace{height:auto!important;min-height:0!important;overflow:visible!important}
+body:not(.dnd-game-ready) .st-key-page2_dialogue_pane,body:not(.dnd-game-ready) #dnd-immersive-bg,body:not(.dnd-game-ready) #dnd-immersive-veil,body:not(.dnd-game-ready) #dnd-immersive-topbar{transition:none!important}
+.st-key-page2_veil_row{position:relative}
+.st-key-page2_veil_row .st-key-page2_veil_auto{position:absolute;top:-2px;right:0;width:auto;z-index:2}
+.st-key-page2_veil_row .st-key-page2_veil_auto [data-testid="stWidgetLabel"]{display:none!important}

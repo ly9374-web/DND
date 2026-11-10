@@ -135,6 +135,7 @@ def load_state(hidden_space: bool = False) -> PromptState:
 def _ensure_record_defaults(state: PromptState) -> None:
     """Migrate first inputs and memory bindings without changing saved memory text."""
     from app.services import prompt_assets
+    from app.services.story_brain_prompts import remove_obsolete_foreshadow_rule
 
     prompt_assets.load_long_term_memories(hidden_space=True)
     normal_default_memory = prompt_assets.default_long_term_memory_record()
@@ -143,6 +144,10 @@ def _ensure_record_defaults(state: PromptState) -> None:
     )
     changed = False
     for record in state.records + state.hidden_records:
+        cleaned = remove_obsolete_foreshadow_rule(record.long_term_memory)
+        if cleaned != record.long_term_memory:
+            record.long_term_memory = cleaned
+            changed = True
         default_memory = (
             (hidden_default_memory or normal_default_memory)
             if record in state.hidden_records
@@ -296,6 +301,16 @@ def bind_final_setting_sources(
     record.updated_at = now_iso()
     _persist(state)
     return record
+
+
+def save_foreshadowing(state: PromptState, record_id: str, config: dict) -> None:
+    from copy import deepcopy
+    record = get_record(state, record_id)
+    if record is None:
+        raise ValueError("最终设定不存在，请先保存最终设定。")
+    record.foreshadowing = deepcopy(config)
+    record.updated_at = now_iso()
+    _persist(state)
 
 
 def save_prompt(

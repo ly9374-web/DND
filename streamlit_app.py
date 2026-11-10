@@ -8,6 +8,7 @@ from app.ui.theme import apply_dark_mode
 from app.services import media_store
 from web.nav import back, goto, nav_init, nav_state
 from web import prompt_draft_guard
+from web.components.immersive_workspace import prepare_workspace
 from web.streamlit_log_filters import install_stale_fragment_filter
 from web.pages.home import render as render_home
 from web.pages.model_settings import render as render_model_settings
@@ -153,6 +154,7 @@ def main():
         goto("home", push_history=False)
 
     page = nav_state().page
+    prepare_workspace(active=page == "main")
     prompt_draft_guard.begin()
     apply_dark_mode(animate_background=page in {"signin", "home"})
     if page != "signin":

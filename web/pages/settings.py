@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 import streamlit as st
@@ -13,6 +14,7 @@ from app.models import (
 from app.services import prompt_assets, quick_inputs, system_prompts
 from web.components.delete_confirmation import render_delete_confirmation, request_delete
 from web import prompt_draft_guard
+from web.components import foreshadow_editor
 
 
 PROMPT_SECTIONS = ["最终设定", "世界书", "角色卡", "固定模板", "长期记忆", "快捷输入"]
@@ -464,10 +466,10 @@ def _render_final_settings(is_guest: bool) -> None:
 
     with right:
         record_key = selected_record.id if selected_record else "new"
-        st.subheader("编辑" if not is_guest else "预览")
         title_key = f"system_prompt_title_{record_key}"
         prompt_key = f"system_prompt_body_{record_key}"
         memory_key = f"system_prompt_long_term_memory_{record_key}"
+        foreshadow_editor.render_header(state, selected_record, prompt_key, disabled=is_guest)
         prompt_draft_guard.protect(
             title_key, selected_record.title if selected_record else "", "最终设定名称"
         )
@@ -509,6 +511,7 @@ def _render_final_settings(is_guest: bool) -> None:
             help="Story Brain 生成和更新时使用的规则。",
         )
         _render_first_input_editor(state, selected_record, is_guest=is_guest)
+        foreshadow_editor.render_editor(state, selected_record, disabled=is_guest)
 
         save_col, sync_col, new_col, delete_col = st.columns(4)
         prompt_draft_guard.save_action("system_prompt_save", title_key, prompt_key, memory_key)
@@ -611,7 +614,7 @@ def _render_generation_reasoning_selector(kind: str, model: str) -> str:
         disabled=not chat_model_supports_reasoning(model),
     )
     if not chat_model_supports_reasoning(model):
-        st.caption("Mistral Large 3 2512 不提供可配置思考模式。")
+        st.caption("当前模型不提供可配置思考模式。")
         return "off"
     return selected if model == "grok2" else "high" if selected == "开思考" else "off"
 
@@ -1324,14 +1327,53 @@ def _render_quick_inputs(is_guest: bool) -> None:
     render_delete_confirmation("quick_input", _delete)
 
 
+def _render_flash_toast(message: str) -> None:
+    """Show a one-shot toast at the bottom-left instead of a full-width row."""
+    text = json.dumps(str(message or ""), ensure_ascii=False).replace("</", "<\\/")
+    st.iframe(f"""<script>
+    (() => {{
+      const host = window.parent;
+      const doc = host.document;
+      if (!doc.getElementById("dnd-prompt-toast-style")) {{
+        const style = doc.createElement("style");
+        style.id = "dnd-prompt-toast-style";
+        style.textContent = `
+          @keyframes dnd-toast-in {{
+            from {{ opacity: 0; transform: translateY(6px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+          }}
+          @keyframes dnd-toast-out {{
+            from {{ opacity: 1; transform: translateY(0); }}
+            to {{ opacity: 0; transform: translateY(6px); visibility: hidden; }}
+          }}
+        `;
+        doc.head.appendChild(style);
+      }}
+      doc.getElementById("dnd-prompt-toast")?.remove();
+      const el = doc.createElement("div");
+      el.id = "dnd-prompt-toast";
+      el.textContent = {text};
+      el.style.cssText = [
+        "position:fixed", "left:1rem", "bottom:1rem", "z-index:100000",
+        "max-width:min(380px,calc(100vw - 2rem))", "padding:.75rem 1rem",
+        "border-radius:.65rem", "pointer-events:none",
+        "background:rgba(24,26,32,.96)", "color:#f3f4f6",
+        "border:1px solid rgba(255,255,255,.14)",
+        "box-shadow:0 10px 30px rgba(0,0,0,.35)",
+        "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+        "animation:dnd-toast-in .2s ease forwards,dnd-toast-out .3s ease 3s forwards"
+      ].join(";");
+      doc.body.appendChild(el);
+    }})();
+    </script>""", height=1)
+
+
 def render():
     st.title("Prompt")
     mode = str(st.session_state.get("auth_mode", "") or "").strip().lower()
     is_guest = mode == "guest"
     section = _render_section_buttons()
     flash = str(st.session_state.pop("prompt_settings_flash", "") or "")
-    if flash:
-        st.success(flash)
 
     if section == "最终设定":
         _render_final_settings(is_guest)
@@ -1377,3 +1419,6 @@ def render():
         _render_long_term_memories(is_guest)
     elif section == "快捷输入":
         _render_quick_inputs(is_guest)
+
+    if flash:
+        _render_flash_toast(flash)

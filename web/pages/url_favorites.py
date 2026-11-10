@@ -404,6 +404,12 @@ def render_url_favorites(prefix: str) -> None:
                 clear_preview_url(prefix)
             else:
                 st.session_state[f"{prefix}_url_preview"] = record.url
+                if prefix == "page2":
+                    st.session_state["page2_background_visible"] = True
+                    st.session_state["page2_media_selection_nonce"] = int(st.session_state.get("page2_media_selection_nonce", 0)) + 1
+            if prefix == "page2":
+                from web.pages.page2 import _upsert_record
+                _upsert_record()
             st.rerun()
 
     render_delete_confirmation(f"{prefix}_stored_url", _delete)

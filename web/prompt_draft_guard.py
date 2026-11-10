@@ -79,6 +79,11 @@ def page_id() -> str:
 
 def render() -> None:
     fields = list(st.session_state.get(_FIELDS_KEY) or [])
+    # No editor has been opened yet: there are no drafts to guard. Avoid the
+    # custom-component initialization on the first visit to the game.
+    if not fields and not st.session_state.get("_prompt_draft_guard_mounted", False):
+        return
+    st.session_state["_prompt_draft_guard_mounted"] = True
     current_scope = scope()
     current_page = page_id()
     prefix = f"{current_scope}:"

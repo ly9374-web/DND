@@ -262,10 +262,11 @@ with patch.object(page2.url_favorites, "get_preview_url", return_value=""):
     page2._render_media_column()
 ''').run()
     assert not app.exception
-    assert len(app.selectbox(key="page2_media_record_select").options) == 1
+    assert len(app.selectbox(key="page2_media_record_select").options) == 2
+    assert app.selectbox(key="page2_media_record_select").options[0] == "无图片／正常背景"
     assert len(app.multiselect[0].options) == 1
     assert app.session_state.page2_video_source == fresh.id
-    assert app.session_state.page2_selected_media_id is None
+    assert app.session_state.page2_selected_media_id == ""
 
 
 def test_explicit_expiry_not_permission_failure(sandbox):

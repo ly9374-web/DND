@@ -42,6 +42,7 @@ class Page2ChatModel(str, Enum):
     DEEPSEEK_PRO = "deepseekPro"
     DEEPSEEK_FLASH = "deepseekFlash"
     MISTRAL_LARGE_2512 = "mistralLarge2512"
+    GEMINI_38_FLASH = "gemini38Flash"
 
 
 CHAT_MODEL_OPTIONS = [model.value for model in Page2ChatModel]
@@ -51,6 +52,7 @@ CHAT_MODEL_LABELS = {
     Page2ChatModel.DEEPSEEK_PRO.value: "DeepSeek Pro",
     Page2ChatModel.DEEPSEEK_FLASH.value: "DeepSeek Flash",
     Page2ChatModel.MISTRAL_LARGE_2512.value: "Mistral Large 3 2512",
+    Page2ChatModel.GEMINI_38_FLASH.value: "Gemini 3.8 Flash",
 }
 GROK_CHAT_MODEL_IDS = {
     Page2ChatModel.GROK1.value: "grok-4.3",
@@ -62,6 +64,10 @@ DEEPSEEK_CHAT_MODEL_IDS = {
 }
 OPENROUTER_CHAT_MODEL_IDS = {
     Page2ChatModel.MISTRAL_LARGE_2512.value: "mistralai/mistral-large-2512",
+    Page2ChatModel.GEMINI_38_FLASH.value: "google/gemini-3.8-flash",
+}
+CHAT_MODELS_WITHOUT_REASONING = {
+    Page2ChatModel.MISTRAL_LARGE_2512.value,
 }
 
 
@@ -87,7 +93,7 @@ def openrouter_api_model_for_chat_model(value) -> str | None:
 
 
 def chat_model_supports_reasoning(value) -> bool:
-    return openrouter_api_model_for_chat_model(value) is None
+    return normalize_chat_model(value) not in CHAT_MODELS_WITHOUT_REASONING
 
 
 class GeneratedMediaKind(str, Enum):
@@ -144,6 +150,7 @@ class SystemPromptRecord:
     updated_at: str = field(default_factory=now_iso)
     first_inputs_need_migration: bool = field(default=False, repr=False, compare=False)
     first_input_defaults_version: int = 0
+    foreshadowing: dict = field(default_factory=dict)
 
     def __post_init__(self):
         normalized_inputs: list[FirstInputRecord] = []
@@ -212,6 +219,7 @@ class SystemPromptRecord:
                 or data.get("longTermMemory")
                 or ""
             ),
+            foreshadowing=deepcopy(data.get("foreshadowing") or {}),
             final_template_id=data.get("final_template_id") or data.get("finalTemplateID") or "",
             final_world_book_id=data.get("final_world_book_id") or data.get("finalWorldBookID") or "",
             final_long_term_memory_id=(
@@ -262,6 +270,7 @@ class SystemPromptRecord:
             "selected_first_input_id": self.selected_first_input_id,
             "first_input_defaults_version": self.first_input_defaults_version,
             "long_term_memory": self.long_term_memory,
+            "foreshadowing": deepcopy(self.foreshadowing),
             "final_template_id": self.final_template_id,
             "final_world_book_id": self.final_world_book_id,
             "final_long_term_memory_id": self.final_long_term_memory_id,
@@ -348,6 +357,8 @@ class Page2ConversationTurn:
     assistant_audio_clips: list[dict] = field(default_factory=list)
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
+    # Kept separate from the visible player message. Only successful turns consume these.
+    special_events: list[dict] = field(default_factory=list)
 
     @staticmethod
     def from_dict(data):
@@ -377,6 +388,7 @@ class Page2ConversationTurn:
                 if isinstance(data.get("assistant_audio_clips", []), list) else []
             ),
             date=data.get("date") or now_iso(),
+            special_events=deepcopy(data.get("special_events") or []),
         )
 
     def to_dict(self):
@@ -391,6 +403,7 @@ class Page2ConversationTurn:
             "assistant_audio_filename": str(self.assistant_audio_filename or ""),
             "assistant_audio_clips": self.assistant_audio_clips,
             "date": self.date,
+            "special_events": deepcopy(self.special_events),
         }
 
 
@@ -515,6 +528,7 @@ class ChatRecord:
     story_brain_last_update_turn_id: str = ""
     auto_image_next_turn: int | None = None
     auto_image_anchor_turn_count: int | None = None
+    auto_image_first_turn_pending: bool = False
     # At most two versions: current and previous, never a per-turn memory archive.
     story_brain_checkpoints: list = field(default_factory=list)
     final_setting_id: str = ""
@@ -528,6 +542,12 @@ class ChatRecord:
     id: str = field(default_factory=new_id)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+
+    # None preserves the legacy latest-media default; empty string explicitly means grid.
+    background_media_id: str | None = None
+    background_url: str = ""
+    background_visible: bool = True
+    foreshadowing: dict = field(default_factory=dict)
 
     @staticmethod
     def from_dict(data):
@@ -549,6 +569,11 @@ class ChatRecord:
             turns=turns,
             system_prompt=data.get("system_prompt") or data.get("systemPrompt") or "",
             generated_images=generated_images,
+            background_media_id=(str(data["background_media_id"] or "")
+                                 if data.get("background_media_id") is not None else None),
+            background_url=str(data.get("background_url") or ""),
+            background_visible=bool(data.get("background_visible", True)),
+            foreshadowing=deepcopy(data.get("foreshadowing") or {}),
             story_brain=deepcopy(
                 data.get("story_brain")
                 if "story_brain" in data
@@ -569,6 +594,7 @@ class ChatRecord:
             auto_image_anchor_turn_count=optional_nonnegative_int(
                 data.get("auto_image_anchor_turn_count")
             ),
+            auto_image_first_turn_pending=bool(data.get("auto_image_first_turn_pending", False)),
             final_setting_id=(
                 data.get("final_setting_id")
                 or data.get("finalSettingID")
@@ -600,6 +626,10 @@ class ChatRecord:
                 for turn in self.turns
             ],
             "system_prompt": self.system_prompt,
+            "background_media_id": self.background_media_id,
+            "background_url": self.background_url,
+            "background_visible": self.background_visible,
+            "foreshadowing": deepcopy(self.foreshadowing),
             "generated_images": [
                 image.to_dict() if hasattr(image, "to_dict") else image
                 for image in self.generated_images
@@ -616,6 +646,7 @@ class ChatRecord:
             "auto_image_anchor_turn_count": optional_nonnegative_int(
                 self.auto_image_anchor_turn_count
             ),
+            "auto_image_first_turn_pending": bool(self.auto_image_first_turn_pending),
             "final_setting_id": str(self.final_setting_id or ""),
             "branch_group_id": str(self.branch_group_id or ""),
             "branch_number": optional_positive_int(self.branch_number),

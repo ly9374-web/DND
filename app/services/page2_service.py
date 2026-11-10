@@ -9,6 +9,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, replace
+from copy import deepcopy
 from typing import Iterable, List, Optional
 
 from PIL import Image, ImageOps
@@ -41,6 +42,7 @@ from app.models import (
     GeneratedImageRecord,
     GeneratedMediaKind,
     Page2ConversationTurn,
+    chat_model_supports_reasoning,
     deepseek_api_model_for_chat_model,
     grok_api_model_for_chat_model,
     normalize_chat_model,
@@ -48,7 +50,7 @@ from app.models import (
     openrouter_api_model_for_chat_model,
 )
 from app.services.story_brain_prompts import DEFAULT_STORY_BRAIN_GENERATOR_PROMPT
-from app.services import media_store, image_references
+from app.services import media_store, image_references, foreshadowing
 from app.services.image_prompts import build_image_prompt_system_prompt
 from app.services.video_prompts import VIDEO_PROMPT_SYSTEM_PROMPT
 from app.storage import ChatRecordStore
@@ -127,7 +129,7 @@ def _turn_history_text(turns: Iterable[Page2ConversationTurn], limit: int) -> st
     recent = completed_turns[-limit:]
     lines = []
     for turn in recent:
-        user_text = str(getattr(turn, "user_message", "") or "").strip()
+        user_text = foreshadowing.turn_user_message(turn).strip()
         assistant_text = str(getattr(turn, "assistant_message", "") or "").strip()
         if user_text:
             lines.append("用户：" + user_text)
@@ -321,7 +323,7 @@ def build_context_messages(
 
     for turn in slice_turns:
         if turn.user_message:
-            messages.append({"role": "user", "content": turn.user_message})
+            messages.append({"role": "user", "content": foreshadowing.turn_user_message(turn)})
         if turn.assistant_message:
             messages.append({"role": "assistant", "content": turn.assistant_message})
 
@@ -335,8 +337,12 @@ def _send_with_current_chat_model(
     user_message: str,
     system_prompt: str | None = None,
     log_label: str = "聊天",
+    temperature: float | None = None,
+    thinking_enabled: bool | None = None,
 ) -> str:
     effective_system_prompt = ctx.system_prompt if system_prompt is None else system_prompt
+    effective_temperature = ctx.temperature if temperature is None else float(temperature)
+    effective_thinking = ctx.chat_reasoning_enabled if thinking_enabled is None else bool(thinking_enabled)
     request_id = uuid.uuid4().hex
     token = chat_request_context.set((request_id, log_label))
     started = time.monotonic()
@@ -348,21 +354,28 @@ def _send_with_current_chat_model(
                 system_prompt=effective_system_prompt,
                 context_messages=context_messages,
                 user_message=user_message,
-                temperature=ctx.temperature,
+                temperature=effective_temperature,
                 model=deepseek_model,
-                thinking_enabled=ctx.chat_reasoning_enabled,
-                reasoning_effort="high" if ctx.chat_reasoning_enabled else None,
+                thinking_enabled=effective_thinking,
+                reasoning_effort="high" if effective_thinking else None,
             )
         else:
             openrouter_model = openrouter_api_model_for_chat_model(ctx.selected_chat_model)
             if openrouter_model is not None:
-                reply = OpenRouterChatAPIClient.send_message(
-                    system_prompt=effective_system_prompt,
-                    context_messages=context_messages,
-                    user_message=user_message,
-                    temperature=ctx.temperature,
-                    model=openrouter_model,
-                )
+                openrouter_kwargs = {
+                    "system_prompt": effective_system_prompt,
+                    "context_messages": context_messages,
+                    "user_message": user_message,
+                    "temperature": effective_temperature,
+                    "model": openrouter_model,
+                }
+                if chat_model_supports_reasoning(ctx.selected_chat_model):
+                    openrouter_kwargs.update(
+                        thinking_enabled=effective_thinking,
+                        reasoning_effort="high" if effective_thinking else None,
+                        max_tokens=50000,
+                    )
+                reply = OpenRouterChatAPIClient.send_message(**openrouter_kwargs)
             else:
                 grok_model = grok_api_model_for_chat_model(ctx.selected_chat_model) or "grok-4.3"
                 grok_requires_reasoning = grok_model == "grok-4.6"
@@ -371,11 +384,11 @@ def _send_with_current_chat_model(
                     context_messages=context_messages,
                     user_message=user_message,
                     model=grok_model,
-                    temperature=ctx.temperature,
-                    thinking_enabled=True if grok_requires_reasoning else ctx.chat_reasoning_enabled,
+                    temperature=effective_temperature,
+                    thinking_enabled=True if grok_requires_reasoning else effective_thinking,
                     reasoning_effort=(
                         "high"
-                        if ctx.chat_reasoning_enabled
+                        if effective_thinking
                         else "low" if grok_requires_reasoning else None
                     ),
                 )
@@ -769,8 +782,13 @@ def upsert_chat_record(
     final_setting_id: str = "",
     auto_image_next_turn: int | None = None,
     auto_image_anchor_turn_count: int | None = None,
+    auto_image_first_turn_pending: bool = False,
     scope: str | None = None,
     hidden: bool = False,
+    background_media_id: str | None = None,
+    background_url: str = "",
+    background_visible: bool = True,
+    foreshadowing: dict | None = None,
 ) -> str:
     if not record_id and not turns and not generated_media:
         return str(record_id or "").strip()
@@ -800,6 +818,10 @@ def upsert_chat_record(
         turns=turns,
         system_prompt=system_prompt,
         generated_images=generated_media,
+        background_media_id=background_media_id,
+        background_url=str(background_url or ""),
+        background_visible=bool(background_visible),
+        foreshadowing=deepcopy(foreshadowing or {}),
         story_brain=story_brain,
         story_brain_short=str(story_brain_short or "").strip(),
         story_brain_next_update_turn=(
@@ -818,6 +840,7 @@ def upsert_chat_record(
             max(0, int(auto_image_anchor_turn_count))
             if auto_image_anchor_turn_count is not None else None
         ),
+        auto_image_first_turn_pending=bool(auto_image_first_turn_pending),
         story_brain_checkpoints=list(story_brain_checkpoints or [])[-2:],
         branch_group_id=existing_branch_group_id,
         branch_number=existing_branch_number,

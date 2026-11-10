@@ -3,7 +3,7 @@ import uuid
 import streamlit as st
 
 from app.services import chat_records
-from web.nav import goto
+from web.nav import goto, navigate
 from web.pages.page2 import start_new_conversation as start_new_page2_conversation
 
 
@@ -117,6 +117,16 @@ def _latest_visible_record_id() -> str:
     return items[0].id if items else ""
 
 
+def _start_game(start_new_conversation, page: str) -> None:
+    if start_new_conversation(reset_settings=True) is not False:
+        navigate(page)
+
+
+def _continue_game(page: str, record_id: str) -> None:
+    st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
+    navigate(page, record_id=record_id)
+
+
 def render(
     *,
     start_new_conversation=start_new_page2_conversation,
@@ -131,25 +141,25 @@ def render(
     with st.container(key="home_start"):
         start_column, continue_column = st.columns(2, gap="medium")
         with start_column:
-            if st.button(
+            st.button(
                 "开始",
                 key="home_start_button",
                 icon=":material/play_arrow:",
                 use_container_width=True,
-            ):
-                start_new_conversation(reset_settings=True)
-                goto(start_page)
+                on_click=_start_game,
+                args=(start_new_conversation, start_page),
+            )
         with continue_column:
             latest_record_id = _latest_visible_record_id()
-            if st.button(
+            st.button(
                 "继续",
                 key="home_continue_button",
                 icon=":material/arrow_forward:",
                 use_container_width=True,
                 disabled=not latest_record_id,
-            ):
-                st.session_state["page2_chat_scroll_to_bottom_request"] = uuid.uuid4().hex
-                goto(start_page, record_id=latest_record_id)
+                on_click=_continue_game,
+                args=(start_page, latest_record_id),
+            )
 
     with st.container(key="home_secondary"):
         prompt_column, records_column = st.columns(2, gap="medium")
