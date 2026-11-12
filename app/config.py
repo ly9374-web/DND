@@ -37,6 +37,7 @@ CHAT_RECORD_DIR = CHAT_RECORDS_DIR
 
 class AppStorageKeys:
     SYSTEM_PROMPT = "systemPrompt"
+    PAGE2_EVENT_HISTORY_TURNS = "page2EventHistoryTurns"
     PAGE2_CONTEXT_TURN_COUNT = "page2ContextTurnCount"
     PAGE2_SELECTED_CHAT_MODEL = "page2SelectedChatModel"
     PAGE2_CHAT_REASONING_ENABLED = "page2ChatReasoningEnabled"

@@ -126,3 +126,14 @@ body:not(.dnd-game-ready) .st-key-page2_dialogue_pane,body:not(.dnd-game-ready) 
 .st-key-page2_veil_row{position:relative}
 .st-key-page2_veil_row .st-key-page2_veil_auto{position:absolute;top:-2px;right:0;width:auto;z-index:2}
 .st-key-page2_veil_row .st-key-page2_veil_auto [data-testid="stWidgetLabel"]{display:none!important}
+
+/* Quick generation stays directly below the top-right media toggle. */
+#dnd-immersive-topbar{align-items:flex-start}
+#dnd-immersive-topbar .dnd-topbar-tools{display:flex;flex-direction:column;align-items:flex-end;gap:10px;pointer-events:none}
+#dnd-immersive-topbar .dnd-media-tools,#dnd-immersive-topbar .dnd-quick-generation{display:flex;gap:8px;pointer-events:auto}
+#dnd-immersive-topbar .dnd-quick-generation-button{width:34px;height:34px;justify-content:center;padding:7px}
+#dnd-immersive-topbar .dnd-quick-generation-button:disabled{opacity:.35;cursor:default}
+#dnd-immersive-topbar .dnd-quick-generation-button:enabled:hover{background:rgba(255,255,255,.12);border-color:#ffffff55}
+#dnd-immersive-topbar .dnd-quick-generation-button:focus-visible{outline:2px solid #bdd8ef;outline-offset:3px}
+.st-key-page2_quick_actions{display:none!important}
+body.dnd-right-open .st-key-page2_media_pane{top:126px!important;height:calc(100dvh - 150px)!important}

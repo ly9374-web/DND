@@ -1,3 +1,4 @@
+from app.services.task_control import check_cancel, wait_or_cancel
 import base64
 import time
 from dataclasses import dataclass
@@ -705,7 +706,8 @@ class ReplicateVideoAPIClient:
         return None
 
     @classmethod
-    def generate_wan_2_2_i2v_fast(cls, image_url, prompt, seconds=5):
+    def generate_wan_2_2_i2v_fast(cls, image_url, prompt, seconds=5, cancel_event=None):
+        check_cancel(cancel_event)
         validate_video_duration(WAN_MODEL, seconds)
         image_url = str(image_url or "").strip()
         prompt = str(prompt or "").strip()
@@ -787,6 +789,7 @@ class ReplicateVideoAPIClient:
             "Authorization": "Bearer " + effective_replicate_api_token,
         }
         for _ in range(200):
+            check_cancel(cancel_event)
             poll_response = requests.get(
                 poll_url,
                 headers=poll_headers,
@@ -810,7 +813,7 @@ class ReplicateVideoAPIClient:
             if status == "succeeded":
                 raise RuntimeError("Replicate Wan 视频任务未返回视频 URL：" + str(poll_data))
 
-            time.sleep(3)
+            wait_or_cancel(3, cancel_event)
 
         raise TimeoutError("Replicate Wan 2.2 I2V Fast 视频任务超时。")
 
@@ -823,7 +826,8 @@ class OpenRouterVideoAPIClient:
 
     @classmethod
     def generate_video(cls, *, model, prompt, seconds, aspect_ratio, image_url=None,
-                       generate_audio=True, resolution=None):
+                       generate_audio=True, resolution=None, cancel_event=None):
+        check_cancel(cancel_event)
         validate_video_duration(model, seconds)
         if model == WAN_MODEL:
             raise ValueError("Wan 视频请使用 Replicate API。")
@@ -868,6 +872,7 @@ class OpenRouterVideoAPIClient:
         deadline = time.monotonic() + cls.POLL_TIMEOUT_SECONDS
         errors = 0
         while True:
+            check_cancel(cancel_event)
             status = str(data.get("status") or "").lower()
             if status == "completed":
                 return poll_url + "/content?index=0"
@@ -876,7 +881,7 @@ class OpenRouterVideoAPIClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"OpenRouter 视频等待超时，请保留任务地址查询结果：{poll_url}")
-            time.sleep(min(cls.POLL_INTERVAL_SECONDS, remaining))
+            wait_or_cancel(min(cls.POLL_INTERVAL_SECONDS, remaining), cancel_event)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 continue

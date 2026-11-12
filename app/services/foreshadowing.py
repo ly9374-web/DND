@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
 from datetime import date
 import json
 import re
@@ -24,7 +23,7 @@ def selected_plan(config):
 
 def snapshot(config):
     plan = selected_plan(config)
-    return {**plan, "enabled": bool(config.get("enabled", True)) and bool(plan)}
+    return without_event_dates({**plan, "enabled": bool(config.get("enabled", True)) and bool(plan)})
 
 
 def _is_regex_term(term):
@@ -121,9 +120,13 @@ def game_state(turns):
         if calendar:
             if previous_date and calendar.month == 1 and previous_date.month == 12 and not re.search(r"\d{4}[年/-]", time_text):
                 calendar = date(previous_date.year + 1, calendar.month, calendar.day)
-            if origin is None:
-                origin = calendar.toordinal() - (int(day[1]) - 1 if day else state["day"] - 1)
-            state["day"] = calendar.toordinal() - origin + 1
+            if day and int(day[1]) > 0:
+                state["day"] = int(day[1])
+                origin = calendar.toordinal() - state["day"] + 1
+            else:
+                if origin is None:
+                    origin = calendar.toordinal() - state["day"] + 1
+                state["day"] = calendar.toordinal() - origin + 1
             state["calendar"] = calendar
         elif day and int(day[1]) > 0:
             state["day"] = int(day[1])
@@ -154,21 +157,13 @@ def due_events(plan, turns):
                 continue
             try:
                 minute = clock_minutes(event.get("time", ""))
-                if event.get("date"):
-                    current = state["calendar"]
-                    calendar = _calendar(event["date"], current.year if current else 2000)
-                    if current is None or calendar is None:
-                        continue
-                    due = calendar.toordinal() * 1440 + minute
-                    now = current.toordinal() * 1440 + state["minute"]
-                else:
-                    due = (int(event["day"]) - 1) * 1440 + minute
-                    now = (state["day"] - 1) * 1440 + state["minute"]
+                due = (int(event["day"]) - 1) * 1440 + minute
+                now = (state["day"] - 1) * 1440 + state["minute"]
                 if due <= now:
-                    copy = deepcopy(event)
-                    when = event.get("date") or f"第{event['day']}天"
+                    copy = without_event_dates({"time_events": [event]})["time_events"][0]
+                    when = f"第{event['day']}天"
                     copy["event_content"] = f"{when} {event['time']}：{event['event_content']}"
-                    # Sort on a shared relative axis when absolute and relative dates mix.
+                    # Sort by actual game day and time, including skipped times.
                     timed.append((due - now, copy))
             except (ValueError, TypeError, KeyError):
                 continue
@@ -202,26 +197,95 @@ def _json(text):
     return result
 
 
-def generate(stage, ctx, final_setting, answers="", questions=""):
+def extract_story_material(final_setting):
+    """Keep Markdown subtrees intact; also accept the app's numbered plain headings."""
+    from app.services.prompt_assets import FINAL_SECTION_HEADINGS
+    names = {re.sub(r"^\d+\.\s*", "", heading).replace(" ", ""): heading
+             for heading in FINAL_SECTION_HEADINGS}
+    lines = str(final_setting or "").splitlines()
+    headings = []
+    fence = None
+    for index, line in enumerate(lines):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence:
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + r"{" + str(fence[1]) + r",}\s*", line):
+                fence = None
+            continue
+        if marker:
+            fence = (marker[1][0], len(marker[1]))
+            continue
+        match = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)$", line)
+        if match:
+            level = len(match[1])
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", match[2] or "").strip()
+        elif line.strip() in FINAL_SECTION_HEADINGS and len(line) - len(line.lstrip()) <= 3:
+            level, title = 1, line.strip()
+        else:
+            continue
+        title = re.sub(r"^(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）:：]\s*", "", title)
+        headings.append((index, level, names.get(title.replace(" ", ""))))
+
+    material = ("2. 世界书", "3. 用户角色", "4. 其他角色")
+    # A character's own subheading named “世界书” is still part of its parent section.
+    levels = [level for _, level, name in headings if name in material]
+    section_level = min(levels) if levels else None
+    sections = {}
+    for position, (start, level, name) in enumerate(headings):
+        if level != section_level or name not in material:
+            continue
+        if name in sections:
+            raise ValueError(f"无法提取事件素材：分区标题“{name}”重复，请明确保留一份。")
+        end = next((line for line, next_level, _ in headings[position + 1:] if next_level <= level), len(lines))
+        content = "\n".join(lines[start + 1:end]).strip()
+        sections[name] = (lines[start].strip(), content)
+    required = material[:2]
+    missing = [name for name in required if name not in sections or not sections[name][1]]
+    if missing:
+        raise ValueError("无法提取事件素材，请补齐最终设定分区：" + "、".join(missing))
+    parts = []
+    for name in material:
+        if name in sections:
+            heading, content = sections[name]
+            if content:
+                parts.append(heading + "\n" + content)
+    return "\n\n".join(parts)
+
+
+def generation_context(final_setting, turns=None, story_brain="", history_turn_count=6):
     from app.services import page2_service
-    system, user = {
-        "questions": (prompts.QUESTIONS_SYSTEM, prompts.QUESTIONS_USER),
-        "events": (prompts.EVENTS_SYSTEM, prompts.EVENTS_USER),
-    }[stage]
-    result = page2_service._send_with_current_chat_model(
-        ctx=replace(ctx, selected_chat_model="deepseekFlash", chat_reasoning_enabled=False) if stage == "questions" else ctx,
-        system_prompt=system, context_messages=[],
-        user_message=user.format(
-            final_setting=final_setting,
-            questions=str(questions or "").strip() or "空",
-            answers=str(answers or "").strip() or "空"),
-        temperature=0.8, thinking_enabled=stage != "questions",
-        log_label={"questions": "事件问卷", "events": "生成背景与事件"}[stage],
+    turns = list(turns or [])
+    state = game_state(turns)
+    minute = state["minute"]
+    initial = f"游戏第{state['day']}天"
+    if minute is not None:
+        initial += f" {minute // 60:02d}:{minute % 60:02d}"
+    elif turns:
+        initial = "未解析到明确时分，请以最新一轮聊天及Story Brain中的最新游戏时间为初始时间，不使用现实时间，不默认重置为游戏第1天。"
+    else:
+        initial += " 00:00（尚未开局，按开局第1天零点起算）"
+    if not turns:
+        state["minute"] = 0
+    recent = page2_service.build_context_messages(
+        [turn for turn in turns if successful(turn)], max(1, int(history_turn_count))
     )
-    if stage == "questions":
-        if not str(result or "").strip():
-            raise ValueError("模型返回了空内容，请重试。")
-        return str(result).strip()
+    history = "\n\n".join(("用户：" if item["role"] == "user" else "助手：") + item["content"] for item in recent)
+    return {
+        "final_setting": extract_story_material(final_setting),
+        "history": history or "暂无", "story_brain": str(story_brain or "").strip() or "暂无",
+        "initial_time": initial, "clock": state,
+    }
+
+
+def generate(stage, ctx, final_setting, *, turns=None, story_brain="", history_turn_count=6, captured_context=None):
+    from app.services import page2_service
+    if stage != "events":
+        raise ValueError("事件生成已取消问卷，请直接生成事件。")
+    context = captured_context or generation_context(final_setting, turns, story_brain, history_turn_count)
+    result = page2_service._send_with_current_chat_model(
+        ctx=ctx, system_prompt=prompts.EVENTS_SYSTEM, context_messages=[],
+        user_message=prompts.EVENTS_USER.format(**context),
+        temperature=0.8, thinking_enabled=True, log_label="生成背景与事件",
+    )
     data = _json(result)
     if not isinstance(data.get("story"), str) or not data["story"].strip():
         raise ValueError("模型没有返回故事背景，请重新生成；原方案未被修改。")
@@ -241,8 +305,49 @@ def generate(stage, ctx, final_setting, answers="", questions=""):
                 if not isinstance(event.get("title"), str) or not event["title"].strip():
                     raise ValueError("时间事件必须包含名称。")
                 clock_minutes(event.get("time", ""))
-                if type(event.get("day")) is not int or not 1 <= event["day"] <= 4:
-                    raise ValueError("生成的时间事件应在第1至第4天内。")
+                if type(event.get("day")) is not int or event["day"] < 1:
+                    raise ValueError("时间事件的游戏天数必须为正整数。")
+                clock = context["clock"]
+                if clock["minute"] is not None:
+                    offset = (event["day"] - clock["day"]) * 1440 + clock_minutes(event["time"]) - clock["minute"]
+                    if not 0 <= offset <= 48 * 60:
+                        raise ValueError("时间事件必须位于本次生成初始时间点起未来48小时内；原方案未被修改。")
+                event.pop("date", None)
             event["id"] = uuid4().hex
             event["enabled"] = True
     return {key: data[key] for key in ("story", "scene_events", "time_events")}
+
+
+def add_generated_plan(config, result):
+    config = deepcopy(config)
+    plan = new_plan(f"事件方案 {len(config.get('plans', [])) + 1}")
+    plan.update(deepcopy(result))
+    config.setdefault("plans", []).append(plan)
+    config.update(selected_plan_id=plan["id"], enabled=True)
+    return config
+
+
+def without_event_dates(plan):
+    """Legacy date fields no longer override the game's day/time schedule."""
+    plan = deepcopy(plan or {})
+    for event in plan.get("time_events", []):
+        event.pop("date", None)
+        event["event_content"] = str(event.get("event_content") or "").replace(
+            "将时间和发生具体时间和日期在story brain中。",
+            "将事件发生在游戏第几天、几点几分记录在story brain中。",
+        )
+    return plan
+
+
+def validate_plan(plan):
+    """Validate manual edits without imposing generation's 5+5 or 48-hour limits."""
+    for event in plan.get("scene_events", []):
+        validate_patterns(event.get("patterns"))
+        if not str(event.get("location") or "").strip() or not str(event.get("event_content") or "").strip():
+            raise ValueError("场景事件的地点和内容不能为空。")
+    for event in plan.get("time_events", []):
+        clock_minutes(event.get("time", ""))
+        if type(event.get("day")) is not int or event["day"] < 1:
+            raise ValueError("游戏第几天必须为正整数。")
+        if not str(event.get("title") or "").strip() or not str(event.get("event_content") or "").strip():
+            raise ValueError("时间事件的名称和内容不能为空。")

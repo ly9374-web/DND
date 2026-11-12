@@ -12,7 +12,21 @@
   const veil=doc.createElement('div');veil.id='dnd-immersive-veil';
   const bar=doc.createElement('div');bar.id='dnd-immersive-topbar';
   const left=doc.createElement('button');left.type='button';left.setAttribute('aria-label','游戏设置');left.innerHTML=svg('<path d="M4 6h16M4 12h11M4 18h16"/>');
-  const right=doc.createElement('button');right.type='button';right.setAttribute('aria-label','图片与视频');right.innerHTML=svg('<path d="M4 7h16M4 17h16M8 4v6M16 14v6"/>')+'<span>图片与视频</span>';const tools=doc.createElement('div');tools.style.cssText='display:flex;gap:8px;pointer-events:auto';const play=doc.createElement('button'),sound=doc.createElement('button');play.type=sound.type='button';play.hidden=sound.hidden=true;play.setAttribute('aria-label','暂停背景视频');play.title='播放／暂停背景视频';play.innerHTML=svg('<path d="M8 4v16M16 4v16"/>');sound.setAttribute('aria-label','开启背景声音');sound.title='静音／声音';sound.innerHTML=svg('<path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8"/>');tools.append(play,sound,right);bar.append(left,tools);
+  const right=doc.createElement('button');right.type='button';right.setAttribute('aria-label','图片与视频');right.innerHTML=svg('<path d="M4 7h16M4 17h16M8 4v6M16 14v6"/>')+'<span>图片与视频</span>';
+  const tools=doc.createElement('div');tools.className='dnd-topbar-tools';
+  const mediaTools=doc.createElement('div');mediaTools.className='dnd-media-tools';
+  const play=doc.createElement('button'),sound=doc.createElement('button');play.type=sound.type='button';play.hidden=sound.hidden=true;play.setAttribute('aria-label','暂停背景视频');play.title='播放／暂停背景视频';play.innerHTML=svg('<path d="M8 4v16M16 4v16"/>');sound.setAttribute('aria-label','开启背景声音');sound.title='静音／声音';sound.innerHTML=svg('<path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8"/>');mediaTools.append(play,sound,right);
+  const quickTools=doc.createElement('div');quickTools.className='dnd-quick-generation';quickTools.setAttribute('role','group');quickTools.setAttribute('aria-label','快捷生成');
+  const quickActions=[
+    ['image','一键生成图片','<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 16 5-5 4 4 3-3 6 6"/>'],
+    ['video','一键生成视频','<rect x="3" y="5" width="13" height="14" rx="3"/><path d="m16 10 5-3v10l-5-3"/>'],
+    ['events','生成事件','<path d="m13 2-3 7-7 3 7 3 3 7 3-7 6-3-6-3z"/>'],
+  ].map(([key,label,path])=>{
+    const button=doc.createElement('button');button.type='button';button.className='dnd-quick-generation-button';button.dataset.action=key;button.title=label;button.setAttribute('aria-label',label);button.innerHTML=svg(path);button.disabled=true;
+    button.onclick=()=>{const native=$('.st-key-page2_quick_'+key+' button');if(native&&!native.disabled)native.click();};
+    quickTools.append(button);return{key,button};
+  });
+  tools.append(mediaTools,quickTools);bar.append(left,tools);
   play.onclick=()=>video.paused?video.play().catch(()=>{}):video.pause();sound.onclick=()=>{video.muted=!video.muted;sound.setAttribute('aria-pressed',String(!video.muted));sound.setAttribute('aria-label',video.muted?'开启背景声音':'关闭背景声音');};
   const resize=doc.createElement('div');resize.id='dnd-chat-resize';resize.tabIndex=0;resize.setAttribute('role','separator');resize.setAttribute('aria-orientation','horizontal');resize.setAttribute('aria-label','上下拖动调整聊天记录高度');resize.innerHTML=svg('<path d="M12 3v18m-4-14 4-4 4 4M8 17l4 4 4-4"/>');
   ($('.stApp')||body).append(bg,veil,bar,resize);
@@ -63,7 +77,10 @@
   function maxHeight(){return Math.max(100,host.innerHeight-84-58-6-brainHeight());}
   function sync(light=false){
     collapseSidebarOnce();
-    const h=history();if(!h)return;
+    for(const {key,button} of quickActions){const native=$('.st-key-page2_quick_'+key+' button');const disabled=!native||native.disabled;if(button.disabled!==disabled)button.disabled=disabled;}
+    // Streamlit omits the empty history container in a brand-new game.
+    // Drawer controls and layout must still work before the first message.
+    const h=history();
     body.classList.toggle('dnd-right-open',state.right);
     body.classList.toggle('dnd-brain-open',state.reveal>0);
     const openLeft=sidebarOpen(),side=Math.min(301,host.innerWidth<=850?host.innerWidth*.42:301),gap=host.innerWidth<=850?20:48,margin=host.innerWidth<=850?10:14;
@@ -76,7 +93,7 @@
     set('veil-height',(height+brainH+64)+'px');
     resize.style.left='var(--dnd-left)';resize.style.right='var(--dnd-right)';resize.style.top='calc(100dvh - var(--dnd-veil-height) - 9px)';resize.style.width='auto';
     resize.setAttribute('aria-valuemin','100');resize.setAttribute('aria-valuemax',String(Math.round(maxHeight())));resize.setAttribute('aria-valuenow',String(Math.round(height)));
-    if(!light){if(state.anchorPinned)pinExchange();else if(state.stickBottom)setScroll(h,h.scrollHeight);}
+    if(!light&&h){if(state.anchorPinned)pinExchange();else if(state.stickBottom)setScroll(h,h.scrollHeight);}
   }
   let scheduled=0;
   function schedule(){if(!scheduled)scheduled=host.requestAnimationFrame(()=>{scheduled=0;sync();});}
@@ -236,11 +253,11 @@
       const t=m.target;
       if(ours.has(t)||t.closest?.('#dnd-immersive-topbar,#dnd-chat-resize,#dnd-immersive-bg,#dnd-immersive-veil'))continue;
       if(t.closest?.('.st-key-page2_veil_opacity'))veilChanged=true;
-      if(m.type==='childList'||m.attributeName==='aria-expanded'||m.attributeName==='src')relayout=true;
+      if(m.type==='childList'||m.attributeName==='aria-expanded'||m.attributeName==='src'||m.attributeName==='disabled')relayout=true;
     }
     if(veilChanged)previewVeil();
     if(relayout){checkLifecycle();bindComposer();schedule();if($('.st-key-page2_chat_input textarea'))ready();const editor=$('.st-key-page2_brain_editor textarea');if(editor&&editor!==state.editor){state.editor=editor;editor.focus();}}
-  });observer.observe($('.stApp')||body,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-expanded','src','value','aria-valuenow','aria-valuetext']});
+  });observer.observe($('.stApp')||body,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-expanded','src','value','aria-valuenow','aria-valuetext','disabled']});
   function hideOverlays(){[bg,veil,bar,resize].forEach(n=>{if(n.style.display!=='none')n.style.display='none';});}
   function showOverlays(){[bg,veil,bar,resize].forEach(n=>{if(n.style.display==='none')n.style.display='';});}
   function checkLifecycle(){

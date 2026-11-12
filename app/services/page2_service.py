@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.task_control import check_cancel
+
 import base64
 import binascii
 import io
@@ -673,7 +675,9 @@ def generate_video_from_image(
     generate_audio: bool = True,
     resolution: str | None = None,
     allow_temporary_upload: bool = False,
+    cancel_event=None,
 ) -> GeneratedImageRecord:
+    check_cancel(cancel_event)
     prompt = str(prompt or "").strip()
     if not prompt:
         raise ValueError("视频 prompt 不能为空，请先生成或填写视频 prompt。")
@@ -689,9 +693,11 @@ def generate_video_from_image(
         allow_temporary_upload=allow_temporary_upload,
     )
 
+    check_cancel(cancel_event)
     if provider == WAN_MODEL:
         video_url = ReplicateVideoAPIClient.generate_wan_2_2_i2v_fast(
             image_reference, prompt, seconds=seconds,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
         )
         effective_seconds = WAN_DURATION_FRAMES[seconds] / WAN_FPS
     else:
@@ -704,9 +710,11 @@ def generate_video_from_image(
             aspect_ratio=aspect_ratio,
             generate_audio=generate_audio,
             resolution=resolution,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
         )
         effective_seconds = int(seconds)
 
+    check_cancel(cancel_event)
     return GeneratedImageRecord(
         provider=source_record.provider,
         prompt=prompt,
@@ -726,7 +734,9 @@ def generate_video_from_image(
 def generate_video_from_text(
     *, ctx: Page2Context, prompt: str, seconds: int,
     aspect_ratio: str = "16:9", resolution: str = "480p", generate_audio: bool = True,
+    cancel_event=None,
 ) -> GeneratedImageRecord:
+    check_cancel(cancel_event)
     provider = str(ctx.selected_video_generation_provider or WAN_MODEL).strip()
     if provider != WAN3_MODEL:
         raise ValueError("当前视频模型不支持纯文字生成。")
@@ -740,7 +750,9 @@ def generate_video_from_text(
     video_url = OpenRouterVideoAPIClient.generate_video(
         model=provider, prompt=prompt, seconds=seconds,
         aspect_ratio=aspect_ratio, resolution=resolution, generate_audio=generate_audio,
+        **({"cancel_event": cancel_event} if cancel_event is not None else {}),
     )
+    check_cancel(cancel_event)
     return GeneratedImageRecord(
         provider=provider, prompt=prompt, media_kind=GeneratedMediaKind.VIDEO,
         video_url_string=video_url, duration_seconds=seconds,

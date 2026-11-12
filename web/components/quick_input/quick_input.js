@@ -297,6 +297,7 @@
     const setter = Object.getOwnPropertyDescriptor(host.HTMLTextAreaElement.prototype, "value")?.set;
     if (!setter) { inserting = false; return; }
     setter.call(input, next);
+    input.focus({ preventScroll: true });
     input.setSelectionRange(caret, caret);
     rememberComposerCaret(input);
     input.dispatchEvent(new host.Event("input", { bubbles: true }));

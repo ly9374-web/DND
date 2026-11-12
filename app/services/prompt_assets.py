@@ -784,14 +784,23 @@ def build_final_prompt(
         ("5. DM 的核心任务", dm_core),
         ("6. 回复格式要求", response_format),
     ]
-    return "\n\n".join(f"{heading}\n{content}".strip() for heading, content in sections)
+    return "\n\n".join(f"# {heading.split('. ', 1)[1]}\n{content}".strip() for heading, content in sections)
+
+
+def _final_section_heading(line: str) -> str:
+    """Map new Markdown headings to the existing internal section keys."""
+    heading = line.strip()
+    if heading.startswith("# "):
+        return next((old for old in FINAL_SECTION_HEADINGS
+                     if old.split(". ", 1)[1] == heading[2:].strip()), heading)
+    return heading
 
 
 def _parse_final_sections(prompt: str) -> dict[str, tuple[str, int]]:
     lines = str(prompt or "").strip().splitlines()
     positions: dict[str, list[int]] = {heading: [] for heading in FINAL_SECTION_HEADINGS}
     for index, line in enumerate(lines):
-        stripped = line.strip()
+        stripped = _final_section_heading(line)
         if stripped in positions:
             positions[stripped].append(index)
 
@@ -835,7 +844,7 @@ def _parse_available_final_sections(prompt: str) -> dict[str, tuple[str, int]]:
     lines = str(prompt or "").strip().splitlines()
     positions: dict[str, list[int]] = {heading: [] for heading in FINAL_SECTION_HEADINGS}
     for index, line in enumerate(lines):
-        stripped = line.strip()
+        stripped = _final_section_heading(line)
         if stripped in positions:
             positions[stripped].append(index)
 

@@ -612,15 +612,15 @@ if "test_task" not in st.session_state:
     st.session_state.test_task = task
     st.session_state.page2_active_operation = task
     st.session_state.page2_operation_queue = [page2._Page2OperationTask(kind="video", label="视频", scope_id="test", payload={"workflow_id": "flow"}), page2._Page2OperationTask(kind="image", label="其他图片", scope_id="test")]
-page2._render_media_operation_status()
+page2._render_generation_toasts()
 ''').run()
         self.assertEqual(len(app.exception), 0)
-        next(button for button in app.button if button.label == "停止轮询").click().run()
+        next(button for button in app.button if button.label == "停止任务").click().run()
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(app.session_state.test_task.image_cancel.is_set())
         self.assertIsNone(app.session_state.page2_active_operation)
         self.assertEqual(len(app.session_state.page2_operation_queue), 1)
-        self.assertEqual(app.session_state.page2_operation_notice, "已停止轮询")
+        self.assertIn("已停止任务", app.session_state.page2_operation_notice)
 
     def test_late_image_is_not_cached(self):
         from web.pages import page2
