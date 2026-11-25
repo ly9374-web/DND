@@ -19,6 +19,7 @@
       gap:12px;padding:9px 12px;border-radius:6px;cursor:pointer;white-space:pre-wrap;overflow-wrap:anywhere;}
     #${menuId} [aria-selected=true]{background:#334155;}
     #${menuId} small{color:#aab8cc;flex-shrink:0;}
+    #${menuId}-hint{color:#aab8cc;padding:6px 12px;font-size:12px;}
     div[data-testid="stVerticalBlock"].st-key-page2_chat_canvas.dnd-quick-input-open,
     .st-key-page2_chat_canvas.dnd-quick-input-open{
       padding-bottom:calc(14px + var(--dnd-quick-input-height)) !important;}
@@ -129,6 +130,14 @@
       doc.body.appendChild(menu);
     }
     menu.replaceChildren();
+    if (!query && config.options.every(item => isOperation(item))) {
+      const hint = doc.createElement("div");
+      hint.id = `${menuId}-hint`;
+      hint.textContent = "暂无自定义快捷输入，可在首页「prompt → 快捷输入」中添加。";
+      hint.setAttribute("role", "presentation");
+      menu.setAttribute("aria-describedby", hint.id);
+      menu.appendChild(hint);
+    } else menu.removeAttribute("aria-describedby");
     matches.forEach((item, index) => {
       const row = doc.createElement("div");
       row.id = `${menuId}-${index}`;
@@ -350,8 +359,9 @@
   host.visualViewport?.addEventListener("scroll", position);
   const observer = new host.MutationObserver(() => {
     if (active && !active.input.isConnected) close();
-    // Navigation/logout removes the composer; discard candidate contents and handlers.
-    if (!doc.querySelector(selector)) destroy();
+    // The native textarea can mount after this bridge or be replaced on a rerun.
+    // Clear shortcuts when navigation removes the entire composer.
+    if (!doc.querySelector(".st-key-page2_chat_composer")) destroy();
   });
   observer.observe(doc.body, { childList: true, subtree: true });
   function destroy() {

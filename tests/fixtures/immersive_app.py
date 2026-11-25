@@ -3,6 +3,7 @@ import base64
 import os
 from pathlib import Path
 import sys
+import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 assert os.environ.get("VS_IMAGE_NOVEL_DATA_DIR"), "Use an isolated data directory"
 import requests
@@ -41,7 +42,14 @@ if "immersive_fixture_seeded" not in st.session_state:
 
 page2_service.load_context_from_settings = page2_service.default_context
 page2_service.send_message = lambda **kwargs: "正式消息接口的本地模拟回复"
-page2_service.generate_image_prompt = lambda **kwargs: "本地模拟图片提示词"
+
+
+def generate_image_prompt(**kwargs):
+    time.sleep(1.5)  # Keep the background toast visible long enough to inspect it.
+    return "本地模拟图片提示词"
+
+
+page2_service.generate_image_prompt = generate_image_prompt
 page2_service.generate_image = lambda **kwargs: GeneratedImageRecord(
     provider=kwargs["provider"], prompt=kwargs["prompt"],
     image_data_base64=base64.b64encode(Path(os.environ["DND_UI_FIXTURE_IMAGE"]).read_bytes()).decode(),

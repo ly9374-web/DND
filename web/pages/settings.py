@@ -9,6 +9,7 @@ from app.config import AppStorageKeys, settings, user_facing_error_message
 from app.models import (
     CHAT_MODEL_LABELS,
     CHAT_MODEL_OPTIONS,
+    Page2ChatModel,
     chat_model_supports_reasoning,
 )
 from app.services import prompt_assets, quick_inputs, system_prompts
@@ -278,6 +279,80 @@ def _render_final_setting_dialog(state) -> None:
     _dialog()
 
 
+def _close_final_setting_sync_dialog() -> None:
+    st.session_state["final_setting_sync_dialog_open"] = False
+
+
+def _render_final_setting_sync_dialog(
+    state,
+    record,
+    *,
+    title: str,
+    prompt: str,
+    long_term_memory: str,
+    title_key: str,
+    prompt_key: str,
+    memory_key: str,
+) -> None:
+    @st.dialog("一键同步", on_dismiss=_close_final_setting_sync_dialog)
+    def _dialog():
+        sync_error = ""
+        st.caption("当前设定 → 固定模板、世界书、角色卡、长期记忆")
+        if st.button(
+            "以当前设定同步之前设定",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                updated_labels = prompt_assets.sync_final_setting(
+                    state,
+                    record,
+                    title=title,
+                    prompt=prompt,
+                    long_term_memory=long_term_memory,
+                    first_inputs=list(record.first_inputs),
+                    selected_first_input_id=record.selected_first_input_id,
+                )
+            except Exception as exc:
+                sync_error = user_facing_error_message(exc)
+            else:
+                prompt_draft_guard.saved(title_key, prompt_key, memory_key)
+                _sync_page2_prompt_widget(prompt)
+                if updated_labels:
+                    details = "、".join(updated_labels)
+                    st.session_state["prompt_settings_flash"] = (
+                        f"已保存最终设定，并同步：{details}。"
+                    )
+                else:
+                    st.session_state["prompt_settings_flash"] = (
+                        "已保存最终设定；关联素材内容没有变化。"
+                    )
+                st.session_state["final_setting_sync_dialog_open"] = False
+                st.rerun()
+        st.caption("固定模板、世界书、角色卡、长期记忆 → 当前设定")
+        if st.button("以之前设定同步当前设定", use_container_width=True):
+            try:
+                new_prompt, new_memory = prompt_assets.restore_final_setting_from_sources(
+                    state, record
+                )
+            except Exception as exc:
+                sync_error = user_facing_error_message(exc)
+            else:
+                st.session_state[prompt_key] = new_prompt
+                st.session_state[memory_key] = new_memory
+                prompt_draft_guard.saved(title_key, prompt_key, memory_key)
+                _sync_page2_prompt_widget(new_prompt)
+                st.session_state["prompt_settings_flash"] = (
+                    "已用关联素材覆盖当前最终设定。"
+                )
+                st.session_state["final_setting_sync_dialog_open"] = False
+                st.rerun()
+        if sync_error:
+            st.error(sync_error)
+
+    _dialog()
+
+
 def _render_first_input_editor(state, selected_record, *, is_guest: bool) -> None:
     if selected_record is None:
         return
@@ -529,37 +604,12 @@ def _render_final_settings(is_guest: bool) -> None:
             _sync_page2_prompt_widget(prompt)
             st.session_state["prompt_settings_flash"] = "已保存最终设定。"
             st.rerun()
-        sync_error = ""
         if sync_col.button(
             "一键同步",
             use_container_width=True,
             disabled=is_guest or selected_record is None,
         ):
-            try:
-                updated_labels = prompt_assets.sync_final_setting(
-                    state,
-                    selected_record,
-                    title=title,
-                    prompt=prompt,
-                    long_term_memory=long_term_memory,
-                    first_inputs=list(selected_record.first_inputs),
-                    selected_first_input_id=selected_record.selected_first_input_id,
-                )
-            except Exception as exc:
-                sync_error = user_facing_error_message(exc)
-            else:
-                prompt_draft_guard.saved(title_key, prompt_key, memory_key)
-                _sync_page2_prompt_widget(prompt)
-                if updated_labels:
-                    details = "、".join(updated_labels)
-                    st.session_state["prompt_settings_flash"] = (
-                        f"已保存最终设定，并同步：{details}。"
-                    )
-                else:
-                    st.session_state["prompt_settings_flash"] = (
-                        "已保存最终设定；关联素材内容没有变化。"
-                    )
-                st.rerun()
+            st.session_state["final_setting_sync_dialog_open"] = True
         if new_col.button("新建", use_container_width=True, disabled=is_guest):
             st.session_state["final_setting_dialog_open"] = True
         if delete_col.button(
@@ -568,8 +618,21 @@ def _render_final_settings(is_guest: bool) -> None:
             disabled=is_guest or selected_record is None,
         ) and selected_record is not None:
             request_delete("final_setting", selected_record.id, selected_record.title or "未命名最终设定")
-        if sync_error:
-            st.error(sync_error)
+
+    if (
+        st.session_state.get("final_setting_sync_dialog_open")
+        and selected_record is not None
+    ):
+        _render_final_setting_sync_dialog(
+            state,
+            selected_record,
+            title=title,
+            prompt=prompt,
+            long_term_memory=long_term_memory,
+            title_key=title_key,
+            prompt_key=prompt_key,
+            memory_key=memory_key,
+        )
 
     if st.session_state.get("final_setting_dialog_open"):
         _render_final_setting_dialog(state)
@@ -783,9 +846,6 @@ def _render_world_book_dialog() -> None:
         error = str(st.session_state.pop(_refinement_state_key("world_book", "error"), "") or "")
         if error:
             st.error(error)
-        prompt_draft_guard.protect(
-            "world_book_generator_description", "", "世界背景介绍", requires_commit=False
-        )
         description = st.text_area("世界背景介绍", height=320, key="world_book_generator_description")
         generate_col, cancel_col = st.columns(2)
         with generate_col:
@@ -953,6 +1013,9 @@ def _render_text_asset(
             st.session_state["prompt_settings_flash"] = f"已保存{content_label}。"
             st.rerun()
         if new_col.button("新建", use_container_width=True, disabled=is_guest):
+            if kind == "world_book":
+                st.session_state.pop("world_book_generator_description", None)
+                st.session_state["world_book_generator_model"] = Page2ChatModel.DEEPSEEK_PRO.value
             st.session_state[dialog_state_key] = True
         if delete_col.button(
             "删除",

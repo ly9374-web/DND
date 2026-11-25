@@ -6,16 +6,20 @@
   const state={scope:null,config:null,height:host.innerHeight/2,reveal:0,right:false,gesture:newGesture(),source:null,stickBottom:true,historyIntentUntil:0,historyAnchor:null,requestedSections:new Set(),collapseSidebar:false,anchorTurn:'',anchorPinned:false,scrollWriteAt:-Infinity,firstConfig:true};
   const build=host.__dndImmersiveBuild||'';
   let entryFrame=0,leaveTimer=0,anchorFrame=0,composerNode=null,wheelLock=null,wheelLockTimer=0;
+  const reducedMotion=host.matchMedia('(prefers-reduced-motion: reduce)');
+  let bounceNode=null,bouncePull=0,bounceOffset=0,bounceAnimation=null,historyTouch=null,lastEdgeWheel=-Infinity;
   const svg=p=>`<svg viewBox="0 0 24 24" aria-hidden="true">${p}</svg>`;
   const bg=doc.createElement('div');bg.id='dnd-immersive-bg';
-  const edge=doc.createElement('canvas'),image=doc.createElement('img'),video=doc.createElement('video');image.alt='';image.crossOrigin='anonymous';video.crossOrigin='anonymous';video.muted=true;video.loop=true;video.playsInline=true;bg.append(edge,image,video);
+  const edge=doc.createElement('canvas'),image=doc.createElement('img'),video=doc.createElement('video');image.alt='';image.crossOrigin='anonymous';video.crossOrigin='anonymous';video.muted=true;video.playsInline=true;bg.append(edge,image,video);
   const veil=doc.createElement('div');veil.id='dnd-immersive-veil';
   const bar=doc.createElement('div');bar.id='dnd-immersive-topbar';
   const left=doc.createElement('button');left.type='button';left.setAttribute('aria-label','游戏设置');left.innerHTML=svg('<path d="M4 6h16M4 12h11M4 18h16"/>');
-  const right=doc.createElement('button');right.type='button';right.setAttribute('aria-label','图片与视频');right.innerHTML=svg('<path d="M4 7h16M4 17h16M8 4v6M16 14v6"/>')+'<span>图片与视频</span>';
+  const right=doc.createElement('button');right.type='button';right.className='dnd-media-toggle';right.setAttribute('aria-label','图片与视频');right.innerHTML=svg('<path d="M4 7h16M4 17h16M8 4v6M16 14v6"/>')+'<span>图片与视频</span>';
   const tools=doc.createElement('div');tools.className='dnd-topbar-tools';
   const mediaTools=doc.createElement('div');mediaTools.className='dnd-media-tools';
-  const play=doc.createElement('button'),sound=doc.createElement('button');play.type=sound.type='button';play.hidden=sound.hidden=true;play.setAttribute('aria-label','暂停背景视频');play.title='播放／暂停背景视频';play.innerHTML=svg('<path d="M8 4v16M16 4v16"/>');sound.setAttribute('aria-label','开启背景声音');sound.title='静音／声音';sound.innerHTML=svg('<path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8"/>');mediaTools.append(play,sound,right);
+  const play=doc.createElement('button'),sound=doc.createElement('button');play.type=sound.type='button';play.hidden=sound.hidden=true;
+  play.className='dnd-background-playback';
+  sound.setAttribute('aria-label','开启背景声音');sound.title='静音／声音';sound.innerHTML=svg('<path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8"/>');mediaTools.append(sound,right);
   const quickTools=doc.createElement('div');quickTools.className='dnd-quick-generation';quickTools.setAttribute('role','group');quickTools.setAttribute('aria-label','快捷生成');
   const quickActions=[
     ['image','一键生成图片','<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 16 5-5 4 4 3-3 6 6"/>'],
@@ -26,8 +30,13 @@
     button.onclick=()=>{const native=$('.st-key-page2_quick_'+key+' button');if(native&&!native.disabled)native.click();};
     quickTools.append(button);return{key,button};
   });
-  tools.append(mediaTools,quickTools);bar.append(left,tools);
-  play.onclick=()=>video.paused?video.play().catch(()=>{}):video.pause();sound.onclick=()=>{video.muted=!video.muted;sound.setAttribute('aria-pressed',String(!video.muted));sound.setAttribute('aria-label',video.muted?'开启背景声音':'关闭背景声音');};
+  tools.append(mediaTools,quickTools);bar.append(left,play,tools);
+  play.onclick=()=>{
+    if(state.source!==video)return;
+    if(video.paused||video.ended)startBackgroundVideo();
+    else video.pause();
+  };
+  sound.onclick=()=>{video.muted=!video.muted;sound.setAttribute('aria-pressed',String(!video.muted));sound.setAttribute('aria-label',video.muted?'开启背景声音':'关闭背景声音');};
   const resize=doc.createElement('div');resize.id='dnd-chat-resize';resize.tabIndex=0;resize.setAttribute('role','separator');resize.setAttribute('aria-orientation','horizontal');resize.setAttribute('aria-label','上下拖动调整聊天记录高度');resize.innerHTML=svg('<path d="M12 3v18m-4-14 4-4 4 4M8 17l4 4 4-4"/>');
   ($('.stApp')||body).append(bg,veil,bar,resize);
   const history=()=>$('.st-key-page2_chat_history'),brain=()=>$('.st-key-page2_brain_scroll');
@@ -100,6 +109,8 @@
   function reveal(open){
     state.reveal=open?Math.min(300,Math.max(140,Math.round(host.innerHeight*.36))):0;
     sync();
+    const scroll=brain();
+    if(open&&scroll)scroll.scrollTop=0;
   }
   function requestSection(section){
     if(state.config?.sections?.includes(section)||state.requestedSections.has(section))return;
@@ -133,17 +144,17 @@
   }
   /* A composer toggle moves the layout under a stationary pointer, so the
      tail of the trackpad gesture (including momentum) would otherwise land on
-     the chat history and scroll it. Only the remaining travel of the triggering
-     gesture is swallowed; a decisive contrary flick counts as a new gesture and
-     is released at once, so a second swipe never needs an extra click before it
-     is heard. Anything over the story brain is reading input and stays native,
-     which is why the panel responds to the wheel without being clicked. */
-  function lockWheel(dir){
+     the reading surfaces and scroll them. Release the lock as soon as the
+     pointer moves or a decisive contrary flick starts a new gesture. */
+  function lockWheel(trigger){
+    const dir=Math.sign(trigger.deltaY);
     host.clearTimeout(wheelLockTimer);
     if(!wheelLock){
       wheelLock=e=>{
         if(e.ctrlKey||!e.deltaY)return;
-        if(e.target?.closest?.('.st-key-page2_story_brain_panel')||Math.sign(e.deltaY)!==dir&&Math.abs(e.deltaY)>6){unlockWheel();return;}
+        const moved=Math.hypot(e.clientX-trigger.clientX,e.clientY-trigger.clientY)>4;
+        const reversed=Math.sign(e.deltaY)!==dir&&Math.abs(e.deltaY)>6;
+        if(moved||reversed){unlockWheel();return;}
         e.preventDefault();host.clearTimeout(wheelLockTimer);wheelLockTimer=host.setTimeout(unlockWheel,160);
       };
       host.addEventListener('wheel',wheelLock,{passive:false,capture:true});
@@ -166,20 +177,92 @@
     if(e.ctrlKey||Math.abs(e.deltaX)>Math.abs(e.deltaY)||!e.deltaY)return;
     e.preventDefault();
     if(editingBrain()&&e.deltaY<0)return;
-    if(gestureToggle(e)){const dir=Math.sign(e.deltaY);lockWheel(dir);reveal(dir>0);}
+    if(gestureToggle(e)){lockWheel(e);reveal(e.deltaY>0);}
+  }
+  function resetHistoryBounce(){
+    bounceAnimation?.cancel();bounceAnimation=null;
+    bounceNode?.style.removeProperty('translate');
+    bounceNode=null;bouncePull=0;bounceOffset=0;
+  }
+  function releaseHistoryBounce(){
+    animateHistoryBounce(bounceNode,bounceOffset);
+  }
+  function animateHistoryBounce(node,offset,showPull=false){
+    resetHistoryBounce();
+    if(!node?.isConnected||!offset||reducedMotion.matches)return;
+    const pullDuration=showPull ? 31 : 0;
+    const returnDuration=showPull ? 458 : 520;
+    const duration=pullDuration+returnDuration;
+    const pullEnd=pullDuration/duration;
+    const reboundEnd=(pullDuration+returnDuration*(showPull ? .72 : .75))/duration;
+    const frames=[
+      {translate:`0 ${-offset}px`,offset:pullEnd,easing:'cubic-bezier(.18,.65,.35,1)'},
+      {translate:`0 ${offset*.16}px`,offset:reboundEnd,easing:'ease-out'},
+      {translate:'0 0px'},
+    ];
+    if(showPull)frames.unshift({translate:'0 0px',offset:0,easing:'ease-out'});
+    const animation=node.animate(frames,{duration});
+    bounceAnimation=animation;
+    animation.onfinish=()=>{if(bounceAnimation===animation)bounceAnimation=null;};
+  }
+  function historyOvertravel(h,delta){
+    const remaining=h.scrollHeight-h.clientHeight-h.scrollTop;
+    return delta-Math.max(0,remaining-1);
   }
   /* The story brain is a reading surface: swiping it only moves its own
      content and stops at the top edge instead of collapsing the panel, so
      trackpad momentum can never close it. */
   const onWheel=e=>{
-    if(wheelLock)return;
-    if(e.deltaY&&e.target.closest?.('.st-key-page2_chat_history'))state.anchorPinned=false;
-    if(e.deltaY<0&&e.target.closest?.('.st-key-page2_chat_history')){
+    if(wheelLock||e.ctrlKey||!e.deltaY||Math.abs(e.deltaX)>Math.abs(e.deltaY))return;
+    const h=history();
+    if(!h||!h.parentElement.contains(e.target))return;
+    state.anchorPinned=false;
+    if(e.deltaY<0){
       state.historyIntentUntil=host.performance.now()+600;
-      if(history()?.scrollTop<=16)loadEarlier();
+      if(h.scrollTop<=16)loadEarlier();
     }
+    const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?h.clientHeight:1);
+    const overtravel=historyOvertravel(h,delta);
+    if(overtravel<=0){lastEdgeWheel=-Infinity;return;}
+    // Start returning immediately. Momentum from the same burst only delays
+    // rearming the effect, so it cannot hold the history in its pulled position.
+    const now=host.performance.now();
+    const newBurst=now-lastEdgeWheel>=140;
+    lastEdgeWheel=now;
+    if(newBurst)animateHistoryBounce(h,20+56*overtravel/(80+overtravel),true);
   };
   doc.addEventListener('wheel',onWheel,{passive:true});
+  const onHistoryTouchStart=e=>{
+    if(historyTouch)onHistoryTouchEnd();
+    const h=history();
+    historyTouch=e.touches.length===1&&h?.parentElement.contains(e.target)
+      ? {node:h,x:e.touches[0].clientX,y:e.touches[0].clientY} : null;
+  };
+  const onHistoryTouchMove=e=>{
+    if(!historyTouch||e.touches.length!==1)return;
+    const touch=e.touches[0],drag=historyTouch;
+    const delta=drag.y-touch.clientY,sideways=touch.clientX-drag.x;
+    drag.x=touch.clientX;drag.y=touch.clientY;
+    if(!drag.node.isConnected||Math.abs(delta)<=Math.abs(sideways)||reducedMotion.matches)return;
+    const overtravel=historyOvertravel(drag.node,delta);
+    if(overtravel<=0){
+      if(delta<0&&bounceNode)releaseHistoryBounce();
+      return;
+    }
+    if(bounceNode!==drag.node)resetHistoryBounce();
+    bounceNode=drag.node;
+    bouncePull+=overtravel;
+    bounceOffset=96*bouncePull/(100+bouncePull);
+    bounceNode.style.translate=`0 ${-bounceOffset}px`;
+  };
+  const onHistoryTouchEnd=()=>{
+    if(historyTouch&&bounceNode)releaseHistoryBounce();
+    historyTouch=null;
+  };
+  doc.addEventListener('touchstart',onHistoryTouchStart,{passive:true});
+  doc.addEventListener('touchmove',onHistoryTouchMove,{passive:true});
+  doc.addEventListener('touchend',onHistoryTouchEnd,{passive:true});
+  doc.addEventListener('touchcancel',onHistoryTouchEnd,{passive:true});
   function bindComposer(){
     const node=$('.st-key-page2_chat_composer');if(node===composerNode)return;
     composerNode?.removeEventListener('wheel',composerWheel);
@@ -221,7 +304,21 @@
     try{ctx.drawImage(source,(cw-sw*cover)/2,(ch-sh*cover)/2,sw*cover,sh*cover);ctx.drawImage(source,x,y,w,h);}catch(_){}
     source.classList.add('dnd-media-ready');edge.classList.add('dnd-media-ready');
   }
-  image.onload=()=>{imageRetry=0;draw();};video.onloadeddata=draw;video.onplay=()=>{play.innerHTML=svg('<path d="M8 4v16M16 4v16"/>');play.setAttribute('aria-label','暂停背景视频');};video.onpause=()=>{play.innerHTML=svg('<path d="m8 4 12 8-12 8z"/>');play.setAttribute('aria-label','播放背景视频');};
+  function updatePlaybackControl(){
+    const playing=!video.paused&&!video.ended;
+    const label=playing?'暂停背景视频':video.ended?'重播背景视频':'播放背景视频';
+    if(play.getAttribute('aria-label')===label)return;
+    play.setAttribute('aria-label',label);
+    play.title=label;
+    play.innerHTML=playing?svg('<path d="M8 4v16M16 4v16"/>'):svg('<path d="m8 4 12 8-12 8z"/>');
+  }
+  function startBackgroundVideo(){
+    if(video.ended)video.currentTime=0;
+    video.play().catch(updatePlaybackControl);
+    updatePlaybackControl();
+  }
+  image.onload=()=>{imageRetry=0;draw();};video.onloadeddata=draw;
+  video.onplay=video.onpause=video.onended=updatePlaybackControl;
   /* Remote provider URLs (Replicate temp files, signed CDN links) often omit
      CORS headers or fail transiently. Retry once without CORS, then twice more
      with the same source so a momentary outage does not blank the backdrop. */
@@ -235,13 +332,14 @@
     imageRetryTimer=host.setTimeout(()=>{if(state.source!==image||state.config?.background?.src!==src)return;image.src=src;},attempt*900);
   };
   video.onerror=()=>{
-    if(state.source===video&&video.crossOrigin){video.crossOrigin=null;video.src=state.config.background.src;video.play().catch(()=>{});}
+    if(state.source===video&&video.crossOrigin){video.crossOrigin=null;video.src=state.config.background.src;startBackgroundVideo();}
   };
   function setBackground(info){
     const identity=JSON.stringify(info);if(state.backgroundKey===identity)return;play.hidden=sound.hidden=info.kind!=='video'||!info.src;video.muted=true;sound.setAttribute('aria-label','开启背景声音');sound.setAttribute('aria-pressed','false');ctx.clearRect(0,0,edge.width,edge.height);state.backgroundKey=identity;state.snapshotReady=false;state.source=null;imageRetry=0;video.pause();video.removeAttribute('src');video.load();image.removeAttribute('src');[image,video,edge].forEach(n=>{n.style.display='none';n.classList.remove('dnd-media-ready');});
     host.clearTimeout(imageRetryTimer);edge.width=640;
     const has=!!info.src&&info.kind!=='none';body.classList.toggle('dnd-has-media',has);if(!has){ctx.clearRect(0,0,edge.width,edge.height);return;}
-    const source=info.kind==='video'?video:image;state.source=source;source.style.display='block';edge.style.display='block';source.crossOrigin=isCrossOrigin(info.src)?'anonymous':null;source.src=info.src;if(source===video)video.play().catch(()=>{});
+    const source=info.kind==='video'?video:image;state.source=source;source.style.display='block';edge.style.display='block';source.crossOrigin=isCrossOrigin(info.src)?'anonymous':null;source.src=info.src;
+    if(source===video)startBackgroundVideo();
   }
   /* Only react to Streamlit's own DOM. Our sync writes aria-expanded/aria-*
      on the docked controls; observing those fed the scheduler its own output
@@ -280,11 +378,12 @@
       pane.style.removeProperty('opacity');
     });});
   }
-  function dispose(){unlockWheel();composerNode?.removeEventListener('wheel',composerWheel);observer.disconnect();host.clearTimeout(leaveTimer);host.cancelAnimationFrame(entryFrame);host.cancelAnimationFrame(scheduled);host.cancelAnimationFrame(anchorFrame);host.clearTimeout(imageRetryTimer);video.pause();video.removeAttribute('src');video.load();doc.removeEventListener('dblclick',onBrainEdit);doc.removeEventListener('wheel',onWheel);doc.removeEventListener('scroll',onHistoryScroll,true);doc.removeEventListener('keydown',onKey);doc.removeEventListener('play',onAudioPlay,true);doc.removeEventListener('input',onVeilInput,true);doc.removeEventListener('change',onVeilInput,true);host.removeEventListener('resize',onResize);[bg,veil,bar,resize].forEach(n=>n.remove());['dnd-game-ready','dnd-game-loading','dnd-right-open','dnd-brain-open','dnd-has-media','dnd-chat-resizing'].forEach(c=>body.classList.remove(c));['left','right','chat-height','brain-height','veil-height','veil'].forEach(k=>body.style.removeProperty('--dnd-'+k));host.__dndGameTransition?.finish();delete host.__dndImmersive;}
+  function dispose(){unlockWheel();resetHistoryBounce();composerNode?.removeEventListener('wheel',composerWheel);observer.disconnect();host.clearTimeout(leaveTimer);host.cancelAnimationFrame(entryFrame);host.cancelAnimationFrame(scheduled);host.cancelAnimationFrame(anchorFrame);host.clearTimeout(imageRetryTimer);video.pause();video.removeAttribute('src');video.load();doc.removeEventListener('dblclick',onBrainEdit);doc.removeEventListener('wheel',onWheel);doc.removeEventListener('touchstart',onHistoryTouchStart);doc.removeEventListener('touchmove',onHistoryTouchMove);doc.removeEventListener('touchend',onHistoryTouchEnd);doc.removeEventListener('touchcancel',onHistoryTouchEnd);doc.removeEventListener('scroll',onHistoryScroll,true);doc.removeEventListener('keydown',onKey);doc.removeEventListener('play',onAudioPlay,true);doc.removeEventListener('input',onVeilInput,true);doc.removeEventListener('change',onVeilInput,true);host.removeEventListener('resize',onResize);[bg,veil,bar,resize].forEach(n=>n.remove());['dnd-game-ready','dnd-game-loading','dnd-right-open','dnd-brain-open','dnd-has-media','dnd-chat-resizing'].forEach(c=>body.classList.remove(c));['left','right','chat-height','brain-height','veil-height','veil'].forEach(k=>body.style.removeProperty('--dnd-'+k));host.__dndGameTransition?.finish();delete host.__dndImmersive;}
   host.__dndImmersive={
     version:build,begin,
     update(config){begin();bindComposer();if(state.scope!==config.scope){
       host.cancelAnimationFrame(anchorFrame);
+      resetHistoryBounce();historyTouch=null;lastEdgeWheel=-Infinity;
       if(state.scope!==null){state.height=host.innerHeight/2;state.reveal=0;state.right=false;state.requestedSections.clear();}
       state.collapseSidebar=true;
       state.scope=config.scope;state.stickBottom=true;state.gesture=newGesture();state.historyAnchor=null;state.historyIntentUntil=0;

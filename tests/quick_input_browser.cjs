@@ -178,6 +178,14 @@ const assert = require("node:assert/strict");
     await page.waitForLoadState("networkidle");
     await expect(input).toBeVisible();
     await page.waitForFunction(() => Boolean(window.__dndQuickInput && window.__dndEmptySpaceSubmitHandler));
+    // A native textarea may be briefly absent while the composer stays mounted.
+    await input.evaluate(async el => {
+      const parent = el.parentNode;
+      const next = el.nextSibling;
+      el.remove();
+      await new Promise(requestAnimationFrame);
+      parent.insertBefore(el, next);
+    });
     await input.press("/");
     await expect(menu).toBeVisible();
     const inputBox = await page.locator('.st-key-page2_chat_input [data-testid="stChatInput"]').boundingBox();

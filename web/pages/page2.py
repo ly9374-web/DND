@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import threading
 import uuid
 from html import escape
@@ -479,7 +480,7 @@ def _veil_auto_source_key() -> str:
 
 
 def _image_veil_opacity(record):
-    """按图片下半屏的平均亮度给出蒙版不透明度（0-65），读不到时返回 None。"""
+    """按图片下半屏的平均亮度给出蒙版不透明度（45-70），读不到时返回 None。"""
     cache_key = str(getattr(record, "id", "") or "") + ":" + str(getattr(record, "created_at", "") or "")
     if cache_key in _VEIL_AUTO_CACHE:
         return _VEIL_AUTO_CACHE[cache_key]
@@ -509,8 +510,8 @@ def _image_veil_opacity(record):
         luminance = ImageStat.Stat(sample).mean[0] / 255.0
     except Exception:
         return None
-    # 斜率 80、封顶 70：同等亮度再高一档，纯黑仍为 0。
-    opacity = min(70, round(80 * max(0.0, min(1.0, (luminance - 0.06) / 0.89))))
+    # 斜率 95、封顶 70、下限 45：整体再高一档，最暗场景也保留 45 的蒙版。
+    opacity = max(45, min(70, round(95 * max(0.0, min(1.0, (luminance - 0.06) / 0.89)))))
     if len(_VEIL_AUTO_CACHE) >= 16:
         _VEIL_AUTO_CACHE.clear()
     _VEIL_AUTO_CACHE[cache_key] = opacity
@@ -2463,6 +2464,10 @@ def _save_current_event_plan(plan, work):
         raise ValueError("本局事件已更新，请关闭后重新打开，避免覆盖新的事件方案。")
     plan = foreshadowing.without_event_dates(plan)
     foreshadowing.validate_plan(plan)
+    _persist_current_event_plan(plan)
+
+
+def _persist_current_event_plan(plan):
     previous = deepcopy(st.session_state.get("page2_foreshadowing"))
     st.session_state["page2_foreshadowing"] = plan
     try:
@@ -2496,7 +2501,7 @@ def _events_for_turn(turns):
     events = foreshadowing.due_events(config or {}, turns)
     if events:
         debug_log(
-            "【事件触发】\n" + "\n".join(
+            "【候选事件】\n" + "\n".join(
                 "- " + "：".join(filter(None, [
                     str(event.get("title") or event.get("location") or ""),
                     str(event.get("event_content") or ""),
@@ -2519,14 +2524,15 @@ def _prepare_resend_operation(task: _Page2OperationTask):
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     remaining = turns[:-1]
     memory, checkpoints, notice = _memory_rewind_plan(remaining)
+    pending_events = [] if original.is_auto_dice_followup else _events_for_turn(remaining)
     replacement = Page2ConversationTurn(
         user_message=original.user_message,
-        special_events=[] if original.is_auto_dice_followup else _events_for_turn(remaining),
         is_user_message_hidden=original.is_user_message_hidden,
         is_auto_dice_followup=original.is_auto_dice_followup,
     )
     task.meta.update({
         "ctx": ctx, "turn_id": replacement.id, "replacement": replacement,
+        "pending_events": pending_events,
         "original_turns": [turn.to_dict() for turn in turns], "remaining_turns": remaining,
         "rewound_memory": memory, "rewound_checkpoints": checkpoints, "memory_notice": notice,
         "story_brain_enabled": bool(task.payload.get("story_brain_enabled", True)),
@@ -2539,7 +2545,7 @@ def _prepare_resend_operation(task: _Page2OperationTask):
         st.session_state["page2_operation_notice"] = notice
     # Staging only: no live turn, memory or persisted record changes until success.
     return lambda: page2_service.send_message(
-        ctx=ctx, turns=remaining, user_message=foreshadowing.turn_user_message(replacement),
+        ctx=ctx, turns=remaining, user_message=foreshadowing.pending_event_message(replacement.user_message, pending_events),
         story_brain_short=memory["short"], story_brain_enabled=task.meta["story_brain_enabled"],
     )
 
@@ -2556,7 +2562,11 @@ def _apply_resend_operation(task: _Page2OperationTask) -> None:
     before_memory = _memory_state()
     before_checkpoints = deepcopy(st.session_state.get("page2_story_brain_checkpoints", []))
     replacement = task.meta["replacement"]
-    replacement.assistant_message = str(task.result)
+    reply, events = foreshadowing.resolve_events(str(task.result), task.meta.get("pending_events", []))
+    if not reply.strip():
+        raise RuntimeError("重发失败，模型返回了空正文，原问答和记忆已保留。")
+    replacement.assistant_message = reply
+    replacement.special_events = events
     st.session_state.page2_turns = task.meta["remaining_turns"] + [replacement]
     _set_memory_state(task.meta["rewound_memory"], task.meta["rewound_checkpoints"])
     try:
@@ -2578,25 +2588,30 @@ def _prepare_chat_operation(task: _Page2OperationTask):
     ctx = task.payload.get("ctx") or page2_service.load_context_from_settings()
     story_brain_enabled = bool(task.payload.get("story_brain_enabled", True))
     turns = list(st.session_state.page2_turns)
-    if current_text == "开始" and not turns:
-        prompt_state = system_prompts.load_state(
-            hidden_space=bool(st.session_state.get("hidden_unlocked", False))
-        )
-        first_input = system_prompts.first_input_for_record(
-            prompt_state,
-            str(st.session_state.get("page2_final_setting_id", "") or ""),
-        )
-        if first_input:
-            current_text = first_input
+    if not turns:
+        start_match = re.fullmatch(r"开始\s*[（(](.*)[）)]", current_text, re.S)
+        if current_text == "开始" or start_match:
+            prompt_state = system_prompts.load_state(
+                hidden_space=bool(st.session_state.get("hidden_unlocked", False))
+            )
+            first_input = system_prompts.first_input_for_record(
+                prompt_state,
+                str(st.session_state.get("page2_final_setting_id", "") or ""),
+            )
+            extra = start_match.group(1).strip() if start_match else ""
+            if first_input:
+                current_text = f"{first_input}额外要求：{extra}" if extra else first_input
+            elif extra:
+                current_text = extra
     previous_assistant_text = _latest_assistant_message(turns)
     memory_source_text = "\n\n".join(
         part for part in [previous_assistant_text.strip(), current_text] if part
     )
     story_brain_short = _current_short_story_brain()
+    pending_events = [] if task.payload.get("is_auto_dice_followup", False) else _events_for_turn(turns)
 
     new_turn = Page2ConversationTurn(
         user_message=current_text,
-        special_events=[] if task.payload.get("is_auto_dice_followup", False) else _events_for_turn(turns),
         assistant_message=None,
         is_loading=True,
         is_user_message_hidden=bool(task.payload.get("hide_user_message", False)),
@@ -2610,6 +2625,7 @@ def _prepare_chat_operation(task: _Page2OperationTask):
         {
             "ctx": ctx,
             "turn_id": new_turn.id,
+            "pending_events": pending_events,
             "memory_source_text": memory_source_text,
             "story_brain_enabled": story_brain_enabled,
             "is_context_excluded": False,
@@ -2621,7 +2637,7 @@ def _prepare_chat_operation(task: _Page2OperationTask):
     return lambda: page2_service.send_message(
         ctx=ctx,
         turns=turns,
-        user_message=foreshadowing.turn_user_message(new_turn),
+        user_message=foreshadowing.pending_event_message(new_turn.user_message, pending_events),
         story_brain_short=story_brain_short,
         story_brain_enabled=story_brain_enabled,
     )
@@ -2704,9 +2720,11 @@ def _prepare_story_brain_operation(task: _Page2OperationTask):
     )
 
 
-def _queue_event_generation(*, final_setting=None, record_id=None, update_game=True):
+def _queue_event_generation(*, final_setting=None, record_id=None, update_game=True, direction="",
+                            source_turn_id=""):
+    automatic = bool(source_turn_id)
     existing = _latest_earlier_operation("events")
-    if existing is not None:
+    if existing is not None and not automatic and (not update_game or not existing.payload.get("source_turn_id")):
         return existing
     ctx = deepcopy(page2_service.load_context_from_settings())
     record_id = str(record_id or st.session_state.get("page2_final_setting_id") or "")
@@ -2720,33 +2738,62 @@ def _queue_event_generation(*, final_setting=None, record_id=None, update_game=T
         source, turns, _current_short_story_brain() if update_game else "",
         settings.int(AppStorageKeys.PAGE2_EVENT_HISTORY_TURNS, 6),
     )
-    return _enqueue_operation("events", "生成事件", {
+    if direction:
+        context["direction"] = direction
+    payload = {
         "ctx": ctx, "record_id": record_id, "context": context, "update_game": update_game,
         "hidden_space": state.hidden_space,
-    })
+    }
+    if automatic:
+        payload.update(source_turn_id=source_turn_id, source_plan=_current_event_plan())
+    elif existing is not None:
+        _stop_generation(existing.id)
+    return _enqueue_operation("events", "自动续编事件" if automatic else "生成事件", payload,
+                              allow_same_kind=automatic)
+
+
+def _auto_event_source_current(task):
+    turns = st.session_state.get("page2_turns") or []
+    return (task.payload["source_plan"] == _current_event_plan(turns)
+            and any(str(turn.id) == task.payload["source_turn_id"] for turn in turns))
+
+
+def _schedule_event_rollover(turn_id):
+    turns = st.session_state.get("page2_turns") or []
+    trigger = next((turn for turn in reversed(turns) if str(turn.id) == turn_id), None)
+    if trigger is None or not trigger.special_events or _chat_scope() == "guest":
+        return
+    plan = _current_event_plan(turns)
+    if not foreshadowing.time_batch_finished(plan, turns, trigger):
+        return
+    if any(task.payload.get("source_plan") == plan for task in _pending_operations() if task.kind == "events"):
+        return
+    try:
+        _queue_event_generation(source_turn_id=turn_id)
+    except Exception as exc:
+        st.session_state["page2_operation_error"] = "自动续编事件失败：" + user_facing_error_message(exc)
 
 
 def _apply_event_generation(task):
+    automatic = bool(task.payload.get("source_turn_id"))
+    if automatic and not _auto_event_source_current(task):
+        task.meta["completion_notice"] = "；来源事件批次已变化，已跳过续编。"
+        return
     if task.error is not None:
         raise task.error
+    if task.payload["update_game"]:
+        plan = foreshadowing.new_plan(_current_event_plan().get("title") or "事件方案")
+        _persist_current_event_plan({**plan, **task.result, "enabled": True})
+        task.meta["completion_notice"] = "；已覆盖本局事件。"
+        return
     state = system_prompts.load_state(hidden_space=task.payload["hidden_space"])
     record = system_prompts.get_record(state, task.payload["record_id"])
     if record is None:
         raise ValueError("对应最终设定已被删除，未写入生成结果。")
-    before = deepcopy(record.foreshadowing)
-    config = foreshadowing.add_generated_plan(before, task.result)
-    previous_game = deepcopy(st.session_state.get("page2_foreshadowing"))
-    try:
-        system_prompts.save_foreshadowing(state, record.id, config)
-        if task.payload["update_game"]:
-            st.session_state["page2_foreshadowing"] = foreshadowing.snapshot(config)
-            _upsert_record()
-    except Exception:
-        st.session_state["page2_foreshadowing"] = previous_game
-        system_prompts.save_foreshadowing(state, record.id, before)
-        raise
+    config = foreshadowing.add_generated_plan(record.foreshadowing, task.result)
+    system_prompts.save_foreshadowing(state, record.id, config)
     st.session_state[f"foreshadow_plan_{record.id}_pending"] = config["selected_plan_id"]
-    task.meta["completion_notice"] = "；已保存新方案" + ("并更新本局伏笔。" if task.payload["update_game"] else "。")
+    task.meta["completion_notice"] = "；已保存新方案。"
 
 
 def _prepare_image_prompt_operation(task: _Page2OperationTask):
@@ -2895,6 +2942,8 @@ def _prepare_operation(task: _Page2OperationTask):
     if task.kind == "resend":
         return _prepare_resend_operation(task)
     if task.kind == "events":
+        if task.payload.get("source_turn_id") and not _auto_event_source_current(task):
+            return lambda: None
         return lambda: foreshadowing.generate("events", task.payload["ctx"], "", captured_context=task.payload["context"])
     if task.kind == "story_brain":
         return _prepare_story_brain_operation(task)
@@ -2922,10 +2971,12 @@ def _apply_chat_operation(task: _Page2OperationTask) -> None:
     )
     if target_turn is None:
         raise RuntimeError("消息任务完成后未找到待写回的对话记录。")
+    events = []
+    if task.error is None:
+        reply, events = foreshadowing.resolve_events(reply, task.meta.get("pending_events", []))
     target_turn.assistant_message = reply
     target_turn.is_loading = False
-    if task.error is not None or not reply.strip():
-        target_turn.special_events = []
+    target_turn.special_events = events if reply.strip() else []
     _upsert_record()
 
     _schedule_chat_followups(task, reply)
@@ -2937,6 +2988,8 @@ def _schedule_chat_followups(task: _Page2OperationTask, reply: str) -> None:
     ctx = task.meta.get("ctx") or page2_service.load_context_from_settings()
     story_brain_enabled = bool(task.meta.get("story_brain_enabled", True))
     is_context_excluded = bool(task.meta.get("is_context_excluded", False))
+    if task.error is None and not is_context_excluded:
+        _schedule_event_rollover(turn_id)
     if story_brain_enabled and task.error is None and not is_context_excluded:
         retry_pending = bool(st.session_state.get("page2_story_brain_retry_pending", False))
         if _should_update_story_brain(
@@ -3066,9 +3119,17 @@ def _apply_operation(task: _Page2OperationTask) -> None:
                 media_store.remember_image(record)
             except OSError as exc:
                 media_store.debug_log("[ImageLibrary] metadata update failed", type(exc).__name__)
-            st.session_state[_reference_key() + "_latest_generated"] = record.id
-            if task.payload.get("workflow_id"):
-                _consume_workflow_references(task)
+            reference_key = _reference_key()
+            st.session_state[reference_key + "_latest_generated"] = record.id
+            if task.payload.get("workflow_id") and not task.payload.get("auto_image"):
+                if (
+                    _manual_reference_ids()
+                    and st.session_state.get(reference_key + "_revision", 0) == task.payload.get("reference_revision")
+                ):
+                    st.session_state[reference_key + "_workflow_video_source"] = record.id
+                if st.session_state.get(reference_key + "_urls", "") == task.payload.get("reference_url_draft"):
+                    # Applied before widgets on the next rerun.
+                    st.session_state[reference_key + "_clear_urls"] = True
             if not _manual_reference_ids():
                 st.session_state["page2_pending_video_source"] = record.id
             # The selected background was persisted with this media result above.
@@ -3633,6 +3694,7 @@ def _set_reference_selection(ids, *, preview=True):
     ids = list(dict.fromkeys(ids))
     st.session_state[key + "_selection"] = ids
     st.session_state[key + "_revision"] = st.session_state.get(key + "_revision", 0) + 1
+    st.session_state.pop(key + "_workflow_video_source", None)
     if ids:
         if preview:
             _select_media_preview(ids[-1])
@@ -3680,18 +3742,6 @@ def _import_reference_uploads(upload_key):
     st.session_state[key + "_upload_nonce"] = st.session_state.get(key + "_upload_nonce", 0) + 1
 
 
-def _consume_workflow_references(task):
-    key = _reference_key()
-    cleared = False
-    if st.session_state.get(key + "_revision", 0) == task.payload.get("reference_revision", 0):
-        cleared = bool(_manual_reference_ids())
-        _set_reference_selection([], preview=False)
-    if st.session_state.get(key + "_urls", "") == task.payload.get("reference_url_draft", ""):
-        # Applied before widgets on the next rerun, including fragment completions.
-        st.session_state[key + "_clear_urls"] = True
-    return cleared
-
-
 def _render_image_references(provider: str, media: list) -> list[str]:
     """One shared selection for image references, video input and preview."""
     key = _reference_key()
@@ -3716,7 +3766,8 @@ def _render_image_references(provider: str, media: list) -> list[str]:
     raw = ""
     with st.expander("参考图片与本地素材", expanded=False):
         st.multiselect("从已有图片选择参考图", options=list(images), key=key,
-                       format_func=label, disabled=busy, on_change=_reference_selection_changed)
+                       format_func=label, disabled=busy, on_change=_reference_selection_changed,
+                       help="选中的图片会用于后续自动生图，点击图片标签旁的 × 可移除。")
         if not supported:
             st.caption("此生图模型不使用参考图；所选图片仍会用于图生视频。")
         st.checkbox("导入后永久保存", key=key + "_permanent", disabled=busy)
@@ -4054,7 +4105,11 @@ def _queue_current_image_video(*, ctx, source_id, seconds, generate_audio=True,
 
 
 def _quick_video_source():
-    candidates = list(reversed(_manual_reference_ids())) + [
+    key = _reference_key()
+    manual = _manual_reference_ids()
+    candidates = [
+        st.session_state.get(key + "_workflow_video_source") if manual else None,
+        *reversed(manual),
         st.session_state.get("page2_pending_video_source"), st.session_state.get("page2_video_source"),
         st.session_state.get("page2_selected_media_id"),
     ] + [item.id for item in reversed(st.session_state.page2_generated_media)
@@ -4065,6 +4120,8 @@ def _quick_video_source():
 
 def _render_quick_generation_actions():
     source = _quick_video_source()
+    manual_events_busy = any(task.kind == "events" and not task.payload.get("source_turn_id")
+                             for task in _pending_operations())
     # The persistent SVG controls in the topbar delegate to these native widgets.
     with st.container(key="page2_quick_actions"):
         image_clicked = st.button("一键生成图片", key="page2_quick_image",
@@ -4072,7 +4129,7 @@ def _render_quick_generation_actions():
         video_clicked = st.button("一键生成视频", key="page2_quick_video",
                                   disabled=source is None or _one_click_video_busy())
         events_clicked = st.button("生成事件", key="page2_quick_events",
-                                   disabled=_operation_kind_busy("events") or _chat_scope() == "guest")
+                                   disabled=manual_events_busy or _chat_scope() == "guest")
     if image_clicked:
         try:
             options = _current_auto_image_options()
@@ -4116,11 +4173,47 @@ def _render_quick_generation_actions():
         else:
             st.rerun()
     if events_clicked:
+        st.session_state["page2_event_generation_scope"] = _operation_scope_id()
+    if st.session_state.get("page2_event_generation_scope"):
+        _render_event_generation_dialog()
+
+
+def _close_event_generation_dialog() -> None:
+    st.session_state.pop("page2_event_generation_scope", None)
+    st.session_state.pop("page2_event_direction", None)
+
+
+@st.dialog("生成事件", on_dismiss=_close_event_generation_dialog)
+def _render_event_generation_dialog() -> None:
+    if st.session_state.get("page2_event_generation_scope") != _operation_scope_id() or _chat_scope() == "guest":
+        _close_event_generation_dialog()
+        st.rerun()
+
+    with st.form("page2_event_generation_form", enter_to_submit=False, border=False):
+        direction = st.text_area(
+            "用户期望的事件生成方向",
+            key="page2_event_direction",
+            height=160,
+            placeholder="例如，希望接下来围绕港口失踪案展开，多一些调查线索。",
+        ).strip()
+        confirm, skip, cancel = st.columns(3)
+        confirmed = confirm.form_submit_button("确认", type="primary", width="stretch")
+        skipped = skip.form_submit_button("跳过", width="stretch")
+        cancelled = cancel.form_submit_button("取消", width="stretch")
+
+    if cancelled:
+        _close_event_generation_dialog()
+        st.rerun()
+    if confirmed and not direction:
+        st.warning("请输入生成方向，或点击跳过。")
+        return
+    if confirmed or skipped:
         try:
-            _queue_event_generation()
+            _queue_event_generation(direction=direction if confirmed else "")
         except Exception as exc:
-            st.toast(user_facing_error_message(exc), icon="⚠️")
+            _show_error(exc)
         else:
+            _close_event_generation_dialog()
             st.rerun()
 
 
@@ -4412,12 +4505,15 @@ def _render_video_prompt_controls(media: list, video_model: str, *, image_option
         st.session_state["page2_video_source"] = resolved_id if resolved_id in by_id else None
     preferred = st.session_state.pop("page2_pending_video_source", "")
     manual = [item for item in _manual_reference_ids() if item in by_id]
+    workflow_source = st.session_state.get(_reference_key() + "_workflow_video_source")
     latest = st.session_state.get(_reference_key() + "_latest_generated")
     if latest not in by_id:
         latest = next((item.id for item in reversed(st.session_state.page2_generated_media)
                        if item.id in by_id and item.provider != "local"), None)
     if not workflow_busy:
-        if manual:
+        if manual and workflow_source in by_id:
+            st.session_state["page2_video_source"] = workflow_source
+        elif manual:
             st.session_state["page2_video_source"] = manual[-1]
         elif preferred in options:
             st.session_state["page2_video_source"] = preferred
@@ -4436,7 +4532,10 @@ def _render_video_prompt_controls(media: list, video_model: str, *, image_option
     elif selected_id in image_tasks:
         st.text("视频输入：等待所选生图任务完成")
     elif selected_id in by_id:
-        origin = "手动选择" if manual else "最新生成"
+        if selected_id == workflow_source:
+            origin = "一键生成"
+        else:
+            origin = "手动选择" if manual and selected_id == manual[-1] else "最新生成"
         st.text(f"视频输入（{origin}）：{by_id[selected_id].prompt[:48]}")
     else:
         st.text("视频输入：请在参考图片中选图，或先生成一张图片。")
@@ -4741,7 +4840,7 @@ def _render_media_column_contents():
     st.divider()
     st.subheader("图生视频")
     video_model = _render_video_model_selector()
-    st.caption("生视频优先使用最后选中的参考图，未选图时使用最新生成的图片。一键流程生图成功后清空参考图，再为新图生成视频 prompt。")
+    st.caption("生视频优先使用最后选中的参考图，未选图时使用最新生成的图片。一键流程会为新图生成视频 prompt 并将其设为视频输入。")
 
     _render_video_prompt_controls(media, video_model, image_options={
         "provider": provider, "aspect_ratio": aspect_ratio,
@@ -4863,8 +4962,11 @@ def render():
     _load_record_from_nav_if_needed()
     _sync_auto_veil()
     _render_quick_generation_actions()
-    if _pending_operations() or st.session_state.get("page2_tts_active"):
-        _render_generation_toasts()
+    # Reserve a stable Streamlit position so showing or hiding a task toast
+    # cannot move the workspace and remount its chat scroll container.
+    with st.container(key="page2_task_feedback"):
+        if _pending_operations() or st.session_state.get("page2_tts_active"):
+            _render_generation_toasts()
     history_start, visible_turns = _history_window()
     # Before the stylesheet's renderer is ready, constrain the native layout
     # instead of briefly exposing the full unstyled conversation.

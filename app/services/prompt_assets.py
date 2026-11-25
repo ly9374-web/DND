@@ -1078,20 +1078,8 @@ def bind_legacy_final_setting_by_titles(
     return True
 
 
-def sync_final_setting(
-    state,
-    record,
-    *,
-    title: str,
-    prompt: str,
-    long_term_memory: str,
-    first_inputs: list[FirstInputRecord],
-    selected_first_input_id: str,
-) -> list[str]:
-    """Atomically save a final setting and sync every linked source still available."""
-    if record is None:
-        raise ValueError("同步失败：当前没有选中最终设定。")
-
+def _resolve_final_setting_sources(record) -> dict:
+    """Resolve every source record currently linked to a final setting."""
     source_links = {
         "固定模板": str(record.final_template_id or "").strip(),
         "世界书": str(record.final_world_book_id or "").strip(),
@@ -1164,6 +1152,58 @@ def sync_final_setting(
         if name:
             linked_other_characters.append((name, character))
 
+    user_name = str(record.final_user_character_name or "").strip()
+    if not user_name and user_character is not None:
+        user_name = str(user_character.title or "").strip()
+
+    return {
+        "template": template,
+        "world_book": world_book,
+        "long_term_memory_record": long_term_memory_record,
+        "user_character": user_character,
+        "linked_other_characters": linked_other_characters,
+        "user_name": user_name,
+        "templates": templates,
+        "hidden_templates": hidden_templates,
+        "world_books": world_books,
+        "hidden_world_books": hidden_world_books,
+        "character_cards": character_cards,
+        "hidden_character_cards": hidden_character_cards,
+        "long_term_memories": long_term_memories,
+        "hidden_long_term_memories": hidden_long_term_memories,
+    }
+
+
+def sync_final_setting(
+    state,
+    record,
+    *,
+    title: str,
+    prompt: str,
+    long_term_memory: str,
+    first_inputs: list[FirstInputRecord],
+    selected_first_input_id: str,
+) -> list[str]:
+    """Atomically save a final setting and sync every linked source still available."""
+    if record is None:
+        raise ValueError("同步失败：当前没有选中最终设定。")
+
+    sources = _resolve_final_setting_sources(record)
+    template = sources["template"]
+    world_book = sources["world_book"]
+    long_term_memory_record = sources["long_term_memory_record"]
+    user_character = sources["user_character"]
+    linked_other_characters = sources["linked_other_characters"]
+    user_name = sources["user_name"]
+    templates = sources["templates"]
+    hidden_templates = sources["hidden_templates"]
+    world_books = sources["world_books"]
+    hidden_world_books = sources["hidden_world_books"]
+    character_cards = sources["character_cards"]
+    hidden_character_cards = sources["hidden_character_cards"]
+    long_term_memories = sources["long_term_memories"]
+    hidden_long_term_memories = sources["hidden_long_term_memories"]
+
     sections = _parse_available_final_sections(prompt)
     other_contents: list[str | None] = []
     if "4. 其他角色" in sections:
@@ -1172,9 +1212,6 @@ def sync_final_setting(
             content_start_line=sections["4. 其他角色"][1],
             expected_names=[name for name, _ in linked_other_characters],
         )
-    user_name = str(record.final_user_character_name or "").strip()
-    if not user_name and user_character is not None:
-        user_name = str(user_character.title or "").strip()
 
     updated_labels: list[str] = []
     changed_at = now_iso()
@@ -1278,3 +1315,66 @@ def sync_final_setting(
     }
     settings.set_many_atomic(updates, backup_path=FINAL_SETTING_SYNC_BACKUP_PATH)
     return updated_labels
+
+
+def restore_final_setting_from_sources(state, record) -> tuple[str, str]:
+    """Rebuild a final setting from its linked sources and save it."""
+    if record is None:
+        raise ValueError("同步失败：当前没有选中最终设定。")
+
+    sources = _resolve_final_setting_sources(record)
+    template = sources["template"]
+    world_book = sources["world_book"]
+    user_character = sources["user_character"]
+    long_term_memory_record = sources["long_term_memory_record"]
+
+    missing = [
+        label
+        for label, item in (
+            ("固定模板", template),
+            ("世界书", world_book),
+            ("用户角色", user_character),
+        )
+        if item is None
+    ]
+    missing.extend(
+        name or "其他角色"
+        for name, character in sources["linked_other_characters"]
+        if character is None
+    )
+    if missing:
+        raise ValueError(
+            "同步失败：无法找到关联的" + "、".join(missing) + "，请先补齐关联素材。"
+        )
+
+    other_characters = [
+        character
+        for _, character in sources["linked_other_characters"]
+        if character is not None
+    ]
+    prompt = build_final_prompt(template, world_book, user_character, other_characters)
+    long_term_memory = (
+        str(long_term_memory_record.content or "").strip()
+        if long_term_memory_record is not None
+        else str(record.long_term_memory or "").strip()
+    )
+
+    changed_at = now_iso()
+    record.prompt = prompt
+    record.long_term_memory = long_term_memory
+    record.__post_init__()
+    record.updated_at = changed_at
+    state.selected_record_id = record.id
+
+    updates = {
+        AppStorageKeys.SYSTEM_PROMPT_RECORDS: json.dumps(
+            [item.to_dict() for item in state.records], ensure_ascii=False
+        ),
+        AppStorageKeys.HIDDEN_SYSTEM_PROMPT_RECORDS: json.dumps(
+            [item.to_dict() for item in state.hidden_records], ensure_ascii=False
+        ),
+        AppStorageKeys.SELECTED_SYSTEM_PROMPT_RECORD_ID: record.id,
+        AppStorageKeys.SYSTEM_PROMPT: record.prompt,
+    }
+    settings.set_many_atomic(updates, backup_path=FINAL_SETTING_SYNC_BACKUP_PATH)
+    return prompt, long_term_memory

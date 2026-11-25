@@ -62,14 +62,32 @@ def context():
 
 
 def events(**kwargs):
-    assert "固定背景指令" not in kwargs["user_message"]
-    assert "固定DM指令" not in kwargs["user_message"]
-    assert "固定格式指令" not in kwargs["user_message"]
+    prompt = kwargs["user_message"]
+    assert "固定背景指令" not in prompt
+    assert "固定DM指令" not in prompt
+    assert "固定格式指令" not in prompt
+    assert "跳过时写的草稿" not in prompt
+    heading = "【用户期望的事件生成方向】\n"
+    story = "新故事：商队将在学校附近停留。"
+    if heading in prompt:
+        story = prompt.split(heading, 1)[1].split("\n请在符合", 1)[0]
     time.sleep(6)
-    day = 1 if "尚未开局" in kwargs["user_message"] else 8
-    return json.dumps({"story": "新故事：商队将在学校附近停留。",
-        "scene_events": [{"location": "学校&门口", "patterns": ["学校&门口", "校门", "学校&入口", "校园&大门"], "event_content": "商队抵达。"} for _ in range(5)],
-        "time_events": [{"title": f"事件{i}", "day": day, "time": "15:00", "event_content": "商队卸货。"} for i in range(5)]}, ensure_ascii=False)
+    day = 1 if "尚未开局" in prompt else 8
+    target = "学校&门口"
+    times = ("00:30", "01:30", "03:00", "04:00", "05:00") if day == 1 else (
+        "15:00", "15:45", "17:00", "18:00", "20:00",
+    )
+    time_events = [
+        {"title": f"口信{i}", "day": day, "time": clock, "leads_to_location": target,
+         "event_content": "商队派人送来口信，邀请主角到学校门口领取货物清单。"}
+        for i, clock in enumerate(times[:2])
+    ] + [
+        {"title": f"事件{i}", "day": day, "time": clock, "event_content": "商队卸货。"}
+        for i, clock in enumerate(times[2:])
+    ]
+    return json.dumps({"story": story,
+        "scene_events": [{"location": target, "patterns": [target, "校门", "学校&入口", "校园&大门"], "event_content": "商队抵达。"} for _ in range(5)],
+        "time_events": time_events}, ensure_ascii=False)
 
 
 def image_prompt(**kwargs):

@@ -496,7 +496,7 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         restored = next(item for item in media_store.list_images() if item.id == saved.id)
         self.assertEqual(restored.video_prompt, "library motion")
 
-    def test_workflow_consumes_references_only_after_successful_image(self):
+    def test_workflow_keeps_references_and_hands_new_image_to_video(self):
         app = self.app()
         app.multiselect[0].set_value(["old"]).run()
         app.session_state.fixture_fail_image = True
@@ -509,10 +509,13 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         tasks = app.session_state.page2_operation_queue
         self.assertEqual(tasks[1].payload["image_urls"], ["media://old"])
         self.finish_workflow(app)
-        self.assertEqual(app.multiselect[0].value, [])
+        self.assertEqual(app.multiselect[0].value, ["old"])
         self.assertEqual(app.session_state.page2_video_source, tasks[1].result.id)
         self.assertEqual(app.session_state.page2_selected_media_id, tasks[1].result.id)
         self.assertEqual(app.text_area(key="_page2_video_prompt").value, "generated motion")
+        app.text_area(key="_page2_video_prompt").input("edited motion").run()
+        app.button(key="page2_generate_video").click().run()
+        self.assertEqual(app.session_state.page2_operation_queue[-1].payload["source_id"], tasks[1].result.id)
 
     def test_image25_full_page_sends_quality_from_both_buttons(self):
         for button in ("page2_generate_image", "page2_generate_video_workflow"):
@@ -665,10 +668,9 @@ with patch.object(page2.settings, "set"), patch.object(page2, "_upsert_record"),
         app.session_state["fixture_fail_prompt"] = True
         app.button(key="page2_generate_video_workflow").click().run()
         self.finish_workflow(app)
-        # Image succeeded before prompt failure: its references were consumed,
-        # and the new image remains the automatic video input.
+        # The image stays available for the video prompt retry.
         self.assertEqual(app.session_state.page2_video_source, app.session_state.page2_generated_media[-1].id)
-        self.assertEqual(app.multiselect[0].value, [])
+        self.assertEqual(app.multiselect[0].value, ["old"])
         self.assertFalse(app.multiselect[0].disabled)
         self.assertFalse(app.text_area(key="_page2_video_prompt").disabled)
         self.assertFalse(app.button(key="page2_generate_video").disabled)

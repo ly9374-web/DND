@@ -96,11 +96,11 @@ body:has(.st-key-page2_game_mount,.st-key-page2_workspace) .st-key-page2_dialogu
 #dnd-game-transition.dnd-transition-active{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .12s ease}
 @media(prefers-reduced-motion:reduce){#dnd-game-transition,#dnd-immersive-topbar,#dnd-immersive-bg img,#dnd-immersive-bg video,#dnd-immersive-bg canvas{transition:none!important}}
 
-/* Native reading surfaces: no JavaScript wheel routing or scroll chaining. */
+/* Native reading surfaces keep their scroll positions independent. */
 .st-key-page2_workspace_actions{display:none!important}
 body:has(.st-key-page2_workspace) .st-key-page2_chat_history{overscroll-behavior:none!important;transition:height .2s ease,max-height .2s ease}
 body:has(.st-key-page2_workspace) .st-key-page2_chat_canvas>div:has(>.st-key-page2_chat_history){transition:height .2s ease}
-body:has(.st-key-page2_workspace) .st-key-page2_brain_scroll{overscroll-behavior:none!important}
+body:has(.st-key-page2_workspace) .st-key-page2_brain_scroll{overscroll-behavior:none!important;overflow-anchor:none}
 body:has(.st-key-page2_workspace) .st-key-page2_story_brain_panel{content-visibility:visible;transition:height .2s ease,max-height .2s ease}
 .dnd-brain-viewer{white-space:pre-wrap;overflow-wrap:anywhere;font-size:16px;line-height:1.9;color:var(--dnd-ink);cursor:text;min-height:220px}
 .st-key-page2_brain_editor textarea{color:var(--dnd-ink)!important;overscroll-behavior:none}
@@ -131,6 +131,14 @@ body:not(.dnd-game-ready) .st-key-page2_dialogue_pane,body:not(.dnd-game-ready) 
 #dnd-immersive-topbar{align-items:flex-start}
 #dnd-immersive-topbar .dnd-topbar-tools{display:flex;flex-direction:column;align-items:flex-end;gap:10px;pointer-events:none}
 #dnd-immersive-topbar .dnd-media-tools,#dnd-immersive-topbar .dnd-quick-generation{display:flex;gap:8px;pointer-events:auto}
+#dnd-immersive-topbar .dnd-background-playback{position:absolute;top:0;left:50%;transform:translateX(-50%);width:42px;height:38px;padding:0;justify-content:center;border-radius:12px;background:rgba(49,59,70,.28);border-color:rgba(255,255,255,.33);backdrop-filter:blur(18px) saturate(150%);box-shadow:inset 0 1px 0 #ffffff26,0 3px 14px #0003}
+#dnd-immersive-topbar .dnd-background-playback:hover{background:rgba(93,106,118,.4);border-color:#ffffff80}
+#dnd-immersive-topbar .dnd-background-playback:focus-visible{outline:2px solid #bdd8ef;outline-offset:3px}
+@media(max-width:420px){
+  #dnd-immersive-topbar:has(.dnd-background-playback:not([hidden])) .dnd-media-tools{gap:4px}
+  #dnd-immersive-topbar:has(.dnd-background-playback:not([hidden])) .dnd-media-tools button{padding-inline:7px}
+  #dnd-immersive-topbar:has(.dnd-background-playback:not([hidden])) .dnd-media-toggle svg{display:none}
+}
 #dnd-immersive-topbar .dnd-quick-generation-button{width:34px;height:34px;justify-content:center;padding:7px}
 #dnd-immersive-topbar .dnd-quick-generation-button:disabled{opacity:.35;cursor:default}
 #dnd-immersive-topbar .dnd-quick-generation-button:enabled:hover{background:rgba(255,255,255,.12);border-color:#ffffff55}

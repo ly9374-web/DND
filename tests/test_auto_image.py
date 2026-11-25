@@ -110,6 +110,35 @@ class AutoImageTests(unittest.TestCase):
                 self.assertFalse(self.state.page2_auto_image_first_turn_pending)
                 self.assertEqual(self.state.page2_auto_image_next_turn, 1 + 2 * interval)
 
+    def test_automatic_images_reuse_selected_reference_until_removed(self):
+        reference = GeneratedImageRecord(id="reference", provider="local", prompt="reference")
+        reference_key = page2._reference_key()
+        self.ctx.auto_image_interval = 2
+        with (
+            patch.object(page2.media_store, "list_images", return_value=[reference]),
+            patch.object(page2, "_select_media_preview"),
+        ):
+            self.state[reference_key] = [reference.id]
+            page2._reference_selection_changed()
+            for number in range(1, 4):
+                self.followup(self.append_turn(number))
+                self.drain()
+
+            self.assertEqual(page2._manual_reference_ids(), [reference.id])
+            self.assertEqual(
+                [call["image_urls"] for call in self.image_calls],
+                [["media://reference"], ["media://reference"]],
+            )
+
+            self.state[reference_key] = []
+            page2._reference_selection_changed()
+            for number in range(4, 6):
+                self.followup(self.append_turn(number))
+                self.drain()
+
+        self.assertEqual(len(self.image_calls), 3)
+        self.assertEqual(self.image_calls[-1]["image_urls"], [])
+
     def test_enabling_in_existing_chat_and_reenabling_use_next_reply(self):
         for number in range(1, 5):
             self.append_turn(number)

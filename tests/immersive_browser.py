@@ -3,6 +3,26 @@ import os
 from playwright.sync_api import sync_playwright, expect
 
 
+def check_reading_position_during_generation(page):
+    history = page.locator(".st-key-page2_chat_history")
+    reading_top = history.evaluate("""node => {
+        window.historyBeforeTask = node;
+        node.scrollTop = 1100;
+        return node.scrollTop;
+    }""")
+    assert reading_top > 0
+    page.wait_for_timeout(120)
+    generate = page.get_by_role("button", name="一键生成图片", exact=True)
+    generate.click()
+    toast = page.locator(".st-key-generation_toasts")
+    reading_position = "node => [node === window.historyBeforeTask, node.scrollTop]"
+    expect(toast).to_be_visible(timeout=10000)
+    assert history.evaluate(reading_position) == [True, reading_top]
+    expect(toast).to_have_count(0, timeout=15000)
+    expect(generate).to_be_enabled()
+    assert history.evaluate(reading_position) == [True, reading_top]
+
+
 def run():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -94,14 +114,44 @@ def run():
         assert page.locator('[data-testid=stChatMessage]').count() == 12
         h.evaluate("e=>e.scrollTop=e.scrollHeight")
         h.hover(position={"x":150,"y":100})
+        # Keep sending momentum at the same pointer position after the first wheel event.
+        h.evaluate("""node => {
+            window.historyBounceSamples = new Promise(resolve => {
+                node.addEventListener('wheel', () => {
+                    const start = performance.now();
+                    const samples = [];
+                    const momentum = setInterval(() => node.dispatchEvent(
+                        new WheelEvent('wheel', {deltaY: 12, bubbles: true})
+                    ), 30);
+                    function sample() {
+                        const elapsed = performance.now() - start;
+                        const offset = parseFloat(getComputedStyle(node).translate.split(' ')[1]) || 0;
+                        samples.push([elapsed, offset]);
+                        if (elapsed < 620) requestAnimationFrame(sample);
+                        else { clearInterval(momentum); resolve(samples); }
+                    }
+                    requestAnimationFrame(sample);
+                }, {once: true});
+            });
+        }""")
         page.mouse.wheel(0,120)
-        page.wait_for_timeout(150)
+        samples = page.evaluate("window.historyBounceSamples")
+        assert any(elapsed < 75 and offset < -6 for elapsed, offset in samples), samples
+        assert any(155 < elapsed < 240 and abs(offset) < 8 for elapsed, offset in samples), samples
+        assert any(305 < elapsed < 430 and offset > 6 for elapsed, offset in samples), samples
+        assert all(abs(offset) < 1 for elapsed, offset in samples if elapsed > 540), samples
         assert page.evaluate("__dndImmersive.getState().reveal") == 0
+        assert h.evaluate("e => Math.abs(e.scrollHeight - e.clientHeight - e.scrollTop) < 2")
+        expect(h).to_have_css("translate", "none")
         composer.hover()
         page.mouse.wheel(0,100)
         page.wait_for_function("__dndImmersive.getState().reveal===300")
+        # More motion at the unchanged pointer position belongs to the opening gesture.
+        page.wait_for_timeout(90)
+        page.mouse.wheel(0,80)
         page.wait_for_timeout(250)
         brain=page.locator('.st-key-page2_brain_scroll')
+        assert brain.evaluate("e => e.scrollTop") == 0
         h.evaluate('e=>e.scrollTop=500')
         brain.evaluate('e=>e.scrollTop=100')
         h.hover(position={"x":150,"y":100})
@@ -135,6 +185,15 @@ def run():
         page.mouse.wheel(0,-100)
         page.wait_for_function('__dndImmersive.getState().reveal===0')
         page.wait_for_timeout(250)
+        composer.hover()
+        page.mouse.wheel(0,100)
+        page.wait_for_function('__dndImmersive.getState().reveal===300')
+        page.wait_for_timeout(250)
+        assert brain.evaluate("e => e.scrollTop") == 0
+        composer.hover()
+        page.mouse.wheel(0,-100)
+        page.wait_for_function('__dndImmersive.getState().reveal===0')
+        page.wait_for_timeout(250)
         # Pagination prepends six turns while the prior first turn stays put.
         for expected in (24,36,40):
             h.evaluate('e=>e.scrollTop=0')
@@ -150,6 +209,7 @@ def run():
             assert abs(new_offset-old_offset)<3,(old_offset,new_offset)
             assert h.evaluate('e=>e.scrollTop')>100
         assert page.locator('.st-key-page2_load_earlier button').is_disabled()
+        check_reading_position_during_generation(page)
         # Real send/undo use the original backend callbacks.
         n = page.locator("[data-testid=stChatMessage]").count()
         input_box = page.locator(".st-key-page2_chat_input textarea")

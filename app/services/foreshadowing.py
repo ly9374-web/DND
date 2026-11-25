@@ -144,12 +144,13 @@ def due_events(plan, turns):
     if not plan.get("enabled", False):
         return []
     state = game_state(turns)
-    consumed = {e.get("id") for t in turns if successful(t)
-                for e in getattr(t, "special_events", [])}
+    consumed = handled_event_ids(turns)
     found = []
     for event in plan.get("scene_events", []):
         if event.get("enabled", True) and event.get("id") not in consumed and matches(event.get("patterns", []), state["location"]):
-            found.append(deepcopy(event))
+            copy = deepcopy(event)
+            copy["event_content"] = event_with_suffix(event["event_content"], timed=False)
+            found.append(copy)
     timed = []
     if state["minute"] is not None:
         for event in plan.get("time_events", []):
@@ -160,9 +161,9 @@ def due_events(plan, turns):
                 due = (int(event["day"]) - 1) * 1440 + minute
                 now = (state["day"] - 1) * 1440 + state["minute"]
                 if due <= now:
-                    copy = without_event_dates({"time_events": [event]})["time_events"][0]
-                    when = f"第{event['day']}天"
-                    copy["event_content"] = f"{when} {event['time']}：{event['event_content']}"
+                    copy = {key: value for key, value in event.items() if key != "date"}
+                    content = event_with_suffix(event["event_content"], timed=True)
+                    copy["event_content"] = f"{event_time(event)}：{content}"
                     # Sort by actual game day and time, including skipped times.
                     timed.append((due - now, copy))
             except (ValueError, TypeError, KeyError):
@@ -174,14 +175,133 @@ def successful(turn):
     return bool(str(turn.assistant_message or "").strip()) and not turn.is_loading and not str(turn.assistant_message).startswith("请求失败，请稍后重试。")
 
 
-def append_events(message, events):
-    parts = [str(message or "")]
-    parts.extend("【特殊事件】" + str(event.get("event_content", "")) for event in events)
+def handled_event_ids(turns):
+    return {event.get("id") for turn in turns if successful(turn)
+            for event in getattr(turn, "special_events", [])}
+
+
+def time_batch_finished(plan, turns, trigger):
+    if not plan.get("enabled") or not successful(trigger):
+        return False
+    active_ids = {event.get("id") for event in plan.get("time_events", []) if event.get("enabled", True)}
+    return bool(active_ids & handled_event_ids([trigger])) and active_ids <= handled_event_ids(turns)
+
+
+EVENT_PREFIX = "【待处理的特殊事件，if成立前保密if...then部分】"
+EVENT_RESULT_MARKER = "【特殊事件处理结果】"
+_EVENT_RESULT_LINE = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?(?:\*\*)?"
+    + re.escape(EVENT_RESULT_MARKER) + r"(?:\*\*)?[ \t]*[:：]?[ \t]*"
+)
+EVENT_RESULT_RULE = (
+    "【特殊事件处理规则】以下事件不属于玩家发言。先判断与过去剧情是否有明确冲突。"
+    "缺少自然的获知渠道只表示用户角色不知情。时间事件按给定的游戏时间发生，"
+    "正文仅自然呈现玩家角色可以获知的内容，由程序在下一次 Story Brain 更新时记入已发生的时间事件。"
+    "照常写完正文、时间地点和其他格式要求，然后在最后单独一行写"
+    f"{EVENT_RESULT_MARKER}，下一行输出一个JSON对象，以各事件的编号为键。"
+    '每个值是 {"status":"occurred","summary":"实际发生的简短客观事实","player_knows":false}，'
+    '或在过去剧情已使事件不可能发生时写 {"status":"invalid"}。'
+    '地点事件没有自然获知渠道时写 {"status":"skipped"}。'
+    "player_knows 使用布尔值，只有用户角色截至本轮已通过自然渠道获知时才填true。"
+    "已发生的地点事件如果还有未满足的if...then条件，可以用字符串 followup 保留仍适用的条件及其对应内容。"
+    "如果正文此前已经写出了同一事件的发生，则确认已有事实，不重复演出。"
+    "如果不能确认某条事件如何处理，可以省略该编号。不要把处理结果写进故事正文。"
+)
+
+_OLD_SCENE_SUFFIX = "若此相关事件在storybrain中发现被剧情影响，则忽略这一特殊事件。不要编写用户角色的行为"
+_OLD_TIME_SUFFIX = "若此相关事件在storybrain中发现本事件被剧情影响不再应该发生，则忽略这一特殊事件，否则尽量让主角通过合理渠道知道这件事情，"
+
+
+def event_body(content):
+    old_suffixes = (prompts.TIME_EVENT_SUFFIX, prompts.SCENE_EVENT_SUFFIX, _OLD_SCENE_SUFFIX, _OLD_SCENE_SUFFIX + "。",
+                    _OLD_TIME_SUFFIX + "将事件发生在游戏第几天、几点几分记录在story brain中。",
+                    _OLD_TIME_SUFFIX + "将时间和发生具体时间和日期在story brain中。")
+    content = str(content or "").strip()
+    for old_suffix in old_suffixes:
+        if content.endswith(old_suffix):
+            return content.removesuffix(old_suffix).rstrip()
+    return content
+
+
+def event_with_suffix(content, *, timed):
+    content = event_body(content)
+    suffix = prompts.TIME_EVENT_SUFFIX if timed else prompts.SCENE_EVENT_SUFFIX
+    return f"{content}\n{suffix}" if content else suffix
+
+
+def event_time(event):
+    minute = clock_minutes(event["time"])
+    return f"第{event['day']}天 {minute // 60:02d}:{minute % 60:02d}"
+
+
+def resolve_events(reply, events):
+    """Strip the model-only trailer and keep only confirmed outcomes."""
+    if not events:
+        return reply, []
+    marker = _EVENT_RESULT_LINE.search(reply)
+    if marker is None:
+        return reply, []
+    story = reply[:marker.start()].rstrip()
+    try:
+        results = _json(reply[marker.end():])
+    except ValueError:
+        return story, []
+    resolved = []
+    for event in events:
+        result = results.get(event["id"])
+        if not isinstance(result, dict):
+            continue
+        timed = "day" in event
+        allowed = ("invalid", "occurred") if timed else ("invalid", "occurred", "skipped")
+        status = result.get("status")
+        if status not in allowed:
+            continue
+        outcome = {"id": event["id"], "status": status}
+        if status == "occurred" and timed:
+            summary = result.get("summary")
+            player_knows = result.get("player_knows")
+            if not isinstance(summary, str) or not summary.strip() or not isinstance(player_knows, bool):
+                continue
+            outcome.update(day=event["day"], time=event["time"], summary=" ".join(summary.split()),
+                           player_knows=player_knows)
+        elif status == "occurred" and result.get("player_knows") is True:
+            followup = result.get("followup")
+            if isinstance(followup, str) and followup.strip():
+                outcome["followup"] = followup.strip()
+        resolved.append(outcome)
+    return story, resolved
+
+
+def confirmed_time_event_facts(turns):
+    return [
+        f"{event_time(event)} {event['summary']}（用户角色当时{'已获知' if event['player_knows'] else '不知情'}）"
+        for turn in turns if successful(turn)
+        for event in getattr(turn, "special_events", [])
+        if event.get("status") == "occurred" and "day" in event
+    ]
+
+
+def pending_event_message(user_message, events):
+    if not events:
+        return user_message
+    pending = [f"{EVENT_PREFIX}编号 {event['id']}\n{event['event_content']}" for event in events]
+    return "\n\n".join([user_message, EVENT_RESULT_RULE, *pending])
+
+
+def turn_user_message(turn, *, include_scene_followups=False):
+    events = getattr(turn, "special_events", [])
+    parts = [str(turn.user_message or "")]
+    if events and successful(turn):
+        facts = confirmed_time_event_facts([turn])
+        if facts:
+            parts.append("【已确认的世界事件】\n" + "\n".join(facts))
+        if include_scene_followups:
+            parts.extend("【先前地点事件的后续条件，成立前保密，已实现的结果勿重复】" + event["followup"]
+                         for event in events if "followup" in event)
+        # Old turns predate the result protocol and retain their historical context.
+        parts.extend("【历史事件提示】" + event_body(event.get("event_content"))
+                     for event in events if "status" not in event)
     return "\n\n".join(parts)
-
-
-def turn_user_message(turn):
-    return append_events(turn.user_message, getattr(turn, "special_events", []))
 
 
 def _json(text):
@@ -281,14 +401,31 @@ def generate(stage, ctx, final_setting, *, turns=None, story_brain="", history_t
     if stage != "events":
         raise ValueError("事件生成已取消问卷，请直接生成事件。")
     context = captured_context or generation_context(final_setting, turns, story_brain, history_turn_count)
+    direction = context.get("direction", "").strip()
+    direction_section = ""
+    if direction:
+        direction_section = (
+            "【用户期望的事件生成方向】\n"
+            f"{direction}\n"
+            "请在符合世界设定、已发生的剧情和编排范围的前提下，优先参考这个方向。\n\n"
+        )
+    window_hours = prompts.EVENT_WINDOW_HOURS
+    lead_window_hours = prompts.LEAD_EVENT_WINDOW_HOURS
+    lead_event_count = prompts.LEAD_EVENT_COUNT
     result = page2_service._send_with_current_chat_model(
         ctx=ctx, system_prompt=prompts.EVENTS_SYSTEM, context_messages=[],
-        user_message=prompts.EVENTS_USER.format(**context),
+        user_message=prompts.EVENTS_USER.format(
+            **context, direction_section=direction_section, window_hours=window_hours,
+            lead_window_hours=lead_window_hours, lead_event_count=lead_event_count,
+        ),
         temperature=0.8, thinking_enabled=True, log_label="生成背景与事件",
     )
     data = _json(result)
     if not isinstance(data.get("story"), str) or not data["story"].strip():
         raise ValueError("模型没有返回故事背景，请重新生成；原方案未被修改。")
+    clock = context["clock"]
+    scene_locations = {}
+    lead_count = 0
     for key in ("scene_events", "time_events"):
         rows = data.get(key)
         if not isinstance(rows, list) or len(rows) != 5:
@@ -301,20 +438,34 @@ def generate(stage, ctx, final_setting, *, turns=None, story_brain="", history_t
                 validate_patterns(event.get("patterns"))
                 if not 4 <= len(event["patterns"]) <= 5 or not isinstance(event.get("location"), str) or not event["location"].strip():
                     raise ValueError("场景事件需包含具体地点和4至5个地点表述。")
+                location = event["location"].strip()
+                scene_locations.setdefault(location, []).extend(event["patterns"])
             else:
                 if not isinstance(event.get("title"), str) or not event["title"].strip():
                     raise ValueError("时间事件必须包含名称。")
-                clock_minutes(event.get("time", ""))
+                event_minute = clock_minutes(event.get("time", ""))
                 if type(event.get("day")) is not int or event["day"] < 1:
                     raise ValueError("时间事件的游戏天数必须为正整数。")
-                clock = context["clock"]
+                destination = event.pop("leads_to_location", None)
+                if destination is not None and not isinstance(destination, str):
+                    raise ValueError("引导地点必须是场景事件的地点名称。")
+                destination = (destination or "").strip()
+                if destination:
+                    if not matches(scene_locations.get(destination, []), event["event_content"]):
+                        raise ValueError("引导事件必须对应本次生成的场景事件，并在正文中写清目的地。")
+                    lead_count += 1
                 if clock["minute"] is not None:
-                    offset = (event["day"] - clock["day"]) * 1440 + clock_minutes(event["time"]) - clock["minute"]
-                    if not 0 <= offset <= 48 * 60:
-                        raise ValueError("时间事件必须位于本次生成初始时间点起未来48小时内；原方案未被修改。")
+                    offset = (event["day"] - clock["day"]) * 1440 + event_minute - clock["minute"]
+                    if not 0 < offset <= window_hours * 60:
+                        raise ValueError(f"时间事件必须安排在本次生成初始时间点之后的{window_hours}小时内。原方案未被修改。")
+                    if (offset <= lead_window_hours * 60) != bool(destination):
+                        raise ValueError(f"引导事件须在初始时间点后的{lead_window_hours}小时内发生，其余时间事件须安排在此后。")
                 event.pop("date", None)
+            event["event_content"] = event_with_suffix(event["event_content"], timed=key == "time_events")
             event["id"] = uuid4().hex
             event["enabled"] = True
+    if lead_count != lead_event_count:
+        raise ValueError(f"需要恰好{lead_event_count}条引导事件。原方案未被修改。")
     return {key: data[key] for key in ("story", "scene_events", "time_events")}
 
 
@@ -340,7 +491,7 @@ def without_event_dates(plan):
 
 
 def validate_plan(plan):
-    """Validate manual edits without imposing generation's 5+5 or 48-hour limits."""
+    """Validate manual edits independently of generation counts and time windows."""
     for event in plan.get("scene_events", []):
         validate_patterns(event.get("patterns"))
         if not str(event.get("location") or "").strip() or not str(event.get("event_content") or "").strip():

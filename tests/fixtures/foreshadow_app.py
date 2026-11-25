@@ -20,8 +20,17 @@ def model_reply(**kwargs):
         calls.append("背景与事件")
         if "测试生成失败" in kwargs["user_message"]:
             return "{}"
-        return json.dumps({"story": "第1天14:00，A回到学校403宿舍。第2天，收粮队抵达。地下室信件与收粮队有关。", "scene_events": [{"location": "A家地下室", "patterns": ["A家地下室", "小A家的地下室", "A住所地下室", "A宅地下室"], "event_content": f"秘密{i+1}，主角未发现时不直接展示。", "enabled": True} for i in range(5)],
-                           "time_events": [{"title": f"时间事件{i+1}", "day": i % 2 + 1, "time": "14:00", "event_content": f"时间事件{i+1}：A回到403宿舍，主角不知情时只记录记忆。", "enabled": True} for i in range(5)]}, ensure_ascii=False)
+        target = "A家地下室"
+        time_events = [
+            {"title": f"口信{i}", "day": 1, "time": clock, "leads_to_location": target,
+             "event_content": "邻居给主角留了口信，请主角去A家地下室辨认一封信。"}
+            for i, clock in enumerate(("00:30", "01:30"))
+        ] + [
+            {"title": f"时间事件{i}", "day": 1, "time": clock, "event_content": "收粮队清点物资。"}
+            for i, clock in enumerate(("03:00", "04:00", "06:00"))
+        ]
+        return json.dumps({"story": "第1天 03:00，A回到学校403宿舍。第1天 06:00，收粮队抵达。地下室信件与收粮队有关。", "scene_events": [{"location": target, "patterns": [target, "小A家的地下室", "A住所地下室", "A宅地下室"], "event_content": f"秘密{i+1}，主角未发现时不直接展示。", "enabled": True} for i in range(5)],
+                           "time_events": time_events}, ensure_ascii=False)
     raise AssertionError("Unexpected model call")
 
 

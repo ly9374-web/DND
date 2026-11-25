@@ -169,7 +169,10 @@ def roll_point() -> int:
 
 def should_auto_roll_dice(assistant_message: str) -> bool:
     """Return whether a freshly generated reply explicitly requests a dice roll."""
-    return str(assistant_message or "").rstrip().endswith(prompt("chat", "auto_roll_marker"))
+    lines = str(assistant_message or "").splitlines(keepends=True)
+    while lines and lines[-1].strip() in {"", ">"}:
+        lines.pop()
+    return "".join(lines).rstrip().endswith(prompt("chat", "auto_roll_marker"))
 
 
 def roll_unexpected_event() -> int:
@@ -310,6 +313,8 @@ def save_context_to_settings(ctx: Page2Context) -> bool:
 def build_context_messages(
     turns: Iterable[Page2ConversationTurn],
     context_turn_count: int,
+    *,
+    include_scene_followups: bool = False,
 ) -> list[dict]:
     turns_list = [
         turn
@@ -325,7 +330,9 @@ def build_context_messages(
 
     for turn in slice_turns:
         if turn.user_message:
-            messages.append({"role": "user", "content": foreshadowing.turn_user_message(turn)})
+            messages.append({"role": "user", "content": foreshadowing.turn_user_message(
+                turn, include_scene_followups=include_scene_followups,
+            )})
         if turn.assistant_message:
             messages.append({"role": "assistant", "content": turn.assistant_message})
 
@@ -415,7 +422,7 @@ def send_message(
     story_brain_short: str = "",
     story_brain_enabled: bool = True,
 ) -> str:
-    context_messages = build_context_messages(turns, ctx.context_turn_count)
+    context_messages = build_context_messages(turns, ctx.context_turn_count, include_scene_followups=True)
     user_message_for_model = user_message
 
     if story_brain_enabled:
@@ -460,6 +467,17 @@ def generate_short_story_brain(
         history=_turn_history_text(turns, history_turns) or "暂无",
         current=existing_story_brain or "暂无",
     )
+    timed_facts = foreshadowing.confirmed_time_event_facts(turns[-history_turns:])
+    if timed_facts:
+        generator_user_message += (
+            "\n\n【已确认的世界事件】中的新增时间事件可作为事实参考，"
+            "程序会另外写入带时间的记忆条目，请勿重复新增。"
+        )
+    if timed_facts or "（用户角色当时不知情）" in existing_story_brain:
+        generator_user_message += (
+            "\n对已有时间事件保留游戏天数和时分。标注用户角色当时不知情的事件，"
+            "除非后续聊天明确获知，否则不得把用户角色列为知情者。"
+        )
 
     story_brain_system_prompt = (
         str(long_term_memory_prompt or "").strip()
@@ -483,7 +501,15 @@ def generate_short_story_brain(
     updated_story_brain = _strip_plain_text_output(raw_text)
     if updated_story_brain in INVALID_STORY_BRAIN_TEXTS:
         raise ValueError("Story Brain 更新模型没有返回可用内容。")
-    return updated_story_brain or existing_story_brain
+    updated_story_brain = updated_story_brain or existing_story_brain
+    entries = [f"- {fact}" for fact in dict.fromkeys(timed_facts)]
+    existing_lines = set(updated_story_brain.splitlines())
+    missing = [entry for entry in entries if entry not in existing_lines]
+    if missing:
+        if updated_story_brain.split("\n\n")[-1].startswith("时间事件\n"):
+            return updated_story_brain + "\n" + "\n".join(missing)
+        updated_story_brain = "\n\n".join(filter(None, [updated_story_brain, "时间事件\n" + "\n".join(missing)]))
+    return updated_story_brain
 
 
 def generate_image_prompt(

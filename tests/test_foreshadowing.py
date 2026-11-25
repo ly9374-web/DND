@@ -4,7 +4,7 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from app.models import ChatRecord, Page2ConversationTurn as Turn, SystemPromptRecord
-from app.services import foreshadowing as f, page2_service, system_prompts
+from app.services import foreshadow_prompts, foreshadowing as f, page2_service, system_prompts
 from app.services.story_brain_prompts import remove_obsolete_foreshadow_rule
 from web.pages import page2
 
@@ -114,7 +114,7 @@ class ForeshadowingTests(unittest.TestCase):
         self.assertTrue(events)
         log.assert_called_once()
         message = log.call_args.args[0]
-        self.assertIn("【事件触发】", message)
+        self.assertIn("【候选事件】", message)
         self.assertIn("地下室秘密", message)
         self.assertIn("home已到家", message)
         self.assertEqual(log.call_args.kwargs, {"category": "chat"})
@@ -140,12 +140,12 @@ class ForeshadowingTests(unittest.TestCase):
     def test_hidden_events_reach_chat_history_and_memory_without_changing_system(self):
         t = Turn(user_message="我在自己家看书", assistant_message="书页翻动。", special_events=[event("home")])
         context = page2_service.build_context_messages([t], 1)
-        self.assertIn("【特殊事件】", context[0]["content"])
-        self.assertNotIn("【特殊事件】", t.user_message)
+        self.assertIn("【历史事件提示】home已到家", context[0]["content"])
+        self.assertNotIn(f.EVENT_PREFIX, t.user_message)
         with patch.object(page2_service, "_send_with_current_chat_model", return_value="A已到家（主角并不知道此事）") as send:
             page2_service.generate_short_story_brain(ctx=page2_service.default_context(), turns=[t], story_brain_short="", long_term_memory_prompt="现有规则")
         self.assertEqual(send.call_args.kwargs["system_prompt"], "现有规则")
-        self.assertIn("【特殊事件】home已到家", send.call_args.kwargs["user_message"])
+        self.assertIn("【历史事件提示】home已到家", send.call_args.kwargs["user_message"])
         self.assertIn("书页翻动", send.call_args.kwargs["user_message"])
 
     def test_first_memory_update_does_not_drop_old_hidden_events(self):
@@ -158,14 +158,53 @@ class ForeshadowingTests(unittest.TestCase):
         task = page2._Page2OperationTask(kind="chat", label="发送", scope_id="test", payload={"ctx": page2_service.default_context(), "user_text": "继续"})
         with patch.object(page2.st, "session_state", state), patch.object(page2, "_upsert_record"), patch.object(page2_service, "send_message", return_value="正文") as send:
             page2._prepare_chat_operation(task)()
-            self.assertIn("【特殊事件】", send.call_args.kwargs["user_message"])
+            self.assertIn(f.EVENT_PREFIX, send.call_args.kwargs["user_message"])
             self.assertEqual(state.page2_turns[-1].user_message, "继续")
-            self.assertTrue(state.page2_turns[-1].special_events)
+            self.assertTrue(task.meta["pending_events"])
+            self.assertEqual(state.page2_turns[-1].special_events, [])
             task.error = RuntimeError("断网")
             with patch.object(page2, "_schedule_chat_followups"):
                 page2._apply_chat_operation(task)
             self.assertEqual(state.page2_turns[-1].special_events, [])
             self.assertEqual(f.due_events(plan(), state.page2_turns), f.due_events(plan(), state.page2_turns[:-1]))
+
+    def test_confirmed_hidden_time_event_enters_memory_without_replaying_other_candidates(self):
+        pending = f.due_events(plan(), [turn()])
+        result = {"home": {"status": "occurred", "summary": "邻居回家。", "player_knows": False},
+                  "basement": {"status": "invalid"}}
+        story = ">当前时间：第1天 15:00，当前地点：A家的地下室"
+        reply, outcomes = f.resolve_events(story + "\n\n" + f.EVENT_RESULT_MARKER + "\n" + json.dumps(result), pending)
+        self.assertEqual(reply, story)
+        saved = Turn.from_dict(Turn(user_message="继续", assistant_message=reply, special_events=outcomes).to_dict())
+        self.assertEqual(saved.special_events[0], {"id": "basement", "status": "invalid"})
+        self.assertEqual([row["id"] for row in f.due_events(plan(), [saved])], ["dinner"])
+        self.assertNotIn("箱中藏着信件", f.turn_user_message(saved))
+        self.assertNotIn("dinner", f.turn_user_message(saved))
+        with patch.object(page2_service, "_send_with_current_chat_model", return_value="常规记忆"):
+            memory = page2_service.generate_short_story_brain(ctx=page2_service.default_context(),
+                                                              turns=[saved], story_brain_short="")
+        self.assertIn("第1天 14:00 邻居回家。（用户角色当时不知情）", memory)
+        self.assertNotIn("箱中藏着信件", memory)
+
+    def test_runtime_replaces_old_suffixes_without_altering_event_body(self):
+        plan_with_old_suffixes = plan()
+        plan_with_old_suffixes["scene_events"][0]["event_content"] = "手写地点。" + f._OLD_SCENE_SUFFIX + "。"
+        plan_with_old_suffixes["time_events"][1]["event_content"] = (
+            "手写时间。" + f._OLD_TIME_SUFFIX + "将时间和发生具体时间和日期在story brain中。"
+        )
+        scene, timed, _ = f.due_events(plan_with_old_suffixes, [turn()])
+        self.assertEqual(scene["event_content"], "手写地点。\n" + foreshadow_prompts.SCENE_EVENT_SUFFIX)
+        self.assertEqual(timed["event_content"], "第1天 14:00：手写时间。\n" + foreshadow_prompts.TIME_EVENT_SUFFIX)
+
+    def test_scene_followup_stays_in_chat_context_without_becoming_a_world_fact(self):
+        pending = f.due_events(plan(), [turn(time="10:00")])
+        followup = "if 用户打开箱子 then 能看到信。"
+        trailer = {"basement": {"status": "occurred", "player_knows": True, "followup": followup}}
+        reply, outcomes = f.resolve_events(f"房间角落有箱子。\n**{f.EVENT_RESULT_MARKER}**：\n{json.dumps(trailer)}", pending)
+        saved = Turn(user_message="继续", assistant_message=reply, special_events=outcomes)
+        chat = page2_service.build_context_messages([saved], 1, include_scene_followups=True)
+        self.assertIn(followup, chat[0]["content"])
+        self.assertNotIn(followup, f.turn_user_message(saved))
 
     def test_removed_questionnaire_cannot_call_model(self):
         with patch.object(page2_service, "_send_with_current_chat_model") as send:
@@ -174,9 +213,14 @@ class ForeshadowingTests(unittest.TestCase):
         send.assert_not_called()
 
     def generation_payload(self):
-        return {"story": "未来2天的世界背景：收粮队即将抵达，地下室中留有账本。",
-                "scene_events": [{"location": "小A家&地下室", "patterns": ["小A家&地下室", "A家&地下室", "A住所&地下室", "A宅&地下室"], "event_content": "屋顶突然倒塌。"} for _ in range(5)],
-                "time_events": [event(str(i)) for i in range(5)]}
+        target = "小A家&地下室"
+        leads = [event("口信", "00:30", leads_to_location=target,
+                       event_content="邻居带来口信，邀请主角去小A家的地下室辨认失物。"),
+                 event("账本", "02:00", leads_to_location=target,
+                       event_content="收粮队送来账本残页，纸上注明剩余账本在A宅的地下室。")]
+        return {"story": "未来6小时的世界背景：收粮队即将抵达，地下室中留有账本。",
+                "scene_events": [{"location": target, "patterns": [target, "A家&地下室", "A住所&地下室", "A宅&地下室"], "event_content": "屋顶突然倒塌。"} for _ in range(5)],
+                "time_events": leads + [event(str(i), f"{3 + i:02d}:00") for i in range(3)]}
 
     def test_single_call_uses_only_material_recent_chat_and_brain(self):
         ctx = page2_service.default_context()
@@ -188,13 +232,28 @@ class ForeshadowingTests(unittest.TestCase):
         user = send.call_args.kwargs["user_message"]
         for value in ("世界事实", "用户设定", "其他人物", "既有记忆", "回复3", "回复8"):
             self.assertIn(value, user)
-        for value in ("固定背景指令", "固定DM指令", "固定格式指令", "回复2", "问卷", "用户回答"):
+        for value in ("固定背景指令", "固定DM指令", "固定格式指令", "回复2", "问卷", "用户回答", "用户期望的事件生成方向"):
             self.assertNotIn(value, user)
         self.assertIn("参考story brain和过去的聊天记录以最新轮次时间点作为初始时间点往后设计事件", user)
+        for prompt in (user, send.call_args.kwargs["system_prompt"]):
+            self.assertIn("未来6小时", prompt)
+            self.assertIn("2小时内", prompt)
+            self.assertNotIn("48小时", prompt)
         self.assertEqual(result["story"], self.generation_payload()["story"])
         self.assertEqual(ctx, original)
         self.assertIs(send.call_args.kwargs["ctx"], ctx)
         self.assertTrue(send.call_args.kwargs["thinking_enabled"])
+
+    def test_captured_direction_is_only_added_to_the_event_user_prompt(self):
+        context = f.generation_context(FINAL)
+        context["direction"] = "  围绕港口失踪案展开。\n增加与{旧码头}有关的线索。\n"
+        with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(self.generation_payload())) as send:
+            f.generate("events", page2_service.default_context(), FINAL, captured_context=context)
+        self.assertEqual(send.call_args.kwargs["system_prompt"], f.prompts.EVENTS_SYSTEM)
+        self.assertIn(
+            "【用户期望的事件生成方向】\n围绕港口失踪案展开。\n增加与{旧码头}有关的线索。\n",
+            send.call_args.kwargs["user_message"],
+        )
 
     def test_missing_or_duplicate_sections_do_not_fall_back_to_full_prompt(self):
         for source in ("未分区正文", FINAL + "\n2. 世界书\n重复"):
@@ -278,36 +337,71 @@ class ForeshadowingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     f.generate("events", page2_service.default_context(), FINAL)
 
-    def test_opening_accepts_second_day_and_rejects_times_outside_48_hours(self):
+    def test_opening_accepts_times_after_midnight_up_to_6_hours(self):
         payload = self.generation_payload()
-        payload["time_events"][-1].update(day=2, time="23:59")
+        payload["time_events"][-1].update(day=1, time="06:00")
         ctx = page2_service.default_context()
         with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
             result = f.generate("events", ctx, FINAL)
-        self.assertEqual(result["time_events"][-1]["day"], 2)
-        self.assertEqual(result["time_events"][-1]["time"], "23:59")
-        for day in (0, 3, 4):
-            with self.subTest(day=day):
-                payload["time_events"][-1]["day"] = day
+        self.assertEqual(result["time_events"][-1]["day"], 1)
+        self.assertEqual(result["time_events"][-1]["time"], "06:00")
+        for day, clock, error in ((0, "04:00", "正整数"), (1, "00:00", "6小时"),
+                                  (1, "06:01", "6小时"), (2, "00:00", "6小时")):
+            with self.subTest(day=day, clock=clock):
+                payload["time_events"][-1].update(day=day, time=clock)
                 with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(ValueError, error):
                         f.generate("events", ctx, FINAL)
 
     def test_current_game_clock_bounds_and_calendar_rollover(self):
         turns = [Turn(assistant_message=">当前时间：2026年12月31日 第8天 23:00，当前地点：学校")]
         payload = self.generation_payload()
-        for row in payload["time_events"]:
-            row.update(day=9, time="00:10", date="1999-01-01")
+        for row, clock in zip(payload["time_events"], ("00:10", "01:00", "02:00", "04:00", "05:00"), strict=True):
+            row.update(day=9, time=clock, date="1999-01-01")
         with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)) as send:
             result = f.generate("events", page2_service.default_context(), FINAL, turns=turns)
         self.assertIn("游戏第8天 23:00", send.call_args.kwargs["user_message"])
         self.assertNotIn("2026-12-31", send.call_args.kwargs["user_message"])
         self.assertNotIn("date", result["time_events"][0])
-        for day, clock in ((8, "22:59"), (10, "23:01"), (1, "14:00")):
-            payload["time_events"][0].update(day=day, time=clock)
-            with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
-                with self.assertRaisesRegex(ValueError, "48小时"):
-                    f.generate("events", page2_service.default_context(), FINAL, turns=turns)
+        self.assertEqual(result["time_events"][1]["time"], "01:00")
+        self.assertEqual(result["time_events"][-1]["time"], "05:00")
+        for day, clock in ((8, "22:59"), (8, "23:00"), (9, "05:01"), (10, "00:00"), (1, "14:00")):
+            with self.subTest(day=day, clock=clock):
+                payload["time_events"][0].update(day=day, time=clock)
+                with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
+                    with self.assertRaisesRegex(ValueError, "6小时"):
+                        f.generate("events", page2_service.default_context(), FINAL, turns=turns)
+
+    def test_generation_rejects_wrong_lead_windows_and_destinations(self):
+        for index, change, error in (
+            (0, {"time": "02:01"}, "2小时内"),
+            (2, {"time": "01:59"}, "2小时内"),
+            (0, {"leads_to_location": "市场"}, "写清目的地"),
+            (0, {"event_content": "邻居送来一条口信。"}, "写清目的地"),
+            (2, {"time": "01:45", "leads_to_location": "小A家&地下室",
+                 "event_content": "主角收到一封邀请去小A家地下室的信。"}, "恰好2条"),
+        ):
+            with self.subTest(index=index, change=change):
+                payload = self.generation_payload()
+                payload["time_events"][index].update(change)
+                with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
+                    with self.assertRaisesRegex(ValueError, error):
+                        f.generate("events", page2_service.default_context(), FINAL)
+
+    def test_lead_content_triggers_first_and_scene_waits_for_arrival(self):
+        payload = self.generation_payload()
+        with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
+            result = f.generate("events", page2_service.default_context(), FINAL)
+        first_lead = result["time_events"][0]
+        self.assertNotIn("leads_to_location", first_lead)
+        config = {**result, "enabled": True}
+        before_arrival = turn(time="00:30", location="学校")
+        leads = f.due_events(config, [before_arrival])
+        self.assertEqual([lead["id"] for lead in leads], [first_lead["id"]])
+        self.assertIn("小A家的地下室", leads[0]["event_content"])
+        arrival = turn(time="00:35", special_events=leads)
+        triggered = f.due_events(config, [before_arrival, arrival])
+        self.assertIn(result["scene_events"][0]["id"], [item["id"] for item in triggered])
 
     def test_missing_footer_leaves_time_inference_to_latest_history(self):
         turns = [Turn(user_message="继续", assistant_message="第8天的下午，学校里仍然很安静。")]
@@ -315,8 +409,8 @@ class ForeshadowingTests(unittest.TestCase):
         self.assertIn("不默认重置", context["initial_time"])
         self.assertIsNone(context["clock"]["minute"])
         payload = self.generation_payload()
-        for row in payload["time_events"]:
-            row.update(day=8, time="16:00")
+        for row, clock in zip(payload["time_events"], ("15:30", "16:00", "17:30", "20:00", "21:00"), strict=True):
+            row.update(day=8, time=clock)
         with patch.object(page2_service, "_send_with_current_chat_model", return_value=json.dumps(payload)):
             result = f.generate("events", page2_service.default_context(), FINAL, captured_context=context)
         self.assertEqual(result["time_events"][0]["day"], 8)

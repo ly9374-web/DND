@@ -61,6 +61,7 @@ def run():
         }""")
         assert max(geometry) < 2, geometry
 
+        expect(page.locator(".dnd-background-playback")).to_be_hidden()
         video_path = Path(os.environ["DND_UI_FIXTURE_VIDEO"]).resolve()
         page.route("**/retained-test.mp4", lambda route: route.fulfill(path=str(video_path), content_type="video/mp4"))
         page.evaluate("""()=>{
@@ -86,6 +87,39 @@ def run():
         page.wait_for_timeout(400)
         assert_no_redraw("same background, pause and resume")
 
+        video.evaluate("v => v.playbackRate = 4")
+        replay = page.get_by_role("button", name="重播背景视频", exact=True)
+        expect(replay).to_be_visible(timeout=15000)
+        end_time = video.evaluate("v => v.currentTime")
+        assert video.evaluate("v => v.ended && v.paused && !v.loop")
+        page.evaluate("__dndImmersive.update(videoConfig)")
+        page.wait_for_timeout(300)
+        assert video.evaluate("v => v.ended && v.paused")
+        assert video.evaluate("v => v.currentTime") == end_time
+
+        assert "blur(" in replay.evaluate("button => getComputedStyle(button).backdropFilter")
+        media_toggle = page.get_by_role("button", name="图片与视频", exact=True)
+        media_tools = page.locator("#dnd-immersive-topbar .dnd-media-tools")
+        for width in (1280, 320):
+            page.set_viewport_size({"width": width, "height": 800})
+            playback_box = replay.bounding_box()
+            media_box = media_toggle.bounding_box()
+            assert abs(playback_box["x"] + playback_box["width"] / 2 - width / 2) < 1
+            assert abs(playback_box["y"] - media_box["y"]) < 1
+            assert playback_box["x"] + playback_box["width"] < media_tools.bounding_box()["x"]
+        page.set_viewport_size({"width": 1280, "height": 800})
+
+        video.evaluate("v => v.playbackRate = 1")
+        replay.click()
+        page.wait_for_function("""() => {
+            const v = document.querySelector('#dnd-immersive-bg video');
+            return !v.paused && !v.ended && v.currentTime < v.duration / 2;
+        }""")
+        expect(page.get_by_role("button", name="暂停背景视频", exact=True)).to_be_visible()
+        video.evaluate("v => v.playbackRate = 4")
+        expect(replay).to_be_visible(timeout=15000)
+        assert video.evaluate("v => v.ended && v.paused")
+
         # A real native-widget rerun must retain the shell and entry state.
         page.get_by_role("button", name="游戏设置", exact=True).click()
         expect(page.get_by_role("button", name="切换测试页面")).to_be_visible()
@@ -110,7 +144,7 @@ def run():
         page.wait_for_function("document.body.classList.contains('dnd-game-ready')")
         expect(h).to_have_css("transition-duration", "0s")
         browser.close()
-        print("PASS: smooth entry, retained backgrounds, zero steady-state canvas work during playback, native playback controls, navigation cleanup, reduced motion")
+        print("PASS: smooth entry, retained backgrounds, single playback and centered replay, navigation cleanup, reduced motion")
 
 
 if __name__ == "__main__":

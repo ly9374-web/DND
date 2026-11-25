@@ -1220,11 +1220,14 @@ if st.button("模拟生成完成"):
                 f"##【行动判定】\n0—12：失败\n13—24：成功\n{marker}\n\n"
             )
         )
+        self.assertTrue(page2_service.should_auto_roll_dice(f"{marker}\n\n>\n\n"))
+        self.assertTrue(page2_service.should_auto_roll_dice(f"{marker}\r\n > \r\n\r\n>"))
         self.assertFalse(
             page2_service.should_auto_roll_dice(
-                f"{marker}\n>当前时间：7月20日 17:25"
+                f"{marker}\n>当前时间：7月20日 17:25\n>"
             )
         )
+        self.assertFalse(page2_service.should_auto_roll_dice(f"{marker}>"))
         self.assertFalse(
             page2_service.should_auto_roll_dice(f"正文提到{marker}随后继续。")
         )
@@ -1288,6 +1291,7 @@ if st.button("模拟生成完成"):
         task.result = (
             "##【行动判定】\n0—12：失败\n13—24：成功\n"
             + internal_prompt("chat", "auto_roll_marker")
+            + "\n\n>\n\n"
         )
         task.meta = {
             "turn_id": turn.id,

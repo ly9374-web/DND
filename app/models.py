@@ -357,7 +357,7 @@ class Page2ConversationTurn:
     assistant_audio_clips: list[dict] = field(default_factory=list)
     id: str = field(default_factory=new_id)
     date: str = field(default_factory=now_iso)
-    # Kept separate from the visible player message. Only successful turns consume these.
+    # Resolved events and skipped IDs, kept separate from the visible player message.
     special_events: list[dict] = field(default_factory=list)
 
     @staticmethod

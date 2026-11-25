@@ -21,8 +21,10 @@ def render_dialog(work, turns, *, read_only, save, close):
             clock += f" {state['minute'] // 60:02d}:{state['minute'] % 60:02d}"
         note = "保存仅修改本局事件；已触发事件保留触发状态。" if not read_only else "游客仅可查看。"
         st.caption("当前游戏时间：" + clock + " · " + note)
-        consumed = {event.get("id") for turn in turns if foreshadowing.successful(turn)
-                    for event in getattr(turn, "special_events", [])}
+        outcomes = {event.get("id"): event.get("status", "occurred")
+                    for turn in turns if foreshadowing.successful(turn)
+                    for event in turn.special_events}
+        labels = {"occurred": "已触发", "invalid": "已跳过", "skipped": "已跳过"}
         prefix = "current_events_" + work["nonce"]
         with st.form(prefix):
             name_col, enabled_col = st.columns([3, 1], vertical_alignment="bottom")
@@ -37,7 +39,7 @@ def render_dialog(work, turns, *, read_only, save, close):
                     st.markdown(f"**{label} · {len(plan.get(group, []))}条**")
                     for index, event in enumerate(plan.get(group, []), 1):
                         key = f"{prefix}_{group}_{index}"
-                        status = "已触发" if event.get("id") in consumed else "未触发"
+                        status = labels.get(outcomes.get(event.get("id")), "未触发")
                         heading = event.get("location", "未命名") if group == "scene_events" else f"第{event.get('day', 1)}天 {event.get('time', '')} · {event.get('title', '未命名')}"
                         with st.expander(f"{label} {index} · {heading} · {status}"):
                             event["enabled"] = st.checkbox("启用此条", value=bool(event.get("enabled", True)), key=key + "_enabled", disabled=read_only)

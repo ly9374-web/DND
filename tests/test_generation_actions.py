@@ -50,8 +50,8 @@ class GenerationActionsTests(unittest.TestCase):
     def result(self):
         return {"story": "新故事", "scene_events": [], "time_events": []}
 
-    def test_event_snapshot_survives_continued_chat_and_updates_both_stores(self):
-        task = page2._queue_event_generation()
+    def test_event_snapshot_survives_continued_chat_and_replaces_only_current_batch(self):
+        task = page2._queue_event_generation(direction="围绕港口失踪案展开\n增加调查线索")
         self.state.page2_turns.append(Turn(id="later", user_message="后来的输入", assistant_message=">当前时间：第9天 18:00，当前地点：家"))
         self.state.page2_story_brain_short = "后来的记忆"
         with patch.object(foreshadowing, "generate", return_value=self.result()) as generate:
@@ -61,8 +61,9 @@ class GenerationActionsTests(unittest.TestCase):
         self.assertEqual(captured["clock"]["day"], 8)
         self.assertEqual(captured["clock"]["minute"], 14 * 60)
         self.assertEqual(captured["story_brain"], "点击时的记忆")
+        self.assertEqual(captured["direction"], "围绕港口失踪案展开\n增加调查线索")
         self.assertNotIn("后来的输入", captured["history"])
-        self.assertEqual(len(self.record.foreshadowing["plans"]), 2)
+        self.assertEqual(len(self.record.foreshadowing["plans"]), 1)
         self.assertEqual(self.record.foreshadowing["plans"][0]["id"], "old")
         self.assertEqual(self.state.page2_foreshadowing["story"], "新故事")
         self.assertTrue(self.state.page2_foreshadowing["enabled"])
@@ -70,11 +71,68 @@ class GenerationActionsTests(unittest.TestCase):
         self.assertNotEqual(self.state.page2_foreshadowing["id"], "old")
         self.assertEqual(page2._operation_lane(task), "events")
 
+    def finished_batch(self):
+        self.state.page2_foreshadowing = {"id": "old", "title": "旧方案", "enabled": True,
+            "scene_events": [{"id": "unused-scene"}],
+            "time_events": [{"id": "earlier"}, {"id": "last"}, {"id": "disabled", "enabled": False}]}
+        self.state.page2_turns[0].special_events = [{"id": "earlier", "status": "occurred"}]
+
+    def test_last_successful_chat_with_invalid_event_rolls_over_only_current_game(self):
+        self.finished_batch()
+        self.state.page2_foreshadowing["time_events"][1].update(day=8, time="14:00", event_content="旧事件。")
+        task = page2._Page2OperationTask(kind="chat", label="发送", scope_id="test",
+                                       payload={"ctx": self.ctx, "user_text": "继续", "story_brain_enabled": False})
+        reply = ">当前时间：第8天 14:05，当前地点：学校"
+        with patch.object(page2_service, "send_message", return_value=reply + "\n" +
+                          foreshadowing.EVENT_RESULT_MARKER + '\n{"last":{"status":"invalid"}}'), \
+             patch.object(page2, "_schedule_auto_image"):
+            task.result = page2._prepare_chat_operation(task)()
+            page2._apply_chat_operation(task)
+        self.assertEqual(self.state.page2_turns[-1].assistant_message, reply)
+        self.assertEqual(self.state.page2_turns[-1].special_events, [{"id": "last", "status": "invalid"}])
+        page2._schedule_event_rollover(self.state.page2_turns[-1].id)
+        queued = self.state.page2_operation_queue
+        self.assertEqual([item.label for item in queued], ["自动续编事件"])
+        self.assertEqual(queued[0].payload["context"]["initial_time"], "游戏第8天 14:05")
+        self.assertNotIn("旧事件", queued[0].payload["context"]["history"])
+        with patch.object(foreshadowing, "generate", return_value=self.result()) as generate:
+            page2._advance_operation_queues()
+            page2._advance_operation_queues()
+        generate.assert_called_once()
+        self.assertEqual(self.state.page2_foreshadowing["scene_events"], [])
+        self.assertEqual(self.state.page2_foreshadowing["story"], "新故事")
+        self.assertEqual(self.record.foreshadowing["selected_plan_id"], "old")
+        self.assertEqual(self.state.page2_story_brain_short, "点击时的记忆")
+
+    def test_manual_replacement_supersedes_auto_and_only_new_batch_can_roll_over(self):
+        self.finished_batch()
+        finished = Turn(id="finished", user_message="继续", assistant_message=">当前时间：第8天 15:00",
+                        special_events=[{"id": "last", "status": "invalid"}])
+        self.state.page2_turns.append(finished)
+        page2._schedule_event_rollover(finished.id)
+        automatic = self.state.page2_operation_queue[0]
+        manual = page2._queue_event_generation(direction="换个方向")
+        self.assertTrue(automatic.cancel_event.is_set())
+        automatic.result = {**self.result(), "story": "迟到的旧批次结果"}
+        page2._apply_operation(automatic)
+        self.assertEqual(self.state.page2_foreshadowing["id"], "old")
+        manual.result = {**self.result(), "time_events": [{"id": "replacement"}]}
+        page2._apply_operation(manual)
+        self.state.page2_operation_queue = []
+        page2._schedule_event_rollover(finished.id)
+        self.assertFalse(self.state.page2_operation_queue)
+        next_trigger = Turn(id="new", user_message="继续", assistant_message=">当前时间：第8天 16:00",
+                            special_events=[{"id": "replacement", "status": "invalid"}])
+        self.state.page2_turns.append(next_trigger)
+        page2._schedule_event_rollover(next_trigger.id)
+        self.assertEqual(self.state.page2_operation_queue[0].payload["source_turn_id"], "new")
+
     def test_settings_entry_uses_edited_body_without_game_chat_or_memory(self):
         task = page2._queue_event_generation(final_setting=FINAL.replace("世界事实", "尚未保存的正文"), record_id="final", update_game=False)
         self.assertIn("尚未保存的正文", task.payload["context"]["final_setting"])
         self.assertEqual(task.payload["context"]["history"], "暂无")
         self.assertEqual(task.payload["context"]["story_brain"], "暂无")
+        self.assertNotIn("direction", task.payload["context"])
         task.result = self.result()
         page2._apply_operation(task)
         self.assertEqual(self.state.page2_foreshadowing, {"id": "old"})
@@ -98,7 +156,7 @@ class GenerationActionsTests(unittest.TestCase):
         self.assertEqual(len(self.record.foreshadowing["plans"]), 1)
         self.assertEqual(self.state.page2_foreshadowing, {"id": "old"})
 
-    def test_failed_game_save_rolls_back_prompt_and_current_plan(self):
+    def test_failed_game_save_restores_current_plan(self):
         task = page2._queue_event_generation()
         task.result = self.result()
         before = deepcopy(self.record.foreshadowing)
